@@ -180,7 +180,7 @@ fn output_file_offset<H: RecordHost, G>(
         return None;
     }
 
-    let fdinfo = H::fdinfo_text_at(access, fd)?;
+    let fdinfo = H::fdinfo_text_at(access, fd).ok().flatten()?;
     let position = fdinfo
         .lines()
         .find_map(|line| line.strip_prefix("pos:\t"))
@@ -378,8 +378,8 @@ async fn copy_at_offset<H: RecordHost, G: Guest<RecorderWithHost<H>>>(
             Ok(false) => 1,
             Err(_) => -1,
         };
-        let input_file = H::fd_metadata(&access, syscall.in_fd());
-        let output_file = H::fd_metadata(&access, syscall.out_fd());
+        let input_file = H::fd_metadata(&access, syscall.in_fd()).ok().flatten();
+        let output_file = H::fd_metadata(&access, syscall.out_fd()).ok().flatten();
         let same_file = input_file
             .as_ref()
             .zip(output_file.as_ref())
@@ -519,7 +519,7 @@ fn sendfile_source<H: RecordHost, G>(
     syscall: Sendfile,
     offset: Option<Option<i64>>,
 ) -> Result<Option<(std::fs::File, SendfileStart)>, Errno> {
-    let metadata = |fd: libc::c_int| H::fd_metadata(access, fd);
+    let metadata = |fd: libc::c_int| H::fd_metadata(access, fd).ok().flatten();
     let (Some(input), Some(output)) = (metadata(syscall.in_fd()), metadata(syscall.out_fd()))
     else {
         return Ok(None);
@@ -779,8 +779,7 @@ fn private_clone_snapshot<H: RecordHost, G>(
     source_offset: u64,
     length: u64,
 ) -> std::io::Result<std::fs::File> {
-    let destination = H::fd_link(access, destination_fd)
-        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::ENOENT))?;
+    let destination = H::fd_link(access, destination_fd)?;
     let relative = destination.strip_prefix("/").map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -1122,7 +1121,9 @@ impl<H: RecordHost> RecorderWithHost<H> {
         let metadata = H::fd_metadata(
             &DescriptorAccess::guest_bound(&self.init, &mut *guest, task),
             fd,
-        );
+        )
+        .ok()
+        .flatten();
         let outputs = guest.thread_state().outputs;
         let (output_fd, shares_output_ofd) = metadata.as_ref().map_or((None, false), |metadata| {
             let (stdout_matches, stderr_matches) = outputs.matching(metadata);
@@ -1208,6 +1209,8 @@ impl<H: RecordHost> RecorderWithHost<H> {
                 &DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
                 syscall.fd(),
             )
+            .ok()
+            .flatten()
         };
         let outputs = guest.thread_state().outputs;
         let output_fd = if result.is_ok() {
@@ -1377,6 +1380,8 @@ impl<H: RecordHost> RecorderWithHost<H> {
                     &DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
                     syscall.fd(),
                 )
+                .ok()
+                .flatten()
             }
             .unwrap_or_else(|| panic!("failed to stat cloned destination fd {}", syscall.fd()))
             .len;

@@ -247,7 +247,6 @@ enum Sharing {
 fn shared_mapping<H: RecordHost, G>(
     access: &DescriptorAccess<'_, H, G>,
     flags: MapFlags,
-    tid: i32,
     fd: i32,
     offset: i64,
 ) -> io::Result<Option<Sharing>> {
@@ -255,21 +254,17 @@ fn shared_mapping<H: RecordHost, G>(
         flags,
         offset,
         || {
-            let metadata = H::fd_metadata(access, fd)
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+            let snapshot = H::descriptor_snapshot(access, fd)?;
             Ok(MappedFileFacts {
-                mode: metadata.mode,
-                rdev: metadata.rdev,
-                device: metadata.device,
-                inode: metadata.inode,
-                // statfs still names the descriptor by its procfs
-                // path; listed in host.rs.
-                fs_type: file_system_type(&format!("/proc/{tid}/fd/{fd}"))?,
-                target: H::fd_link(access, fd)
-                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?,
+                mode: snapshot.metadata.mode,
+                rdev: snapshot.metadata.rdev,
+                device: snapshot.metadata.device,
+                inode: snapshot.metadata.inode,
+                fs_type: snapshot.fs_type,
+                target: snapshot.target,
             })
         },
-        || H::fdinfo_text_at(access, fd).ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT)),
+        || H::fdinfo_text_at(access, fd)?.ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT)),
     )
 }
 
@@ -322,6 +317,7 @@ fn shared_mapping_with(
 }
 
 /// The `statfs` magic of the file system that holds the file `path` names.
+#[cfg(test)]
 fn file_system_type(path: &str) -> io::Result<i64> {
     let path = std::ffi::CString::new(path).expect("a /proc path holds no NUL");
     // SAFETY: `statfs` is plain old data, valid when zeroed.
@@ -508,7 +504,6 @@ impl<H: RecordHost> RecorderWithHost<H> {
             shared_mapping::<H, G>(
                 &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
                 syscall.flags(),
-                tid.as_raw(),
                 syscall.fd(),
                 syscall.offset(),
             )
@@ -663,7 +658,132 @@ impl<H: RecordHost> RecorderWithHost<H> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use reverie::Pid;
+    use reverie::Tool;
+
     use super::*;
+    use crate::host::DescriptorKind;
+
+    /// A host whose snapshot read fails with a non-ENOENT error:
+    /// the adapter must surface that error, not translate it to the
+    /// missing-descriptor one (B9 regression).
+    struct FailingSnapshotHost;
+
+    impl RecordHost for FailingSnapshotHost {
+        type InitStorage = ();
+
+        fn install(
+            _storage: &Self::InitStorage,
+            _provider: Option<std::sync::Arc<dyn reverie::DescriptorProvider>>,
+        ) {
+        }
+
+        fn installed(_storage: &Self::InitStorage) -> Option<&dyn reverie::DescriptorProvider> {
+            None
+        }
+
+        async fn classify_fd<G: Guest<T>, T: Tool>(
+            _access: &mut DescriptorAccess<'_, Self, G>,
+            _fd: i32,
+        ) -> DescriptorKind {
+            unreachable!("snapshot test")
+        }
+
+        async fn fd_is_eventfd<G: Guest<T>, T: Tool>(
+            _access: &mut DescriptorAccess<'_, Self, G>,
+            _fd: i32,
+        ) -> bool {
+            unreachable!("snapshot test")
+        }
+
+        async fn fdinfo_text<G: Guest<T>, T: Tool>(
+            _access: &mut DescriptorAccess<'_, Self, G>,
+            _fd: i32,
+        ) -> io::Result<Option<String>> {
+            unreachable!("snapshot test")
+        }
+
+        fn fd_link<G>(access: &DescriptorAccess<'_, Self, G>, fd: i32) -> io::Result<PathBuf> {
+            let _ = (access, fd);
+            unreachable!("snapshot test")
+        }
+
+        fn fdinfo_text_at<G>(
+            _access: &DescriptorAccess<'_, Self, G>,
+            _fd: i32,
+        ) -> io::Result<Option<String>> {
+            unreachable!("snapshot test")
+        }
+
+        fn fd_metadata<G>(
+            _access: &DescriptorAccess<'_, Self, G>,
+            _fd: i32,
+        ) -> io::Result<Option<reverie::DescriptorMetadata>> {
+            unreachable!("snapshot test")
+        }
+
+        fn descriptor_snapshot<G>(
+            _access: &DescriptorAccess<'_, Self, G>,
+            _fd: i32,
+        ) -> io::Result<crate::host::DescriptorSnapshot> {
+            Err(io::Error::from_raw_os_error(libc::EACCES))
+        }
+
+        fn duplicate_guest_fd<G>(
+            _access: &DescriptorAccess<'_, Self, G>,
+            _pid: Pid,
+            _fd: i32,
+        ) -> io::Result<OwnedFd> {
+            unreachable!("snapshot test")
+        }
+
+        fn duplicate_guest_thread_fd<G>(
+            _access: &DescriptorAccess<'_, Self, G>,
+            _pid: Pid,
+            _tid: Pid,
+            _fd: i32,
+        ) -> io::Result<OwnedFd> {
+            unreachable!("snapshot test")
+        }
+
+        fn same_open_file_description(_left: i32, _right: i32) -> io::Result<bool> {
+            unreachable!("snapshot test")
+        }
+
+        fn guest_fds_share_description<G>(
+            _access: &DescriptorAccess<'_, Self, G>,
+            _left: i32,
+            _right: i32,
+        ) -> io::Result<bool> {
+            unreachable!("snapshot test")
+        }
+
+        fn visit_descriptor_numbers<G, F: FnMut(i32) -> bool>(
+            _access: &DescriptorAccess<'_, Self, G>,
+            _visit: F,
+        ) -> io::Result<()> {
+            unreachable!("snapshot test")
+        }
+
+        fn guest_task_exists<G>(_access: &DescriptorAccess<'_, Self, G>, _pid: Pid) -> bool {
+            unreachable!("snapshot test")
+        }
+    }
+
+    #[test]
+    fn shared_mapping_preserves_snapshot_error() {
+        let pid = Pid::from_raw(std::process::id() as i32);
+        let error = shared_mapping::<FailingSnapshotHost, ()>(
+            &DescriptorAccess::task(&(), pid, pid),
+            MapFlags::MAP_SHARED,
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+    }
 
     fn own_facts(fd: i32) -> io::Result<MappedFileFacts> {
         let tid = std::process::id() as i32;
@@ -752,7 +872,6 @@ mod tests {
             let capture = shared_mapping::<crate::host::PtraceHost, ()>(
                 &DescriptorAccess::task(&(), pid, pid),
                 flags,
-                std::process::id() as i32,
                 file.as_raw_fd(),
                 4096,
             );

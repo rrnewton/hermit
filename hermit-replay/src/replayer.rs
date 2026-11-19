@@ -347,7 +347,7 @@ fn placeholder_eventfd_id<H: RecordHost, G>(
     access: &DescriptorAccess<'_, H, G>,
     fd: libc::c_int,
 ) -> Option<String> {
-    let fdinfo = H::fdinfo_text_at(access, fd)?;
+    let fdinfo = H::fdinfo_text_at(access, fd).ok().flatten()?;
     parse_eventfd_id(&fdinfo)
 }
 
@@ -394,7 +394,10 @@ fn holds_accept_stand_in<H: RecordHost, G>(
     access: &DescriptorAccess<'_, H, G>,
     fd: libc::c_int,
 ) -> bool {
-    H::fdinfo_text_at(access, fd).and_then(|fdinfo| parse_eventfd_count(&fdinfo))
+    H::fdinfo_text_at(access, fd)
+        .ok()
+        .flatten()
+        .and_then(|fdinfo| parse_eventfd_count(&fdinfo))
         == Some(u64::from(ACCEPT_STAND_IN_COUNT))
 }
 
@@ -422,7 +425,7 @@ fn slot_divergence_message<H: RecordHost, G>(
 /// `reserve_replay_fd` installs as a placeholder.
 fn fd_is_eventfd<H: RecordHost, G>(access: &DescriptorAccess<'_, H, G>, fd: libc::c_int) -> bool {
     H::fd_link(access, fd)
-        .is_some_and(|target| target == std::path::Path::new("anon_inode:[eventfd]"))
+        .is_ok_and(|target| target == std::path::Path::new("anon_inode:[eventfd]"))
 }
 
 /// Whether descriptor `fd` of thread `tid` is an `AF_UNIX` socket: its socket
@@ -433,8 +436,7 @@ fn fd_is_unix_socket<H: RecordHost, G>(
     fd: libc::c_int,
 ) -> io::Result<bool> {
     let tid = access.table();
-    let target =
-        H::fd_link(access, fd).ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+    let target = H::fd_link(access, fd)?;
     let Some(inode) = socket_inode(&target) else {
         return Ok(false);
     };
@@ -480,7 +482,7 @@ fn file_is_beneath_replay_root<H: RecordHost, G>(
     fd: libc::c_int,
 ) -> bool {
     let pid = access.table();
-    let Some(link) = H::fd_link(access, fd) else {
+    let Ok(link) = H::fd_link(access, fd) else {
         return false;
     };
     let link = link.to_string_lossy().into_owned();
@@ -506,7 +508,7 @@ fn remember_materialized_file<H: RecordHost, G>(
     fd: libc::c_int,
 ) {
     let pid = access.table();
-    let Some(metadata) = H::fd_metadata(access, fd) else {
+    let Ok(Some(metadata)) = H::fd_metadata(access, fd) else {
         return;
     };
     // FIFOs register beside regular files: the registry is keyed by object
@@ -582,6 +584,13 @@ pub struct ReplayerThreadState {
     stream_id: EventStreamId,
     child_stream_ids: ChildEventStreamIds,
     bootstrapped: bool,
+    /// Minted only for a fresh root state (init with no parent) and
+    /// consumed once at `handle_thread_start`: whether root output
+    /// capture is still owed for this state. Inherited and restored
+    /// states carry `false`, preserving the root bundle they
+    /// inherited; a forked leader never recaptures its own endpoints.
+    #[serde(default)]
+    fresh_root_capture: bool,
     /// The root guest's captured output endpoints (`ReplayOutputs`), which
     /// every thread inherits from the thread that created it.
     #[serde(skip)]
@@ -786,11 +795,11 @@ fn fd_is_plain_placeholder<H: RecordHost, G>(
         return false;
     }
     match H::fdinfo_text_at(access, fd) {
-        Some(fdinfo) => parse_eventfd_count(&fdinfo) == Some(0),
+        Ok(Some(fdinfo)) => parse_eventfd_count(&fdinfo) == Some(0),
         // Unreadable fdinfo proves nothing about this descriptor, and
         // this guard exists to keep a spend from clobbering a real
         // descriptor: fail closed.
-        None => false,
+        Ok(None) | Err(_) => false,
     }
 }
 
@@ -1315,23 +1324,27 @@ fn syscall_clears_pending(syscall: Syscall, fd: libc::c_int) -> bool {
 /// copy is used now, and every other thread shares it.
 #[derive(Default)]
 pub struct ReplayOutputs {
-    pub stdout: std::sync::OnceLock<Option<std::os::fd::OwnedFd>>,
-    pub stderr: std::sync::OnceLock<Option<std::os::fd::OwnedFd>>,
+    pub stdout: Option<std::os::fd::OwnedFd>,
+    pub stderr: Option<std::os::fd::OwnedFd>,
     /// Preserve replayed write ordering independently for each captured stream.
     pub stdout_output_lock: tokio::sync::Mutex<()>,
     pub stderr_output_lock: tokio::sync::Mutex<()>,
-    pub stdout_error: std::sync::OnceLock<Option<String>>,
-    pub stderr_error: std::sync::OnceLock<Option<String>>,
+    pub stdout_error: Option<String>,
+    pub stderr_error: Option<String>,
 }
 
 impl ReplayOutputs {
-    fn capture_into<H: RecordHost, G>(&self, access: &DescriptorAccess<'_, H, G>) {
+    fn capture<H: RecordHost, G>(access: &DescriptorAccess<'_, H, G>) -> Self {
         let (stdout, stdout_error) = capture_guest_fd::<H, G>(access, libc::STDOUT_FILENO);
         let (stderr, stderr_error) = capture_guest_fd::<H, G>(access, libc::STDERR_FILENO);
-        let _ = self.stdout.set(stdout);
-        let _ = self.stderr.set(stderr);
-        let _ = self.stdout_error.set(stdout_error);
-        let _ = self.stderr_error.set(stderr_error);
+        Self {
+            stdout,
+            stderr,
+            stdout_output_lock: tokio::sync::Mutex::new(()),
+            stderr_output_lock: tokio::sync::Mutex::new(()),
+            stdout_error,
+            stderr_error,
+        }
     }
 }
 
@@ -1370,11 +1383,6 @@ pub struct ReplayerWithHost<H: RecordHost> {
     // Keep track of the data directory. Each thread uses this path to open its
     // event stream.
     data: PathBuf,
-    /// Duplicates of this process's descriptors 1 and 2 when it was created.
-    /// Only the root guest's are the captured output endpoints, so only the
-    /// root thread takes them (`ReplayerThreadState::outputs`).
-    #[serde(skip)]
-    outputs: std::sync::Arc<ReplayOutputs>,
 }
 
 /// The replayer on the ptrace backend's host; what `hermit replay`
@@ -1387,7 +1395,6 @@ impl<H: RecordHost> Default for ReplayerWithHost<H> {
             _host: PhantomData,
             data: PathBuf::new(),
             init: H::InitStorage::default(),
-            outputs: Default::default(),
         }
     }
 }
@@ -1406,24 +1413,25 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
             _host: PhantomData,
             data: cfg.replay_data.as_ref().unwrap().clone(),
             init: H::InitStorage::default(),
-            outputs: Default::default(),
         }
     }
 
     /// First pre-execution guest boundary: install the run's
-    /// descriptor provider, then (process leader only) capture the
-    /// root endpoints shared by every thread state, before any
-    /// descriptor-mutating injection or replayed write.
+    /// descriptor provider, then build the complete captured-output
+    /// bundle only into a fresh root state (consuming its one-use
+    /// flag), before any descriptor-mutating injection or replayed
+    /// write. Descendants inherit the published bundle; a forked
+    /// leader never recaptures its own endpoints.
     async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
         H::install(&self.init, guest.descriptor_provider());
-        if guest.tid() == guest.pid() {
+        if guest.thread_state().fresh_root_capture {
             let table = guest.tid();
-            self.outputs
-                .capture_into::<H, G>(&DescriptorAccess::guest_bound(
-                    &self.init,
-                    &mut *guest,
-                    table,
-                ));
+            let outputs = std::sync::Arc::new(ReplayOutputs::capture::<H, G>(
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
+            ));
+            let state = guest.thread_state_mut();
+            state.outputs = outputs;
+            state.fresh_root_capture = false;
         }
         Ok(())
     }
@@ -1451,8 +1459,9 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
             child_stream_ids: ChildEventStreamIds::default(),
             interrupted_poll: None,
             bootstrapped: parent.is_some_and(|(_, state)| state.bootstrapped),
+            fresh_root_capture: parent.is_none(),
             outputs: match parent {
-                None => self.outputs.clone(),
+                None => std::sync::Arc::new(ReplayOutputs::default()),
                 Some((_, state)) => state.outputs.clone(),
             },
         }
@@ -2577,7 +2586,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         Ok(())
     }
     pub(super) fn fd_is_in_replay_root(&self, pid: Pid, fd: libc::c_int) -> bool {
-        let Some(metadata) =
+        let Ok(Some(metadata)) =
             H::fd_metadata(&DescriptorAccess::<H, ()>::task(&self.init, pid, pid), fd)
         else {
             return false;
@@ -4098,6 +4107,8 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             &DescriptorAccess::guest_bound(&self.init, &mut *guest, thread),
             call.fd(),
         )
+        .ok()
+        .flatten()
         .is_some_and(|metadata| metadata.is_dir())
         {
             return next_event!(guest, Return);

@@ -42,8 +42,7 @@
 //! `/proc/<pid>/limits` and `status` reads, the `/proc/<tid>/net/unix`
 //! table read, process root/directory opens
 //! (`record_replay_path`), the replayer `FICLONE` destination reopen
-//! by its `/proc/<pid>/fd` path, the exec-restore descriptor scan's
-//! directory listing, the tool's own `/proc/self` descriptor reads,
+//! by its `/proc/<pid>/fd` path, the tool's own `/proc/self` descriptor reads,
 //! captured-output identity matching over `stat` results this trait
 //! returns, and replay materialization. A second [`RecordHost`]
 //! implementation must route or refuse each of those for its backend
@@ -182,6 +181,19 @@ impl<'a, H: RecordHost + ?Sized, G> DescriptorAccess<'a, H, G> {
     }
 }
 
+/// One descriptor snapshot for mapping capture: the `stat` facts,
+/// link target and filesystem type of a single descriptor, read in
+/// one query sequence (see [`RecordHost::descriptor_snapshot`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DescriptorSnapshot {
+    /// The descriptor's `stat` facts.
+    pub metadata: reverie::DescriptorMetadata,
+    /// Its link target naming.
+    pub target: PathBuf,
+    /// Its filesystem type (`statfs` `f_type`).
+    pub fs_type: i64,
+}
+
 /// Descriptor facts and host descriptor operations for one backend.
 ///
 /// A tool names its host as a type parameter (for example
@@ -204,8 +216,11 @@ pub trait RecordHost: Send + Sync + 'static {
 
     /// Retains `provider` (the guest's descriptor provider, taken at
     /// the tool's first pre-execution guest boundary) in `storage`
-    /// for the rest of the run. Called once per run, before any
-    /// descriptor capture.
+    /// for the rest of the run, before any descriptor capture.
+    /// Install is called at every thread start: it is idempotent,
+    /// the same provider is passed each time within one run, the
+    /// first install wins, and a later install naming a different
+    /// run's provider is ignored, never substituted.
     fn install(
         storage: &Self::InitStorage,
         provider: Option<std::sync::Arc<dyn reverie::DescriptorProvider>>,
@@ -232,32 +247,51 @@ pub trait RecordHost: Send + Sync + 'static {
         fd: RawFd,
     ) -> impl std::future::Future<Output = bool> + Send;
 
-    /// The descriptor's `fdinfo` text, if it can be read.
-    /// Asynchronous for the same reason as [`Self::classify_fd`].
+    /// The descriptor's `fdinfo` text: `Ok(None)` when the
+    /// descriptor is not open, `Err` when the read itself failed
+    /// otherwise (required facts preserve the failure; callers that
+    /// historically collapsed every failure say so by mapping both
+    /// to their empty answer). Asynchronous for the same reason as
+    /// [`Self::classify_fd`].
     fn fdinfo_text<G: Guest<T>, T: Tool>(
         access: &mut DescriptorAccess<'_, Self, G>,
         fd: RawFd,
-    ) -> impl std::future::Future<Output = Option<String>> + Send;
+    ) -> impl std::future::Future<Output = io::Result<Option<String>>> + Send;
 
     /// The link target naming what descriptor `fd` in the access's
-    /// table refers to, if it can be read. Synchronous for registry
+    /// table refers to. The read's own error is preserved (a closed
+    /// descriptor is `ENOENT`); callers that historically collapsed
+    /// every failure map it themselves. Synchronous for registry
     /// paths that hold no guest handle.
-    fn fd_link<G>(access: &DescriptorAccess<'_, Self, G>, fd: RawFd) -> Option<PathBuf>;
+    fn fd_link<G>(access: &DescriptorAccess<'_, Self, G>, fd: RawFd) -> io::Result<PathBuf>;
 
-    /// The descriptor's `fdinfo` text by task; the synchronous
-    /// counterpart of [`Self::fdinfo_text`] for paths that hold no
-    /// guest handle.
-    fn fdinfo_text_at<G>(access: &DescriptorAccess<'_, Self, G>, fd: RawFd) -> Option<String>;
+    /// The descriptor's `fdinfo` text by task, with
+    /// [`Self::fdinfo_text`]'s error shape; the synchronous
+    /// counterpart for paths that hold no guest handle.
+    fn fdinfo_text_at<G>(
+        access: &DescriptorAccess<'_, Self, G>,
+        fd: RawFd,
+    ) -> io::Result<Option<String>>;
 
     /// `stat` of descriptor `fd` in the access's table, following
-    /// its link as `stat` on the descriptor does, if it can be read.
-    /// Synchronous: the guards that decide whether an effect through
-    /// [`Self::duplicate_guest_fd`] applies read it in the same
-    /// function as the effect.
+    /// its link as `stat` on the descriptor does: `Ok(None)` when
+    /// the descriptor is not open, `Err` when the read itself failed
+    /// otherwise. Synchronous: the guards that decide whether an
+    /// effect through [`Self::duplicate_guest_fd`] applies read it
+    /// in the same function as the effect.
     fn fd_metadata<G>(
         access: &DescriptorAccess<'_, Self, G>,
         fd: RawFd,
-    ) -> Option<reverie::DescriptorMetadata>;
+    ) -> io::Result<Option<reverie::DescriptorMetadata>>;
+
+    /// One descriptor snapshot for mapping capture: `stat`, link
+    /// target and filesystem type read in a single query sequence
+    /// over one descriptor path, so a host formats that path once.
+    /// Errors are the reads' own, in `stat`, `statfs`, link order.
+    fn descriptor_snapshot<G>(
+        access: &DescriptorAccess<'_, Self, G>,
+        fd: RawFd,
+    ) -> io::Result<DescriptorSnapshot>;
 
     /// Duplicates guest descriptor `fd` of process `pid` into this
     /// process, preserving its open file description. Synchronous
@@ -300,12 +334,14 @@ pub trait RecordHost: Send + Sync + 'static {
     /// Visits the descriptor numbers open in the access process's
     /// table, in no promised order, stopping when `visit` returns
     /// `false` — lazily, so a caller searching for the first match
-    /// pays only for the descriptors it inspects. `None` when the
-    /// table cannot be listed.
+    /// pays only for the descriptors it inspects. Listing and
+    /// per-entry failures are the enumeration's own errors,
+    /// preserved for callers that must not lose a descriptor to a
+    /// silent skip.
     fn visit_descriptor_numbers<G, F: FnMut(RawFd) -> bool>(
         access: &DescriptorAccess<'_, Self, G>,
         visit: F,
-    ) -> Option<()>;
+    ) -> io::Result<()>;
 
     /// Whether guest task `pid` still exists.
     fn guest_task_exists<G>(access: &DescriptorAccess<'_, Self, G>, pid: Pid) -> bool;
@@ -373,38 +409,83 @@ impl RecordHost for PtraceHost {
         access: &mut DescriptorAccess<'_, Self, G>,
         fd: RawFd,
     ) -> bool {
-        Self::fd_link(access, fd).is_some_and(|target| link_is_eventfd(&target))
+        Self::fd_link(access, fd).is_ok_and(|target| link_is_eventfd(&target))
     }
 
     async fn fdinfo_text<G: Guest<T>, T: Tool>(
         access: &mut DescriptorAccess<'_, Self, G>,
         fd: RawFd,
-    ) -> Option<String> {
+    ) -> io::Result<Option<String>> {
         Self::fdinfo_text_at(access, fd)
     }
 
-    fn fd_link<G>(access: &DescriptorAccess<'_, Self, G>, fd: RawFd) -> Option<PathBuf> {
-        std::fs::read_link(format!("/proc/{}/fd/{fd}", access.table().as_raw())).ok()
+    fn fd_link<G>(access: &DescriptorAccess<'_, Self, G>, fd: RawFd) -> io::Result<PathBuf> {
+        std::fs::read_link(format!("/proc/{}/fd/{fd}", access.table().as_raw()))
     }
 
-    fn fdinfo_text_at<G>(access: &DescriptorAccess<'_, Self, G>, fd: RawFd) -> Option<String> {
-        std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", access.table().as_raw())).ok()
+    fn fdinfo_text_at<G>(
+        access: &DescriptorAccess<'_, Self, G>,
+        fd: RawFd,
+    ) -> io::Result<Option<String>> {
+        match std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", access.table().as_raw())) {
+            Ok(text) => Ok(Some(text)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     fn fd_metadata<G>(
         access: &DescriptorAccess<'_, Self, G>,
         fd: RawFd,
-    ) -> Option<reverie::DescriptorMetadata> {
+    ) -> io::Result<Option<reverie::DescriptorMetadata>> {
         use std::os::unix::fs::MetadataExt as _;
-        let metadata =
-            std::fs::metadata(format!("/proc/{}/fd/{fd}", access.table().as_raw())).ok()?;
-        Some(reverie::DescriptorMetadata::new(
+        let metadata = match std::fs::metadata(format!("/proc/{}/fd/{fd}", access.table().as_raw()))
+        {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(Some(reverie::DescriptorMetadata::new(
             metadata.mode(),
             metadata.rdev(),
             metadata.dev(),
             metadata.ino(),
             metadata.len(),
-        ))
+        )))
+    }
+
+    fn descriptor_snapshot<G>(
+        access: &DescriptorAccess<'_, Self, G>,
+        fd: RawFd,
+    ) -> io::Result<DescriptorSnapshot> {
+        use std::os::unix::fs::MetadataExt as _;
+        // One formatted path serves stat, statfs and the link read,
+        // in the parent code's order.
+        let path = format!("/proc/{}/fd/{fd}", access.table().as_raw());
+        let metadata = std::fs::metadata(&path)?;
+        let fs_type = {
+            let c_path = std::ffi::CString::new(path.as_str())
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+            // SAFETY: statfs writes only through the out pointer for
+            // a NUL-terminated path.
+            let mut stats: libc::statfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statfs(c_path.as_ptr(), &mut stats) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            stats.f_type
+        };
+        let target = std::fs::read_link(&path)?;
+        Ok(DescriptorSnapshot {
+            metadata: reverie::DescriptorMetadata::new(
+                metadata.mode(),
+                metadata.rdev(),
+                metadata.dev(),
+                metadata.ino(),
+                metadata.len(),
+            ),
+            target,
+            fs_type,
+        })
     }
 
     fn duplicate_guest_fd<G>(
@@ -456,9 +537,10 @@ impl RecordHost for PtraceHost {
     fn visit_descriptor_numbers<G, F: FnMut(RawFd) -> bool>(
         access: &DescriptorAccess<'_, Self, G>,
         mut visit: F,
-    ) -> Option<()> {
-        let entries = std::fs::read_dir(format!("/proc/{}/fd", access.pid().as_raw())).ok()?;
-        for entry in entries.flatten() {
+    ) -> io::Result<()> {
+        let entries = std::fs::read_dir(format!("/proc/{}/fd", access.pid().as_raw()))?;
+        for entry in entries {
+            let entry = entry?;
             let Some(fd) = entry
                 .file_name()
                 .to_str()
@@ -470,7 +552,7 @@ impl RecordHost for PtraceHost {
                 break;
             }
         }
-        Some(())
+        Ok(())
     }
 
     fn guest_task_exists<G>(_access: &DescriptorAccess<'_, Self, G>, pid: Pid) -> bool {
@@ -544,7 +626,7 @@ mod tests {
             visited += 1;
             false
         });
-        assert_eq!(listed, Some(()));
+        assert!(listed.is_ok());
         assert_eq!(visited, 1);
     }
 

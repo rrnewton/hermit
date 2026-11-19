@@ -968,14 +968,8 @@ impl ReplayOutputs {
                 )));
             }
         };
-        let output = output
-            .get()
-            .and_then(|output| output.as_ref())
-            .ok_or_else(|| {
-                let reason = error
-                    .get()
-                    .and_then(|error| error.as_deref())
-                    .unwrap_or("descriptor was closed");
+        let output = output.as_ref().ok_or_else(|| {
+            let reason = error.as_deref().unwrap_or("descriptor was closed");
             Error::Tool(anyhow::anyhow!(
                 "recording requires output fd {output_fd}, but replay could not duplicate it: {reason}"
             ))
@@ -1515,7 +1509,7 @@ mod tests {
     #[test]
     fn missing_or_invalid_output_endpoint_is_an_outer_tool_error() {
         let outputs = ReplayOutputs {
-            stdout_error: std::sync::OnceLock::from(Some("Too many open files".to_owned())),
+            stdout_error: Some("Too many open files".to_owned()),
             ..ReplayOutputs::default()
         };
         for output_fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO, 9] {
