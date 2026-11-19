@@ -170,8 +170,7 @@ fn manifest_is_path_sourced(root: &Path) -> Result<bool> {
 /// `GitlinkCheckout`, so the pin proof runs for a real checkout.
 fn source_layout(root: &Path) -> Result<CompiledSourceLayout> {
     Ok(
-        if manifest_is_path_sourced(root)?
-            && !reverie_root_has_git_metadata(&root.join("reverie"))
+        if manifest_is_path_sourced(root)? && !reverie_root_has_git_metadata(&root.join("reverie"))
         {
             CompiledSourceLayout::PathCheckout
         } else {
@@ -332,8 +331,7 @@ fn copied_path_source_checks(case: &Path, original: &Path, runner: &mut Runner) 
         CompiledSourceLayout::PathCheckout => {
             assert_eq!(expected["layout"], "HermitPath");
             assert_eq!(
-                expected["authority"]["reverie_sha256"],
-                observed["authority"]["reverie_sha256"],
+                expected["authority"]["reverie_sha256"], observed["authority"]["reverie_sha256"],
                 "gitless original and gitless copy must bind identical content",
             );
             assert_eq!(
@@ -871,18 +869,16 @@ fn path_transaction_checks(case: &Path, runner: &mut Runner) -> Result<()> {
     // Failure path: the body error and the closing error both surface.
     let context = resolve(&copied, runner)?;
     io(fs::write(&role, &changed))?;
-    let body: Result<()> = Err("deliberate receipt-only body failure".into());
+    let body_error = "deliberate receipt-only body failure";
     let close = context.verify_unchanged(runner);
     io(fs::write(&role, &bytes))?;
     assert_eq!(io(fs::read(&role))?, bytes);
     let combined = format!(
-        "{}; compiled source transaction close failed: {}",
-        body.unwrap_err(),
+        "{body_error}; compiled source transaction close failed: {}",
         close.unwrap_err(),
     );
     assert!(
-        combined.contains("deliberate receipt-only body failure")
-            && combined.contains("catalog"),
+        combined.contains("deliberate receipt-only body failure") && combined.contains("catalog"),
         "{combined}",
     );
     resolve(&copied, runner)?;
