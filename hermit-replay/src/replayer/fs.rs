@@ -1180,14 +1180,16 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 let _guard = output_lock.lock().await;
                 truncate_replay_output(output, event.length)?;
             }
-            if event.replay_regular_file
+            if self.write_output_files
+                && event.replay_regular_file
                 && event.output_fd.is_none()
                 && let Ok(length) = u64::try_from(event.length)
             {
                 super::mmap::truncate_shared_backing(guest.tid(), syscall.fd(), length)
                     .map_err(Error::Io)?;
             }
-            if event.replay_regular_file
+            if self.write_output_files
+                && event.replay_regular_file
                 && event.output_fd.is_none()
                 && self.fd_is_in_replay_root(guest.pid(), syscall.fd())
             {
@@ -1268,6 +1270,12 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             ioctl::Request::FICLONE(_) | ioctl::Request::FICLONERANGE(_)
         ) {
             let snapshot = next_event!(guest, FileClone)?;
+            // rr-like default (6805): the clone's recorded success is
+            // the whole answer; no destination file is sized or
+            // written. Later reads replay from the recording.
+            if !self.write_output_files {
+                return Ok(0);
+            }
             let destination_is_internal = self.fd_is_in_replay_root(guest.pid(), syscall.fd());
             if destination_is_internal {
                 let path = format!("/proc/{}/fd/{}", guest.pid().as_raw(), syscall.fd());
