@@ -55,9 +55,11 @@
 //!    continuation, a delivery permit's holder, or held at a happens-before
 //!    gate), at its next probe (`pselect6`, a masked `ppoll`,
 //!    `rt_sigtimedwait`), through the drain (an internal IO poll with the
-//!    restart marker, a backend-served `rt_sigsuspend`). Every other state
-//!    is refused by name (`SendRefusal`), a raw `select` included
-//!    (`SendRefusal::RawSelect`).
+//!    restart marker, a backend-served `rt_sigsuspend`), or in a parked
+//!    observation (an emulated `pause`, `nanosleep`, polled read or child
+//!    wait, which the observation pass begins for the chosen receiver:
+//!    slice D1). Every other state is refused by name (`SendRefusal`), a
+//!    raw `select` included (`SendRefusal::RawSelect`).
 //!
 //! A signalfd reads its reader's own queue and its process's shared one. A
 //! read of a blocking signalfd runs outside the schedule, as a host call, and
@@ -73,20 +75,24 @@
 //! move, and no thread is marked.
 //!
 //! An admitted copy that its receiver is to take is claimed for it once the
-//! forwarded call succeeds (`Scheduler::guest_send_committed`), until the
-//! receiver takes it. A receiver chosen while runnable can still enter a wait
-//! before its next boundary: this backend's emulated `pause` and `nanosleep`
-//! do not look for a pending signal before they park
+//! forwarded call succeeds (`Scheduler::guest_send_committed`), with the
+//! sender's committed virtual time, when the send is due, until the
+//! receiver takes it. A receiver chosen while runnable can still enter a
+//! wait before its next boundary: this backend's emulated `pause` and
+//! `nanosleep` do not look for a pending signal before they park
 //! (`supports_blocked_wait_signal_interruption`), and the observation that
 //! ends such a wait for a signal of the thread's own looks at its own queue
 //! only. Linux returns from such a wait at once. So at every pass that can
 //! begin a parked observation the claims are checked again
-//! (`Scheduler::audit_guest_send_claims`), and a claimed copy whose receiver
-//! now waits where it cannot take it ends the run with that refusal, as the
-//! design's retargeting rule ends it for a receiver in a refused state.
-//! Linux would also wake another thread for a shared copy whose receiver
-//! exited or blocked the signal first (`retarget_shared_pending`), which is
-//! slice E; until then that case is refused too.
+//! (`Scheduler::audit_guest_send_claims`), a claimed receiver parked in an
+//! observable wait is served by that pass
+//! (`Scheduler::select_guest_sent_receiver`), and a claimed copy whose
+//! receiver now waits where it cannot take it ends the run with that
+//! refusal, as the design's retargeting rule ends it for a receiver in a
+//! refused state. Linux would also wake another thread for a shared copy
+//! whose receiver exited or blocked the signal first
+//! (`retarget_shared_pending`), which is slice E; until then that case is
+//! refused too.
 //!
 //! An observation begun for another reason (a SIGALRM, a parent-death signal)
 //! takes the lowest signal its thread leaves unblocked, from its own queue
@@ -137,6 +143,7 @@
 
 use std::fmt;
 
+use reverie::PendingDomain;
 use reverie::syscalls::Errno;
 use serde::Deserialize;
 use serde::Serialize;
@@ -152,6 +159,7 @@ use super::process_signal_receiver::complete_signal;
 use crate::resources::ResourceID;
 use crate::types::DetPid;
 use crate::types::DetTid;
+use crate::types::LogicalTime;
 
 /// Whether a guest's send names one thread or its process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,7 +173,7 @@ pub enum SendScope {
 }
 
 /// How an admitted receiver takes a caught copy (the rows of section 2's
-/// table that slice C admits).
+/// table that slices C and D1 admit).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CatchReach {
     /// Runnable, a continuation posted and not yet granted, or a delivery
@@ -174,8 +182,9 @@ pub enum CatchReach {
     Boundary,
     /// Held at a happens-before gate: at its boundary once it is released.
     Gate,
-    /// Probing in `pselect6`, a masked `ppoll` or
-    /// `rt_sigtimedwait`: its next probe takes the copy.
+    /// Probing in `pselect6`, a masked `ppoll`, or an `rt_sigtimedwait`
+    /// with no registered wait set (its first probe fails in the kernel):
+    /// its next probe takes the copy.
     Probe,
     /// Parked in an internal IO poll with the restart marker: the drain
     /// answers its turn `Signaled` (`Scheduler::notify_signal_pending`).
@@ -183,6 +192,18 @@ pub enum CatchReach {
     /// In a backend-served `rt_sigsuspend`: the drain wakes it
     /// (`Scheduler::wake_backend_signal_waits`).
     BackendSuspend,
+    /// Parked in an emulated `pause`, `nanosleep`, polled read or child
+    /// wait: the observation pass begins a parked observation on it
+    /// (`Scheduler::select_guest_sent_receiver`). Appended after the
+    /// slice-C variants so their serialized discriminants do not move.
+    Parked,
+    /// Probing in `rt_sigtimedwait` with a registered wait set
+    /// (`Scheduler::sigtimedwait_sets`, the typed state the wait itself
+    /// publishes): its probe takes only wait-set copies, so a transition
+    /// it cannot carry out must not be admitted on this reach. Appended
+    /// after the earlier variants so their serialized discriminants do
+    /// not move.
+    ProbeWaitSetOnly,
 }
 
 /// Why a guest's send is refused at admission, each naming the state and
@@ -206,7 +227,10 @@ pub enum SendRefusal {
     /// thread of the sender's own process.
     SenderTakesIt(DetTid),
     /// The receiver is parked in an emulated `pause`, `nanosleep`, polled read
-    /// or child wait: slice D.
+    /// or child wait. No longer constructed since slice D1, which admits
+    /// that state (`CatchReach::Parked`); retained so the serialized
+    /// discriminants of the other variants in `GlobalResponse`'s bincode
+    /// do not move.
     Parked(DetTid),
     /// The receiver polls in a call whose probe never takes a pending signal
     /// (`poll`, `epoll_wait`, an unmasked `ppoll`): slice D.
@@ -343,14 +367,104 @@ pub enum SendAdmission {
     Refused(SendRefusal),
 }
 
+/// One standing copy of a guest-sent signal: which queue it waits in, its
+/// signal, and when its send was due. The due time is attached at
+/// construction, so a claim without one cannot be made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ClaimedSignal {
+    domain: PendingDomain,
+    signo: i32,
+    /// The sender's committed virtual time at the send's commit point (the
+    /// design's section 6, "Time"). The guest-sent step of the observation
+    /// pass judges a parked `nanosleep` by that time, not by the later
+    /// pass's, as a timed signal is judged by when it was due
+    /// (`signal_sent_at`).
+    due: LogicalTime,
+}
+
 /// The copies a guest sent from another process that wait for the thread the
-/// admission chose to take them (`Scheduler::guest_send_committed`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// admission chose to take them (`Scheduler::guest_send_committed`), keyed
+/// by queue and signal: the same signal claimed in the shared and the
+/// private queue keeps a distinct due time in each. For one key, the first
+/// standing copy's due time is kept: that is the copy a dequeue of that
+/// queue takes first, and the one an interrupted sleep's remaining time is
+/// judged by.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GuestSendClaim {
-    /// Signals in the thread's process's shared queue.
-    pub(crate) shared: u64,
-    /// Signals in the thread's own queue.
-    pub(crate) private: u64,
+    copies: Vec<ClaimedSignal>,
+}
+
+impl GuestSendClaim {
+    /// Claim `signo`, sent in `scope`, due at `due`. A signal already
+    /// standing in that queue keeps its earlier due time: committed time
+    /// never goes back, so its first standing copy is its earliest due.
+    pub(crate) fn insert(&mut self, scope: SendScope, signo: i32, due: LogicalTime) {
+        let domain = match scope {
+            SendScope::Thread => PendingDomain::Thread,
+            SendScope::Process => PendingDomain::Process,
+        };
+        if self
+            .copies
+            .iter()
+            .all(|copy| copy.domain != domain || copy.signo != signo)
+        {
+            self.copies.push(ClaimedSignal {
+                domain,
+                signo,
+                due,
+            });
+        }
+    }
+
+    /// The standing copies in the thread's process's shared queue.
+    pub(crate) fn shared(&self) -> u64 {
+        self.bits(PendingDomain::Process)
+    }
+
+    /// The standing copies in the thread's own queue.
+    pub(crate) fn private(&self) -> u64 {
+        self.bits(PendingDomain::Thread)
+    }
+
+    fn bits(&self, domain: PendingDomain) -> u64 {
+        self.copies
+            .iter()
+            .filter(|copy| copy.domain == domain)
+            .fold(0, |bits, copy| bits | kernel_signal_bit(copy.signo))
+    }
+
+    /// The claim as it stands against the queues' pending bits and the
+    /// receiver's mask: a copy taken, flushed, or blocked now drops out,
+    /// with its due time (`Scheduler::standing_claim`).
+    fn reconcile(self, shared_pending: u64, private_pending: u64, mask: u64) -> GuestSendClaim {
+        GuestSendClaim {
+            copies: self
+                .copies
+                .into_iter()
+                .filter(|copy| {
+                    let pending = match copy.domain {
+                        PendingDomain::Process => shared_pending,
+                        PendingDomain::Thread => private_pending,
+                    };
+                    pending & !mask & kernel_signal_bit(copy.signo) != 0
+                })
+                .collect(),
+        }
+    }
+
+    /// When the earliest standing copy was due, if one stands.
+    pub(crate) fn earliest_due(&self) -> Option<LogicalTime> {
+        self.copies.iter().map(|copy| copy.due).min()
+    }
+
+    /// When the standing copy of `signo` in `domain`'s queue was due, if
+    /// one stands.
+    pub(crate) fn due_for(&self, domain: PendingDomain, signo: i32) -> Option<LogicalTime> {
+        self.copies
+            .iter()
+            .find(|copy| copy.domain == domain && copy.signo == signo)
+            .map(|copy| copy.due)
+    }
 }
 
 /// Why a claimed copy can no longer be delivered as its admission decided
@@ -632,7 +746,7 @@ impl Scheduler {
             || self
                 .guest_send_claims
                 .get(&thread)
-                .is_some_and(|claim| claim.shared | claim.private != 0);
+                .is_some_and(|claim| claim.shared() | claim.private() != 0);
         if chosen {
             return Wants::Busy;
         }
@@ -677,7 +791,7 @@ impl Scheduler {
             && !turn.req.is_empty()
             && !turn.resp.is_full()
         {
-            return Err(SendRefusal::Parked(thread));
+            return Ok(CatchReach::Parked);
         }
         if self
             .parked_futex_waiter(thread)
@@ -722,13 +836,22 @@ impl Scheduler {
         }
         // Each probe of these calls applies the call's mask and takes a
         // pending signal it lets in (a `ppoll` only under a mask of its own:
-        // `Detcore::backend_masked_ppoll_wait`).
-        let probes = request.fyi.as_str() == "rt_sigtimedwait"
+        // `Detcore::backend_masked_ppoll_wait`). Whether a probe is the
+        // wait-set-only kind is the typed wait state itself
+        // (`sigtimedwait_sets`, published by the `rt_sigtimedwait` handler
+        // before it polls), never the request's debugging label.
+        let wait_set_only = self.sigtimedwait_sets.contains_key(&thread);
+        let probes = wait_set_only
+            || request.fyi.as_str() == "rt_sigtimedwait"
             || (request.signal_interrupt_errno() == Some(Errno::EINTR.into_raw())
                 && (request.fyi.as_str() == "pselect6"
                     || (request.fyi.as_str() == "ppoll" && request.blocked_signal_mask.is_some())));
         if probes {
-            return Ok(CatchReach::Probe);
+            return Ok(if wait_set_only {
+                CatchReach::ProbeWaitSetOnly
+            } else {
+                CatchReach::Probe
+            });
         }
         if self.restartable_internal_io_signals(thread).is_some() {
             return Ok(CatchReach::RestartablePoll);
@@ -737,19 +860,20 @@ impl Scheduler {
     }
 
     /// The guest send that `guest_send_admission` admitted for `receiver` to
-    /// take succeeded: the copy is claimed for it until it takes it
+    /// take succeeded: the copy is claimed for it, due at the sender's
+    /// committed virtual time now, until it takes it
     /// (`audit_guest_send_claims`), and Linux's `signal_wake_up` makes it busy
-    /// for a later choice (`controlled_wants`).
+    /// for a later choice (`controlled_wants`). A signal already standing
+    /// keeps its earlier due time: committed time never goes back, so its
+    /// first standing copy is its earliest due.
     pub(crate) fn guest_send_committed(&mut self, receiver: DetTid, scope: SendScope, signo: i32) {
         if !self.signal_control_installed() || !(1..=64).contains(&signo) {
             return;
         }
-        let bit = kernel_signal_bit(signo);
-        let claim = self.guest_send_claims.entry(receiver).or_default();
-        match scope {
-            SendScope::Thread => claim.private |= bit,
-            SendScope::Process => claim.shared |= bit,
-        }
+        self.guest_send_claims
+            .entry(receiver)
+            .or_default()
+            .insert(scope, signo, self.committed_time);
     }
 
     /// Check every claimed copy again (module docs), at a pass that may begin
@@ -757,14 +881,15 @@ impl Scheduler {
     /// was taken, flushed, or is blocked now, and find a receiver that now
     /// waits where it cannot take its copy, or a shared copy left behind by a
     /// receiver that exited or blocked it while another live thread leaves
-    /// it unblocked. A thread parked where the observation of its own signals
-    /// reaches it (`observe_parked_thread_woken_by_its_own_signal`) takes a
-    /// copy in its own queue there, so only a shared copy is refused for it.
+    /// it unblocked. A receiver parked in an observable wait is no refusal:
+    /// the same pass serves it (`select_guest_sent_receiver`), as the
+    /// observation of its own signals already reached a copy in its own
+    /// queue there (`observe_parked_thread_woken_by_its_own_signal`).
     pub(crate) fn audit_guest_send_claims(&mut self) -> Option<ClaimRefusal> {
         let claims: Vec<(DetTid, GuestSendClaim)> = self
             .guest_send_claims
             .iter()
-            .map(|(thread, claim)| (*thread, *claim))
+            .map(|(thread, claim)| (*thread, claim.clone()))
             .collect();
         for (thread, claim) in claims {
             let process = self.sigchld_process(thread);
@@ -778,7 +903,7 @@ impl Scheduler {
                 // Its own queue went with it; a shared copy stays.
                 let shared = self
                     .read_shared_pending_of(process, thread)
-                    .map_or(0, |pending| claim.shared & pending);
+                    .map_or(0, |pending| claim.shared() & pending);
                 let refusal = (shared != 0)
                     .then(|| self.retarget_refusal(thread, process, shared))
                     .flatten();
@@ -811,8 +936,7 @@ impl Scheduler {
             // Not readable now: judged at the next pass.
             return (claim, None);
         };
-        let shared = claim.shared & state.shared_pending;
-        let private = claim.private & state.thread_pending;
+        let shared = claim.shared() & state.shared_pending;
         // Blocked now: a copy in its own queue waits for it, and a shared one
         // for whichever thread unblocks it first.
         if shared & mask != 0
@@ -820,18 +944,13 @@ impl Scheduler {
         {
             return (GuestSendClaim::default(), Some(refusal));
         }
-        let standing = GuestSendClaim {
-            shared: shared & !mask,
-            private: private & !mask,
-        };
-        if standing == GuestSendClaim::default() {
-            return (standing, None);
+        let standing = claim.reconcile(state.shared_pending, state.thread_pending, mask);
+        if standing.shared() | standing.private() == 0 {
+            return (GuestSendClaim::default(), None);
         }
         let refusal = match self.catch_reach(thread) {
             Ok(_) | Err(SendRefusal::UnknownState(_)) => None,
-            Err(SendRefusal::Parked(_)) if standing.shared == 0 => None,
-            Err(SendRefusal::Parked(_)) => Some((standing.shared, SendRefusal::Parked(thread))),
-            Err(refusal) => Some((standing.shared | standing.private, refusal)),
+            Err(refusal) => Some((standing.shared() | standing.private(), refusal)),
         };
         (
             standing,
@@ -888,11 +1007,11 @@ impl Scheduler {
         self.guest_send_claims
             .iter()
             .filter(|(thread, claim)| {
-                **thread != observed && claim.shared != 0 && self.sigchld_process(**thread) == pid
+                **thread != observed && claim.shared() != 0 && self.sigchld_process(**thread) == pid
             })
             .find_map(|(thread, claim)| {
                 let pending = self.read_shared_pending_of(pid, *thread)?;
-                let contested = claim.shared & pending & !mask;
+                let contested = claim.shared() & pending & !mask;
                 (contested != 0).then(|| ClaimRefusal {
                     receiver: *thread,
                     signal: lowest_signal(contested),

@@ -231,7 +231,7 @@ impl Scheduler {
     fn shared_copies_chosen_for(&self, thread: DetTid) -> u64 {
         self.guest_send_claims
             .get(&thread)
-            .map_or(0, |claim| claim.shared)
+            .map_or(0, |claim| claim.shared())
             | self
                 .process_signal_takers
                 .get(&thread)

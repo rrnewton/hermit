@@ -336,7 +336,7 @@ fn each_receiver_state_is_admitted_or_refused_by_name() {
         (
             "parked in pause",
             |s| parked_in_pause(s, TARGET, LEADER),
-            refused(SendRefusal::Parked(LEADER)),
+            catch(LEADER, CatchReach::Parked),
         ),
         (
             "futex wait",
@@ -493,10 +493,13 @@ fn a_waiter_in_rt_sigtimedwait_takes_a_default_fatal_signal_it_blocks() {
     polling(&mut s, LEADER, "rt_sigtimedwait", None, None);
     assert!(s.set_sigtimedwait_set(LEADER, Some(term)));
     runnable(&mut s, SIBLING);
-    assert_eq!(kill(&s, libc::SIGTERM), catch(LEADER, CatchReach::Probe));
+    assert_eq!(
+        kill(&s, libc::SIGTERM),
+        catch(LEADER, CatchReach::ProbeWaitSetOnly)
+    );
     assert_eq!(
         tgkill(&s, LEADER, libc::SIGTERM),
-        catch(LEADER, CatchReach::Probe)
+        catch(LEADER, CatchReach::ProbeWaitSetOnly)
     );
 
     let (mut s, control) = two_processes(state(0, 0, term, 0, 0));
@@ -558,13 +561,23 @@ fn a_claim_stands_until_its_copy_is_taken() {
     let (mut s, control) = two_processes(state(0, 0, 0, 0, usr1 | usr2));
     runnable(&mut s, LEADER);
     runnable(&mut s, SIBLING);
+    s.committed_time = LogicalTime::from_nanos(7);
     s.guest_send_committed(LEADER, SendScope::Process, libc::SIGUSR1);
+    let mut expected = GuestSendClaim::default();
+    expected.insert(
+        SendScope::Process,
+        libc::SIGUSR1,
+        LogicalTime::from_nanos(7),
+    );
+    assert_eq!(s.guest_send_claims.get(&LEADER), Some(&expected));
+    // A second standing copy keeps the earliest due time.
+    s.committed_time = LogicalTime::from_nanos(9);
+    s.guest_send_committed(LEADER, SendScope::Thread, libc::SIGUSR2);
     assert_eq!(
-        s.guest_send_claims.get(&LEADER),
-        Some(&GuestSendClaim {
-            shared: usr1,
-            private: 0
-        })
+        s.guest_send_claims
+            .get(&LEADER)
+            .and_then(|claim| claim.earliest_due()),
+        Some(LogicalTime::from_nanos(7))
     );
     // Linux's `signal_wake_up` makes the chosen thread busy: the next copy
     // goes to its sibling.
@@ -577,6 +590,17 @@ fn a_claim_stands_until_its_copy_is_taken() {
     }
     assert_eq!(s.audit_guest_send_claims(), None);
     assert!(s.guest_send_claims.contains_key(&LEADER));
+    // The audit kept the standing copy's due time and pruned the private
+    // copy's, whose queue no longer holds it.
+    let claim = s.guest_send_claims.get(&LEADER).expect("the standing claim");
+    assert_eq!(
+        claim.due_for(reverie::PendingDomain::Process, libc::SIGUSR1),
+        Some(LogicalTime::from_nanos(7))
+    );
+    assert_eq!(
+        claim.due_for(reverie::PendingDomain::Thread, libc::SIGUSR2),
+        None
+    );
     // Taken: nothing pending any more.
     for tid in [LEADER, SIBLING] {
         control.script(tid, vec![Ok(catching())]);
@@ -585,10 +609,56 @@ fn a_claim_stands_until_its_copy_is_taken() {
     assert!(s.guest_send_claims.is_empty());
 }
 
+/// The same signal claimed in both queues keeps a distinct due time in
+/// each: a later private copy does not overwrite (or inherit) the shared
+/// copy's due time, and consuming the shared copy leaves the private
+/// copy standing with its own.
+#[test]
+fn a_claim_keeps_a_due_time_per_queue() {
+    let usr1 = bit(libc::SIGUSR1);
+    let (mut s, control) = two_processes(state(usr1, usr1, 0, 0, usr1));
+    runnable(&mut s, LEADER);
+    runnable(&mut s, SIBLING);
+    s.committed_time = LogicalTime::from_nanos(7);
+    s.guest_send_committed(LEADER, SendScope::Process, libc::SIGUSR1);
+    s.committed_time = LogicalTime::from_nanos(13);
+    s.guest_send_committed(LEADER, SendScope::Thread, libc::SIGUSR1);
+    let claim = s.guest_send_claims.get(&LEADER).expect("the claim");
+    assert_eq!(claim.shared(), usr1);
+    assert_eq!(claim.private(), usr1);
+    assert_eq!(
+        claim.due_for(reverie::PendingDomain::Process, libc::SIGUSR1),
+        Some(LogicalTime::from_nanos(7))
+    );
+    assert_eq!(
+        claim.due_for(reverie::PendingDomain::Thread, libc::SIGUSR1),
+        Some(LogicalTime::from_nanos(13))
+    );
+    assert_eq!(claim.earliest_due(), Some(LogicalTime::from_nanos(7)));
+
+    // The shared copy is taken; the private copy stands with its own due.
+    for tid in [LEADER, SIBLING] {
+        control.script(tid, vec![Ok(state(usr1, 0, 0, 0, usr1))]);
+    }
+    assert_eq!(s.audit_guest_send_claims(), None);
+    let claim = s.guest_send_claims.get(&LEADER).expect("the claim");
+    assert_eq!(claim.shared(), 0);
+    assert_eq!(
+        claim.due_for(reverie::PendingDomain::Process, libc::SIGUSR1),
+        None
+    );
+    assert_eq!(
+        claim.due_for(reverie::PendingDomain::Thread, libc::SIGUSR1),
+        Some(LogicalTime::from_nanos(13))
+    );
+}
+
 /// A claimed receiver that begins to wait where it cannot take its copy ends
-/// the run with that refusal: a host call for either copy, and an emulated
-/// `pause` for a shared copy. A copy in its own queue reaches a parked
-/// thread through the observation of its own signals.
+/// the run with that refusal: a host call for either copy. An emulated
+/// `pause` is no refusal for either copy: the observation pass serves a
+/// parked receiver (`select_guest_sent_receiver`), as the observation of
+/// its own signals already reached a copy in its own queue there, so the
+/// claim stands for that pass.
 #[test]
 fn a_claimed_receiver_that_waits_where_it_cannot_take_the_copy_is_refused() {
     let usr1 = bit(libc::SIGUSR1);
@@ -616,21 +686,8 @@ fn a_claimed_receiver_that_waits_where_it_cannot_take_the_copy_is_refused() {
     runnable(&mut s, SIBLING);
     parked_in_pause(&mut s, TARGET, LEADER);
     s.guest_send_committed(LEADER, SendScope::Process, libc::SIGUSR1);
-    let refusal = s.audit_guest_send_claims();
-    assert_eq!(
-        refusal,
-        Some(ClaimRefusal {
-            receiver: LEADER,
-            signal: libc::SIGUSR1,
-            reason: ClaimReason::Waits(SendRefusal::Parked(LEADER)),
-        })
-    );
-    let text = refusal.unwrap().to_string();
-    assert!(
-        text.starts_with("HERMIT_KVM_SIGNAL_CLAIM_REFUSED: signal 10 ")
-            && text.contains("stage X1 slice D"),
-        "{text}"
-    );
+    assert_eq!(s.audit_guest_send_claims(), None);
+    assert!(s.guest_send_claims.contains_key(&LEADER));
 }
 
 /// A shared copy whose receiver exited, or blocked the signal, before taking

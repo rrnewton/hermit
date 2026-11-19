@@ -1464,6 +1464,34 @@ fn cross_process_signal_admission_guest() -> &'static Path {
     })
 }
 
+static NANOSLEEP_GUEST_SEND_DUE_TIME_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+fn nanosleep_guest_send_due_time_guest() -> &'static Path {
+    NANOSLEEP_GUEST_SEND_DUE_TIME_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("nanosleep-guest-send-due-time");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create nanosleep-guest-send-due-time guest directory");
+        let guest = build_root.join("nanosleep_guest_send_due_time");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/nanosleep_guest_send_due_time.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile nanosleep-guest-send-due-time guest");
+        assert!(
+            output.status.success(),
+            "nanosleep-guest-send-due-time guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
 static ROBUST_FUTEX_UNEXCHANGEABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 fn robust_futex_unexchangeable_word_guest() -> &'static Path {
@@ -26043,6 +26071,23 @@ const SENDS_KVM_ADMITS: [(&str, &str); 12] = [
 ];
 
 /// The sends of tests/c/cross_process_signal_admission.c, by `kill` and by
+/// `tgkill`, to a child parked in an emulated `pause`, a polled `read` of a
+/// pipe, a long `nanosleep`, or a child wait (with no child ready, and with
+/// one already a zombie).
+const SENDS_TO_A_PARKED_RECEIVER: [(&str, &str); 10] = [
+    ("pause", "kill"),
+    ("pause", "tgkill"),
+    ("read", "kill"),
+    ("read", "tgkill"),
+    ("sleep", "kill"),
+    ("sleep", "tgkill"),
+    ("waitchild", "kill"),
+    ("waitchild", "tgkill"),
+    ("waitchild-ready", "kill"),
+    ("waitchild-ready", "tgkill"),
+];
+
+/// The sends of tests/c/cross_process_signal_admission.c, by `kill` and by
 /// `tgkill`, across a wait, a new thread or an exec.
 const SENDS_ACROSS_A_WAIT_A_THREAD_OR_AN_EXEC: [(&str, &str); 8] = [
     ("waitfatal", "kill"),
@@ -26168,6 +26213,127 @@ fn run_kvm_guest_signals_to_another_process_that_kvm_admits_match_linux() {
     );
 }
 
+/// tests/c/cross_process_signal_admission.c, by `kill` and by `tgkill`, as
+/// in `guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`
+/// (`SENDS_TO_A_PARKED_RECEIVER`), on ptrace: a caught SIGUSR1 ends the
+/// child's `pause`, polled `read` and long `nanosleep` with EINTR, the
+/// handler running once, as on Linux.
+#[test]
+fn guest_signals_to_a_parked_receiver_match_linux() {
+    assert_admitted_sends_match_linux(
+        "guest_signals_to_a_parked_receiver_match_linux",
+        AdmittedOn::Ptrace,
+        &SENDS_TO_A_PARKED_RECEIVER,
+    );
+}
+
+/// `guest_signals_to_a_parked_receiver_match_linux` on KVM, where stage X1
+/// slice D1 of the KVM cross-process signal design
+/// (https://github.com/rrnewton/hermit/issues/4485) admits a caught copy
+/// for a receiver parked in an emulated wait and the observation pass
+/// begins its observation, each case also verified bitwise. Before D1
+/// these sends were the `pause` and `read` named refusals of
+/// `run_kvm_guest_signals_kvm_cannot_yet_deliver_are_named_refusals`.
+#[test]
+fn run_kvm_guest_signals_to_a_parked_receiver_match_linux() {
+    assert_admitted_sends_match_linux(
+        "run_kvm_guest_signals_to_a_parked_receiver_match_linux",
+        AdmittedOn::Kvm,
+        &SENDS_TO_A_PARKED_RECEIVER,
+    );
+}
+
+/// tests/c/nanosleep_guest_send_due_time.c: a parent sends a caught
+/// SIGUSR1 to its child in a 150 ms nanosleep and then computes in the same
+/// turn, so the pass that can wake the child comes after its deadline
+/// (the 100/150 ms deadlines fall before the first pass after the kill,
+/// which the default 200 ms `--max-timeslice` bounds).
+/// Natively the sleep is interrupted at the send, before the deadline, and
+/// returns EINTR with time left. On KVM the guest-sent step likewise judges
+/// the sleep by the send's due time, and its remaining time is reported
+/// from there, so KVM matches the native lines and verifies bitwise. On
+/// ptrace the drain judges the sleep at its own committed time, by then
+/// past the deadline, so the sleep instead completes and the handler runs
+/// as the call returns — the one case where the backends' permitted Linux
+/// outcomes differ, pinned here so neither silently becomes the other's.
+#[test]
+fn run_kvm_guest_sent_signal_ends_nanosleep_at_its_due_time() {
+    if kvm_unavailable("run_kvm_guest_sent_signal_ends_nanosleep_at_its_due_time") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = nanosleep_guest_send_due_time_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let at_due = "B: nanosleep returned 0, rem positive no, handler ran 0\n\
+                  C: nanosleep EINTR, rem positive yes, handler ran 1\n\
+                  parent: done\n";
+    let native = Command::new(guest)
+        .output()
+        .expect("run the nanosleep-guest-send-due-time guest natively");
+    assert!(native.status.success(), "native: {native:?}");
+    assert_eq!(stdout(&native), at_due, "native");
+
+    let args = [
+        "--backend=ptrace",
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "B: nanosleep returned 0, rem positive no, handler ran 0\n\
+         C: nanosleep returned 0, rem positive no, handler ran 1\n\
+         parent: done\n",
+        "ptrace"
+    );
+
+    let args = [
+        "--backend=kvm",
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), at_due, "kvm");
+
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("verify.json");
+    let report = report.to_str().expect("report path should be UTF-8");
+    let args = [
+        "--backend=kvm",
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report,
+        "--base-env=minimal",
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), at_due, "--verify on kvm");
+    let log = stderr(&output);
+    assert!(
+        log.contains(":: comparison=BitwiseInfoV1 relaxations=none"),
+        "--verify on kvm: comparison was not canonical:\n{log}"
+    );
+    assert!(
+        log.contains(":: Success: deterministic. Determinism verified."),
+        "--verify on kvm: verification failed:\n{log}"
+    );
+    assert_bitwise_parity(report, "--verify on kvm");
+}
+
 /// tests/c/cross_process_signal_admission.c, by `kill` and by `tgkill`, as in
 /// `guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`
 /// (`SENDS_ACROSS_A_WAIT_A_THREAD_OR_AN_EXEC`), on ptrace:
@@ -26201,21 +26367,29 @@ fn run_kvm_guest_signals_to_another_process_across_a_wait_a_thread_or_an_exec_ma
 /// The modes of tests/c/cross_process_signal_admission.c whose admitted
 /// delivery on KVM is also run under `--verify --verify-strict`: the runnable
 /// receiver, which takes its copy at a boundary of its own
-/// (`CatchReach::Boundary`), and the receivers whose next probe takes it
+/// (`CatchReach::Boundary`), the receivers whose next probe takes it
 /// (`CatchReach::Probe`: `select`, `pselect6`, `rt_sigtimedwait`, including
-/// the wait for a blocked default-fatal SIGTERM), and the first of two
-/// threads in a backend-served `sigsuspend` (`CatchReach::BackendSuspend`),
-/// whose sibling must not take the copy. Native equality alone does
-/// not show that two runs commit the same schedule, so these rows need the
-/// bitwise comparison too (condition C1 of the deterministic-scheduling
-/// review of https://github.com/rrnewton/hermit/pull/5415).
-const STRICT_VERIFY_ADMITTED_MODES: [&str; 6] = [
+/// the wait for a blocked default-fatal SIGTERM), the receivers the
+/// observation pass serves (`CatchReach::Parked`: `pause`, a polled `read`,
+/// a long `nanosleep`, a child wait with no child ready or with one already
+/// a zombie), and the first of two threads in a backend-served
+/// `sigsuspend` (`CatchReach::BackendSuspend`), whose sibling must not take
+/// the copy. Native equality alone does not show that two runs commit the
+/// same schedule, so these rows need the bitwise comparison too (condition
+/// C1 of the deterministic-scheduling review of
+/// https://github.com/rrnewton/hermit/pull/5415).
+const STRICT_VERIFY_ADMITTED_MODES: [&str; 11] = [
     "runnable",
     "select",
     "pselect",
     "sigtimedwait",
     "waitfatal",
     "sigsuspend-two",
+    "pause",
+    "read",
+    "sleep",
+    "waitchild",
+    "waitchild-ready",
 ];
 
 /// The modes of `SENDS_KVM_ADMITS` that ptrace refuses by name. With both of
@@ -26382,12 +26556,13 @@ const RAW_SELECT_MODES: [&str; 4] = [
 ];
 
 /// tests/c/cross_process_signal_admission.c on KVM: the sends to another
-/// process that stage X1 slice C refuses by name, before any effect
+/// process that stage X1 still refuses by name, before any effect
 /// (https://github.com/rrnewton/hermit/issues/4485): a caught signal to a
-/// child parked in `pause` or in a polled `read` of a pipe (slice D), to one
-/// in a `poll` whose probe never takes a pending signal (slice D), and to one
+/// child in a `poll` whose probe never takes a pending signal (slice D) or
 /// waiting on a futex (N8a); a default-fatal SIGTERM (slice F); SIGKILL
-/// (slice G); and a default stop (stage X2). A fail-closed run ends with the policy-refusal status naming
+/// (slice G); and a default stop (stage X2). The `pause`, polled `read` and
+/// `nanosleep` receivers slice D1 admits are
+/// `run_kvm_guest_signals_to_a_parked_receiver_match_linux`. A fail-closed run ends with the policy-refusal status naming
 /// the refusal, and the sender prints nothing after its call. With
 /// `--allow-unsupported-syscalls` the call returns ENOSYS and the child sees
 /// nothing: it reports as if no signal had been sent.
@@ -26407,22 +26582,7 @@ fn run_kvm_guest_signals_kvm_cannot_yet_deliver_are_named_refusals() {
     let guest = cross_process_signal_admission_guest()
         .to_str()
         .expect("guest path should be UTF-8");
-    let parked = "is parked in an emulated pause, nanosleep, polled read or child wait, which \
-                  KVM does not yet end for a signal another process sends (stage X1 slice D)";
-    let cases: [(&str, &str, &str); 7] = [
-        (
-            "pause",
-            parked,
-            "kill of USR1: -1 ENOSYS\nchild: pause returned -1 EINTR\nchild: alarm 1\n\
-             child: handler ran 0 time(s)\nchild exited 0\n",
-        ),
-        // Its own alarm ends the read, which reports the timeout (exit 41).
-        (
-            "read",
-            parked,
-            "kill of USR1: -1 ENOSYS\nchild: read returned -1 EINTR\n\
-             child: handler ran 0 time(s)\nchild exited 41\n",
-        ),
+    let cases: [(&str, &str, &str); 5] = [
         (
             "poll",
             "polls in a call whose probe never takes a pending signal (poll, epoll_wait, an \
