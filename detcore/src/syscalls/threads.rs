@@ -2445,6 +2445,16 @@ impl<T: RunMode> Detcore<T> {
         }
     }
 
+    /// Whether a clone (a vfork, when `is_vfork`) draws its child's starting
+    /// priority before the clone (`ThreadState::prepare_vfork_child_priority`):
+    /// a vfork under chaos, replaying neither preemptions nor a schedule.
+    fn draws_vfork_child_priority(&self, is_vfork: bool) -> bool {
+        is_vfork
+            && self.cfg.chaos
+            && self.cfg.replay_preemptions_from.is_none()
+            && self.cfg.replay_schedule_from.is_none()
+    }
+
     /// Clone, clone3, fork, vfork system calls
     pub async fn handle_clone_family<G: Guest<Self>>(
         &self,
@@ -2536,17 +2546,19 @@ impl<T: RunMode> Detcore<T> {
             .plan_clone_id(guest, &Syscall::from(clone_family))
             .await?;
 
+        // A vfork child's starting priority is drawn here, before the clone.
+        // (The condition is evaluated again below rather than held across
+        // the boundary's await, so the ordinary run keeps no value for it.)
+        if Self::BOUNDARY_ACTS && self.draws_vfork_child_priority(is_vfork) {
+            Self::before_choice(guest, crate::choice::ChoiceSite::VforkChildPriority).await;
+        }
         let ts = guest.thread_state_mut();
         assert_eq!(ts.clone_flags, None);
         assert!(ts.pending_vfork.is_none());
         ts.clone_flags = Some(flags);
 
         let parent_dettid = ts.dettid;
-        let child_priority = if is_vfork
-            && self.cfg.chaos
-            && self.cfg.replay_preemptions_from.is_none()
-            && self.cfg.replay_schedule_from.is_none()
-        {
+        let child_priority = if self.draws_vfork_child_priority(is_vfork) {
             Some(ts.prepare_vfork_child_priority())
         } else {
             None
@@ -5416,6 +5428,9 @@ impl<T: RunMode> Detcore<T> {
         if self.cfg.sequentialize_threads {
             match sched_yield_route(&self.cfg) {
                 SchedYieldRoute::ChaosReprioritize => {
+                    if Self::BOUNDARY_ACTS {
+                        Self::before_choice(guest, crate::choice::ChoiceSite::Priority).await;
+                    }
                     let change_time = guest.thread_state().thread_logical_time.as_nanos();
                     let request = Self::random_priority_changepoint_request(guest, change_time);
                     resource_request(guest, request).await;

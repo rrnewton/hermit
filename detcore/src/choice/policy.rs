@@ -17,6 +17,13 @@
 //! - [`ControlledChoices`] offers the draw as the default of a choice point
 //!   to the run's [`ChoiceSession`], through the handle the thread received
 //!   when it started.
+//!
+//! Just before each draw, in a run mode that acts there
+//! ([`crate::ChoiceBoundary::ACTS`]), Detcore announces the draw to the policy
+//! ([`SchedulingChoices::announce`]) and runs the run mode's choice boundary
+//! with what was announced: for [`ControlledChoices`], the index of the
+//! request the draw takes, which the draw then checks it takes. The ordinary
+//! run ([`SeededChoices`], no boundary) does not act there at all.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -46,6 +53,21 @@ pub struct DrawContext {
 
 /// A run's scheduling-choice policy. See the module documentation.
 pub trait SchedulingChoices: Default + Clone + Send + Sync + std::fmt::Debug + 'static {
+    /// Whether this policy announces its draws ([`Self::announce`]): whether
+    /// they are requests a choice boundary can name.
+    const ANNOUNCES: bool;
+
+    /// What the policy announces of a coming draw ([`Self::announce`]), which
+    /// the run mode's choice boundary is given.
+    type Announced: Copy + Send + Sync + std::fmt::Debug + 'static;
+
+    /// The drawing thread's next draw, with context `ctx`, is a point at
+    /// `site`, and the run mode's choice boundary runs before it
+    /// ([`crate::ChoiceBoundary`]). Core calls this immediately before that
+    /// boundary, wherever a draw follows and nowhere else, and gives the
+    /// boundary what it returns.
+    fn announce(&self, ctx: DrawContext, site: ChoiceSite) -> Self::Announced;
+
     /// Before the first draw of a thread that registers itself (the root,
     /// whose registration draws its own starting priority before its start
     /// grant), take from the run whatever this policy needs. Core calls it
@@ -73,6 +95,14 @@ pub trait SchedulingChoices: Default + Clone + Send + Sync + std::fmt::Debug + '
 pub struct SeededChoices;
 
 impl SchedulingChoices for SeededChoices {
+    /// The seeded draws make no requests: there is nothing to announce.
+    const ANNOUNCES: bool = false;
+
+    type Announced = ();
+
+    #[inline(always)]
+    fn announce(&self, _ctx: DrawContext, _site: ChoiceSite) {}
+
     /// Nothing to take: the seeded draws need no session.
     #[inline(always)]
     async fn init_thread<M, G>(_guest: &mut G)
@@ -116,6 +146,19 @@ impl ControlledChoices {
 }
 
 impl SchedulingChoices for ControlledChoices {
+    /// Every draw is a request of the run's session, announced before it.
+    const ANNOUNCES: bool = true;
+
+    /// The index of the request the announced draw takes.
+    type Announced = u64;
+
+    /// Announces the draw in the run's session ([`ChoiceSession::announce`]),
+    /// where the draw checks that it takes the request announced. A thread
+    /// not yet attached is refused by name, as its draw would be.
+    fn announce(&self, ctx: DrawContext, site: ChoiceSite) -> u64 {
+        self.session(ctx.dettid).announce(ctx.dettid, site)
+    }
+
     /// A thread not yet attached asks the global state for the run's handle
     /// (`GlobalRequest::ChoiceSession`, which consumes no choice and moves no
     /// scheduler or time state) and attaches it as a start grant's would be.
@@ -208,6 +251,18 @@ impl ChoiceHandle {
     pub fn choose(&self, point: ChoicePoint) -> u64 {
         self.0.lock().unwrap().choose(point)
     }
+
+    /// Announce thread `dtid`'s coming draw at `site` in the run's session
+    /// ([`ChoiceSession::announce`]): the index of the request it takes.
+    pub fn announce(&self, dtid: DetTid, site: ChoiceSite) -> u64 {
+        self.0.lock().unwrap().announce(dtid, site)
+    }
+
+    /// The index the run's next request will take
+    /// ([`ChoiceSession::next_index`]). Read-only: it draws nothing.
+    pub fn next_index(&self) -> u64 {
+        self.0.lock().unwrap().next_index()
+    }
 }
 
 impl std::fmt::Debug for ChoiceHandle {
@@ -283,6 +338,33 @@ mod tests {
         assert_eq!(std::mem::size_of::<SeededChoices>(), 0);
     }
 
+    /// The seeded policy announces nothing to the run mode's choice
+    /// boundary: its announcement is the unit.
+    #[test]
+    fn seeded_choices_announce_nothing() {
+        assert_eq!(
+            std::mem::size_of::<<SeededChoices as SchedulingChoices>::Announced>(),
+            0
+        );
+    }
+
+    /// `controlled`'s slice draw, announced first, as Detcore announces it
+    /// before the draw's choice boundary.
+    fn announced_slice(controlled: &ControlledChoices, seeded: u64, mean_rcbs: f64) -> u64 {
+        controlled.announce(ctx(), ChoiceSite::ChaosSlice);
+        controlled.slice(ctx(), seeded, mean_rcbs)
+    }
+
+    /// `controlled`'s priority draw at `site`, announced first.
+    fn announced_priority(
+        controlled: &ControlledChoices,
+        site: ChoiceSite,
+        entropy: u64,
+    ) -> Priority {
+        controlled.announce(ctx(), site);
+        controlled.priority(ctx(), site, entropy)
+    }
+
     /// A controlled policy asks its session: an empty tape answers every
     /// point with its default, and a tape byte selects another value.
     #[test]
@@ -290,13 +372,13 @@ mod tests {
         let session = ChoiceSession::new(Box::new(TapeSource::new(vec![0, 0, 1])), None);
         let mut controlled = ControlledChoices::default();
         controlled.attach(Some(ChoiceHandle::new(session)), DetTid::from_raw(5));
-        assert_eq!(controlled.slice(ctx(), 1234, 1e6), 1234);
+        assert_eq!(announced_slice(&controlled, 1234, 1e6), 1234);
         assert_eq!(
-            controlled.priority(ctx(), ChoiceSite::Priority, 77),
+            announced_priority(&controlled, ChoiceSite::Priority, 77),
             entropy_to_priority(77)
         );
         assert_eq!(
-            controlled.priority(ctx(), ChoiceSite::ChildPriority, 77),
+            announced_priority(&controlled, ChoiceSite::ChildPriority, 77),
             FIRST_PRIORITY,
             "tape byte 1 is the bottom of the priority range"
         );
@@ -315,14 +397,53 @@ mod tests {
         second.attach(Some(handle.clone()), DetTid::from_raw(2));
         assert_eq!(first, second);
         assert_eq!(
-            first.priority(ctx(), ChoiceSite::Priority, 0),
+            announced_priority(&first, ChoiceSite::Priority, 0),
             FIRST_PRIORITY
         );
         assert_eq!(
-            second.priority(ctx(), ChoiceSite::Priority, 0),
+            announced_priority(&second, ChoiceSite::Priority, 0),
             LAST_PRIORITY,
             "the second request reads the second tape byte"
         );
+    }
+
+    /// The next index is the number of requests made so far, shared by every
+    /// thread of the run. Reading it draws nothing, and neither does an
+    /// announcement, which names the index the draw after it takes: the tape
+    /// is read in order.
+    #[test]
+    fn an_announcement_names_the_request_its_draw_takes() {
+        let handle = ChoiceHandle::new(ChoiceSession::new(
+            Box::new(TapeSource::new(vec![1, 255, 1])),
+            None,
+        ));
+        let mut first = ControlledChoices::default();
+        let mut second = ControlledChoices::default();
+        first.attach(Some(handle.clone()), DetTid::from_raw(1));
+        second.attach(Some(handle.clone()), DetTid::from_raw(2));
+        assert_eq!(handle.next_index(), 0);
+        assert_eq!(handle.next_index(), 0, "a read draws nothing");
+        assert_eq!(first.announce(ctx(), ChoiceSite::Priority), 0);
+        assert_eq!(handle.next_index(), 0, "an announcement draws nothing");
+        assert_eq!(
+            first.priority(ctx(), ChoiceSite::Priority, 0),
+            FIRST_PRIORITY,
+            "the first draw reads the first tape byte"
+        );
+        assert_eq!(second.announce(ctx(), ChoiceSite::Priority), 1);
+        assert_eq!(
+            second.priority(ctx(), ChoiceSite::Priority, 0),
+            LAST_PRIORITY,
+            "the second draw reads the second tape byte"
+        );
+        assert_eq!(handle.next_index(), 2);
+        assert_eq!(first.announce(ctx(), ChoiceSite::ChaosSlice), 2);
+        assert_ne!(
+            first.slice(ctx(), 1234, 1e6),
+            1234,
+            "the third byte, not the seeded default, decides the slice"
+        );
+        assert_eq!(handle.next_index(), 3);
     }
 
     /// A thread offered the session it already holds (the root: from its

@@ -862,7 +862,12 @@ hermit run --chaos --sched-seed=0 --choice-controller=/path/to/socket -- PROGRAM
   (exit 122, `class=policy-refusal`), names the choice on stderr
   (`HERMIT_CHOICE_REFUSED: choice N: ...`) and ends the record with the refused
   request and its `"refused"` reason, which locates the first divergence of a
-  replay to one choice.
+  replay to one choice. A reason that starts with `internal:` is a fault of
+  Hermit's own, not a finding about the controller or the program. Hermit
+  announces each choice point just before drawing it, and an internal refusal
+  names a draw without its announcement, a draw other than the one announced,
+  or an announcement with no draw after it (which has no request to record, so
+  it is named on stderr only). Report it as a Hermit bug.
 - `--choice-record FILE` writes every choice request and the answer used, one
   JSON line each. Under `--verify` the file holds the choices of the last of
   the two runs.

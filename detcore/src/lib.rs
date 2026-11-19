@@ -502,8 +502,10 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
+pub use run_mode::ChoiceBoundary;
 pub use run_mode::ControlledMode;
 pub use run_mode::Mode;
+pub use run_mode::NoBoundary;
 pub use run_mode::RecordReplayState;
 pub use run_mode::RunMode;
 pub use run_mode::SeededMode;
@@ -1188,6 +1190,37 @@ pub fn observes_sigreturns(cfg: &Config) -> bool {
 }
 
 impl<T: RunMode> Detcore<T> {
+    /// Whether this run mode acts before a draw ([`ChoiceBoundary::ACTS`]),
+    /// computed once per mode. Each draw site calls [`Self::before_choice`]
+    /// only where this holds, a compile-time constant, so the ordinary run's
+    /// sites hold no call and no await. A mode whose policy announces its
+    /// draws ([`choice::SchedulingChoices::ANNOUNCES`]) but whose boundary
+    /// does not act would have every draw refused as unannounced: it fails
+    /// to build here instead.
+    pub(crate) const BOUNDARY_ACTS: bool = {
+        let acts = <T::Boundary as ChoiceBoundary<T::Choices>>::ACTS;
+        assert!(
+            acts || !<T::Choices as choice::SchedulingChoices>::ANNOUNCES,
+            "a run mode whose choice policy announces its draws needs a choice boundary that acts"
+        );
+        acts
+    };
+
+    /// The run mode's choice boundary ([`ChoiceBoundary`]) before thread
+    /// `guest`'s next draw, a choice point at `site`. Called, where the mode
+    /// acts ([`Self::BOUNDARY_ACTS`]), immediately before the helper that
+    /// draws it, with no await between, wherever a draw follows and nowhere
+    /// else. The draw is announced to the run's policy
+    /// ([`choice::SchedulingChoices::announce`]), and the boundary runs with
+    /// what was announced.
+    pub(crate) async fn before_choice<G: Guest<Self>>(guest: &mut G, site: choice::ChoiceSite) {
+        let thread = guest.thread_state();
+        let announced =
+            choice::SchedulingChoices::announce(&thread.choices, thread.draw_context(), site);
+        <T::Boundary as ChoiceBoundary<T::Choices>>::before_choice::<T, G>(guest, site, announced)
+            .await;
+    }
+
     /// A5 step 3c.1e A, IR-15 (Detcore's half): whether the calling thread's
     /// process is the init of a PID namespace it created with `CLONE_NEWPID`
     /// (`Scheduler`'s `pid_namespace_inits`, through
@@ -4333,6 +4366,15 @@ impl<T: RunMode> Detcore<T> {
             // ends it, which records it. A later pass of this loop ends no
             // armed slice.
             let mut ended_offset = None;
+            // Closing the slice draws the next one (`close_slice`, or
+            // `next_timeslice`), except in a schedule replay's administrative
+            // pass below.
+            if Self::BOUNDARY_ACTS
+                && !(replay_checkpoint && !expiry_due)
+                && guest.thread_state().draws_next_timeslice(&self.cfg)
+            {
+                Self::before_choice(guest, choice::ChoiceSite::ChaosSlice).await;
+            }
             let (maybe_prio, boundary) = {
                 let thread = guest.thread_state_mut();
                 if replay_checkpoint && !expiry_due {
@@ -4415,6 +4457,9 @@ impl<T: RunMode> Detcore<T> {
             } else if let Some(prio) = maybe_prio {
                 Self::priority_changepoint_request(guest, end_time, prio)
             } else if chaos {
+                if Self::BOUNDARY_ACTS {
+                    Self::before_choice(guest, choice::ChoiceSite::Priority).await;
+                }
                 Self::random_priority_changepoint_request(guest, end_time)
             } else if explicit_sched_yield && self.cfg.replay_schedule_from.is_none() {
                 Self::sched_yield_request(guest)
@@ -6639,6 +6684,11 @@ impl<T: RunMode> Tool for Detcore<T> {
         // Except for the root task, let's block until it's our turn to go:
         let (th, first_slice) = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
 
+        // The startup reset draws the thread's first slice, unless the start
+        // grant's preemption history, installed just before it, replays one.
+        if Self::BOUNDARY_ACTS && tool_local::draws_timeslice(&self.cfg, th.is_some()) {
+            Self::before_choice(guest, choice::ChoiceSite::ChaosSlice).await;
+        }
         tool_global::finish_thread_start(&self.cfg, guest, th, first_slice);
 
         // The prehook is a noop for a thread just starting.  Can't end the timeslice.  There's no

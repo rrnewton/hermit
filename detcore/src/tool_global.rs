@@ -12323,6 +12323,9 @@ where
                 Some(LAST_PRIORITY)
             }
         } else {
+            if Detcore::<T>::BOUNDARY_ACTS {
+                Detcore::<T>::before_choice(guest, crate::choice::ChoiceSite::ChildPriority).await;
+            }
             Some(
                 guest
                     .thread_state_mut()
@@ -15719,6 +15722,11 @@ mod tests {
             panic!("a run with a tape answered no handle");
         };
         assert_eq!(Some(handle.clone()), controlled.choice_session);
+        assert_eq!(
+            handle.announce(root, crate::choice::ChoiceSite::ChildPriority),
+            0,
+            "the session's next request is still its first"
+        );
         handle.choose(crate::choice::ChoicePoint {
             kind: crate::choice::ChoiceKind::SchedPriority,
             lo: 1,

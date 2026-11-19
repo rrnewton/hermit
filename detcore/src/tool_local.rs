@@ -8901,8 +8901,10 @@ impl<T: crate::RunMode> ThreadState<T> {
         r
     }
 
-    /// This thread's identity and position, for a choice point's request.
-    fn draw_context(&self) -> crate::choice::DrawContext {
+    /// This thread's identity and position, for a choice point's request,
+    /// and for its announcement before the run mode's choice boundary
+    /// (`Detcore::before_choice`).
+    pub(crate) fn draw_context(&self) -> crate::choice::DrawContext {
         crate::choice::DrawContext {
             dettid: self.dettid,
             thread_rcbs: self.committed_clock_value,
@@ -10201,6 +10203,12 @@ impl<T: crate::RunMode> ThreadState<T> {
             .map_or(bound, |post_crash| post_crash.max(bound))
     }
 
+    /// Whether this thread's [`Self::next_timeslice`] draws its slice now
+    /// ([`draws_timeslice`]).
+    pub(crate) fn draws_next_timeslice(&self, cfg: &Config) -> bool {
+        draws_timeslice(cfg, self.preemption_points.is_some())
+    }
+
     /// Choose the logical target and PMU maximum deadlines for the next timeslice.
     ///
     /// Effects:
@@ -10732,6 +10740,18 @@ type RecordedSlice = (
     Option<u64>,
     Option<InstructionOffset>,
 );
+
+/// Whether [`ThreadState::next_timeslice`] draws the slice, a choice point at
+/// `ChoiceSite::ChaosSlice`, for a thread that replays recorded preemption
+/// points (`replays_preemptions`) or does not: with a logical timeslice, no
+/// recorded points, and a schedule that chaos draws
+/// (`Config::chaos_draws_schedule`). The run mode's choice boundary runs
+/// before that draw exactly when this holds (`Detcore::before_choice`).
+pub(crate) fn draws_timeslice(cfg: &Config, replays_preemptions: bool) -> bool {
+    cfg.target_timeslice.or(cfg.max_timeslice).is_some()
+        && !replays_preemptions
+        && cfg.chaos_draws_schedule()
+}
 
 /// The first recorded slice of an edited record (`--replay-edited-preemptions`)
 /// still ahead of a thread at logical time `now` and committed PMU count
@@ -12980,6 +13000,80 @@ mod timeslice_tests {
         assert!(
             longest > 2_000,
             "slices are drawn around the post-crash bound"
+        );
+    }
+
+    /// The slice hooks' predicate (`draws_next_timeslice`) holds exactly when
+    /// `next_timeslice` draws: across chaos, schedule replay, the two slice
+    /// bounds and preemption replay, a controlled thread's draw, announced
+    /// when the predicate holds, takes one request of its session, and
+    /// nothing is drawn when it does not. (A draw the predicate missed would
+    /// be unannounced, and end this test's process as a refusal.)
+    #[test]
+    fn the_slice_hook_predicate_holds_exactly_when_next_timeslice_draws() {
+        use crate::choice::ChoiceHandle;
+        use crate::choice::ChoiceSession;
+        use crate::choice::ChoiceSite;
+        use crate::choice::SchedulingChoices;
+        use crate::choice::TapeSource;
+
+        let bounds = [
+            (None, None),
+            (nz(100_000), None),
+            (None, nz(100_000)),
+            (nz(50_000), nz(100_000)),
+        ];
+        let mut drawn = 0;
+        for chaos in [false, true] {
+            for schedule_replay in [false, true] {
+                for (target_timeslice, max_timeslice) in bounds {
+                    for replays_preemptions in [false, true] {
+                        let config = Config {
+                            chaos,
+                            target_timeslice,
+                            max_timeslice,
+                            replay_schedule_from: schedule_replay.then(|| "schedule.json".into()),
+                            ..Default::default()
+                        };
+                        let tid = DetPid::from_raw(3);
+                        let handle = ChoiceHandle::new(ChoiceSession::new(
+                            Box::new(TapeSource::new(vec![])),
+                            None,
+                        ));
+                        let mut state = ThreadState::<crate::ControlledMode>::new(tid, &config, ());
+                        state.choices.attach(Some(handle.clone()), tid);
+                        if replays_preemptions {
+                            let now = state.thread_logical_time.as_nanos();
+                            let history = ThreadHistory::new().with_prio_changes(vec![(
+                                now + Duration::from_nanos(1_000),
+                                DEFAULT_PRIORITY,
+                            )]);
+                            state.preemption_points = Some(history.into_iter());
+                        }
+                        let draws = state.draws_next_timeslice(&config);
+                        let expected = chaos
+                            && !schedule_replay
+                            && (target_timeslice.is_some() || max_timeslice.is_some())
+                            && !replays_preemptions;
+                        assert_eq!(draws, expected, "{config:?}, {replays_preemptions}");
+                        if draws {
+                            let ctx = state.draw_context();
+                            assert_eq!(state.choices.announce(ctx, ChoiceSite::ChaosSlice), 0);
+                        }
+                        state.next_timeslice(&config);
+                        assert_eq!(
+                            handle.next_index(),
+                            u64::from(draws),
+                            "{config:?}, replaying preemptions: {replays_preemptions}"
+                        );
+                        drawn += u64::from(draws);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            drawn, 3,
+            "chaos without a replay, under each of the three bounds"
         );
     }
 
