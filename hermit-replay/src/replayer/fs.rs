@@ -800,12 +800,16 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         };
         match event.replay_fd_kind {
             ReplayFdKind::Eventfd => {
-                let actual = inject_kernel_side_effect(guest, fd, syscall).await?;
-                assert_eq!(
-                    actual,
-                    Ok(event.bytes.len() as i64),
-                    "replayed readv eventfd side effect diverged"
-                );
+                // rr-like default (6805): the counter is not consumed
+                // live; reads and writes both answer from the recording.
+                if self.write_output_files {
+                    let actual = inject_kernel_side_effect(guest, fd, syscall).await?;
+                    assert_eq!(
+                        actual,
+                        Ok(event.bytes.len() as i64),
+                        "replayed readv eventfd side effect diverged"
+                    );
+                }
             }
             ReplayFdKind::RegularFile if advances_offset => {
                 self.advance_regular_file_position(guest.pid(), guest.pid(), fd, event.bytes.len());
@@ -828,12 +832,15 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         let event = next_event!(guest, ReadV2)?;
         match event.replay_fd_kind {
             ReplayFdKind::Eventfd => {
-                let actual = inject_kernel_side_effect(guest, syscall.fd(), syscall.into()).await?;
-                assert_eq!(
-                    actual,
-                    Ok(event.bytes.len() as i64),
-                    "replayed read eventfd side effect diverged"
-                );
+                if self.write_output_files {
+                    let actual =
+                        inject_kernel_side_effect(guest, syscall.fd(), syscall.into()).await?;
+                    assert_eq!(
+                        actual,
+                        Ok(event.bytes.len() as i64),
+                        "replayed read eventfd side effect diverged"
+                    );
+                }
             }
             ReplayFdKind::RegularFile => {
                 self.advance_regular_file_position(
@@ -1047,12 +1054,15 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         let successful_count = successful_replay_write_count(event.result)?;
         match event.replay_fd_kind {
             ReplayFdKind::Eventfd => {
-                let actual =
-                    inject_kernel_side_effect(guest, syscall.fd(), Syscall::from(syscall)).await?;
-                assert_eq!(
-                    actual, event.result,
-                    "replayed eventfd write side effect diverged"
-                );
+                if self.write_output_files {
+                    let actual =
+                        inject_kernel_side_effect(guest, syscall.fd(), Syscall::from(syscall))
+                            .await?;
+                    assert_eq!(
+                        actual, event.result,
+                        "replayed eventfd write side effect diverged"
+                    );
+                }
             }
             ReplayFdKind::RegularFile => {
                 if let Some(count) = successful_count {
