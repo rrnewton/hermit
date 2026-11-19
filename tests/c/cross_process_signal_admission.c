@@ -53,6 +53,10 @@
  *   poll           A caught SIGUSR1 to a child in poll(2) on an empty pipe:
  *                  EINTR.
  *   fatal          SIGTERM, default action, to a runnable child: it dies.
+ *   fatal-two      SIGTERM, default action, to a child with two threads,
+ *                  its second in pause(2): it dies (on KVM this shape is
+ *                  still refused by name until slice F, so there the child
+ *                  is still alive to report and exit 0).
  *   sigkill        SIGKILL to a runnable child: it dies.
  *   stop           SIGTSTP, default action, to a runnable child: it stops;
  *                  SIGCONT resumes it.
@@ -65,6 +69,26 @@
  *   waitchild-ready The same where its own child is already a zombie: the
  *                  wait reaps it at once, and the signal then ends the
  *                  pause(2) the child reports from.
+ *   pause-fatal    SIGTERM, default action, to a child in pause(2): it dies.
+ *   pause-core     SIGQUIT, default core-dumping action, to a child in
+ *                  pause(2): it dies, and the wait status carries the
+ *                  core-dump flag the parent reports.
+ *   sleep-fatal    SIGTERM, default action, to a child in a long
+ *                  nanosleep(2): it dies.
+ *   robust-fatal   SIGTERM, default action, to a child in pause(2) holding
+ *                  a process-shared robust mutex in shared memory: it dies,
+ *                  and the parent's next lock of the mutex answers
+ *                  EOWNERDEAD.
+ *   cleartid-fatal SIGTERM, default action, to a child in pause(2) that
+ *                  registered a word in shared memory with
+ *                  set_tid_address(2): it dies, and the parent then reads
+ *                  the word and waits in futex on it briefly. The kernel
+ *                  clears such a word in mm_release only while another
+ *                  thread still uses the address space (mm_users > 1), so
+ *                  for this one-thread child the word keeps its tid and
+ *                  no wake comes; the mode shows a backend does exactly
+ *                  that, no more and no less, and that the registration
+ *                  does not disturb the death.
  *   futex          A caught SIGUSR1 to a child whose only thread waits on a
  *                  futex: EINTR.
  *   read           A caught SIGUSR1 to a child in read(2) of an empty pipe:
@@ -73,6 +97,12 @@
  *   waitfatal      SIGTERM, default action and blocked, to a child waiting
  *                  for it in sigtimedwait(2): the call returns it, and the
  *                  child lives.
+ *   waitother-forever SIGTERM, default action, to a child waiting in
+ *                  sigwaitinfo(2) for blocked SIGUSR1 with no timeout: it
+ *                  dies.
+ *   waitother      The same with sigtimedwait(2) and a five-second timeout.
+ *   waitunblocked  SIGTERM, default action and unblocked, to a child
+ *                  waiting for it in sigtimedwait(2): it dies.
  *   newthread      A caught SIGUSR1 sent right after the child created a
  *                  thread that does not block it, its first thread blocking
  *                  it: the handler runs in the new thread.
@@ -104,6 +134,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -130,6 +161,53 @@ static volatile sig_atomic_t stop_requested = 0;
 
 /* This program's path, which the exec mode runs again. */
 static const char *self_path;
+
+/* The robust-fatal and cleartid-fatal modes' state shared with the child,
+ * made in main before the fork. */
+static pthread_mutex_t *shared_robust_mutex;
+static volatile uint32_t *shared_tid_word;
+
+static void setup_shared_robust(void) {
+  shared_robust_mutex = mmap(
+      NULL,
+      sizeof(*shared_robust_mutex),
+      PROT_READ | PROT_WRITE,
+      MAP_SHARED | MAP_ANONYMOUS,
+      -1,
+      0);
+  pthread_mutexattr_t attr;
+  if (shared_robust_mutex == MAP_FAILED ||
+      pthread_mutexattr_init(&attr) != 0 ||
+      pthread_mutexattr_setpshared(&attr, PTHREAD_PROCESS_SHARED) != 0 ||
+      pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) != 0 ||
+      pthread_mutex_init(shared_robust_mutex, &attr) != 0) {
+    perror("robust mutex setup");
+    exit(1);
+  }
+}
+
+static void setup_shared_tid_word(void) {
+  shared_tid_word = mmap(
+      NULL,
+      sizeof(*shared_tid_word),
+      PROT_READ | PROT_WRITE,
+      MAP_SHARED | MAP_ANONYMOUS,
+      -1,
+      0);
+  if (shared_tid_word == MAP_FAILED) {
+    perror("tid word setup");
+    exit(1);
+  }
+}
+
+/* The parent's futex wait on the cleartid-fatal word after the reap: 0 if
+ * a wake came, EAGAIN (reported as `changed`) if the word no longer holds
+ * the dead child's tid, ETIMEDOUT if neither happened. */
+static long wait_tid_word(uint32_t expected) {
+  struct timespec timeout = {0, 200 * 1000 * 1000};
+  return syscall(
+      SYS_futex, (uint32_t *)shared_tid_word, FUTEX_WAIT, expected, &timeout, NULL, 0);
+}
 
 static void on_usr1(int signo, siginfo_t *info, void *context) {
   (void)signo;
@@ -246,6 +324,14 @@ static void child_run_until_stopped(void) {
     }
     (void)getppid();
   }
+}
+
+/* The fatal-two mode's other thread: it leaves SIGTERM unblocked in
+ * pause(2) for as long as the child lives. */
+static void *paused_thread_main(void *arg) {
+  (void)arg;
+  pause();
+  return NULL;
 }
 
 /* The newthread mode's new thread: runnable, as child_run_until_stopped. */
@@ -594,6 +680,62 @@ static void child_main(const char *mode) {
     report_usr1();
     _exit(alarm_count ? CHILD_TIMED_OUT : 0);
   }
+  if (strcmp(mode, "fatal-two") == 0) {
+    alarm(10);
+    pthread_t worker;
+    if (pthread_create(&worker, NULL, paused_thread_main, NULL) != 0) {
+      _exit(CHILD_SETUP_FAILED);
+    }
+    child_ready();
+    child_wait_for_go();
+    _exit(alarm_count ? CHILD_TIMED_OUT : 0);
+  }
+  if (strcmp(mode, "pause-fatal") == 0 || strcmp(mode, "pause-core") == 0) {
+    alarm(5);
+    child_ready();
+    int result = pause();
+    int error = errno;
+    child_wait_for_go();
+    report_call("pause", result, error);
+    printf("child: alarm %d\n", (int)alarm_count);
+    _exit(alarm_count ? CHILD_TIMED_OUT : 0);
+  }
+  if (strcmp(mode, "sleep-fatal") == 0) {
+    alarm(5);
+    child_ready();
+    const struct timespec length = {10, 0};
+    int result = nanosleep(&length, NULL);
+    int error = errno;
+    child_wait_for_go();
+    report_call("nanosleep", result, error);
+    _exit(alarm_count ? CHILD_TIMED_OUT : 0);
+  }
+  if (strcmp(mode, "robust-fatal") == 0) {
+    alarm(10);
+    if (pthread_mutex_lock(shared_robust_mutex) != 0) {
+      _exit(CHILD_SETUP_FAILED);
+    }
+    child_ready();
+    int result = pause();
+    int error = errno;
+    pthread_mutex_unlock(shared_robust_mutex);
+    child_wait_for_go();
+    report_call("pause", result, error);
+    _exit(alarm_count ? CHILD_TIMED_OUT : 0);
+  }
+  if (strcmp(mode, "cleartid-fatal") == 0) {
+    alarm(10);
+    *shared_tid_word = (uint32_t)gettid();
+    if (syscall(SYS_set_tid_address, (uint32_t *)shared_tid_word) != gettid()) {
+      _exit(CHILD_SETUP_FAILED);
+    }
+    child_ready();
+    int result = pause();
+    int error = errno;
+    child_wait_for_go();
+    report_call("pause", result, error);
+    _exit(alarm_count ? CHILD_TIMED_OUT : 0);
+  }
   if (strcmp(mode, "read") == 0 || strcmp(mode, "recv") == 0) {
     install_usr1();
     int fds[2];
@@ -619,6 +761,53 @@ static void child_main(const char *mode) {
     child_ready();
     siginfo_t info;
     struct timespec timeout = {10, 0};
+    int result = sigtimedwait(&wanted, &info, &timeout);
+    int error = errno;
+    child_wait_for_go();
+    report_call("sigtimedwait", result, error);
+    if (result == SIGTERM) {
+      printf(
+          "child: code %s, %s\n",
+          code_name(info.si_code),
+          info.si_pid == getppid() ? "from the parent" : "NOT from the parent");
+    }
+    _exit(0);
+  }
+  if (strcmp(mode, "waitother-forever") == 0 || strcmp(mode, "waitother") == 0) {
+    block(SIGUSR1);
+    sigset_t wanted;
+    sigemptyset(&wanted);
+    sigaddset(&wanted, SIGUSR1);
+    child_ready();
+    siginfo_t info;
+    int result;
+    if (strcmp(mode, "waitother-forever") == 0) {
+      result = sigwaitinfo(&wanted, &info);
+    } else {
+      struct timespec timeout = {5, 0};
+      result = sigtimedwait(&wanted, &info, &timeout);
+    }
+    int error = errno;
+    child_wait_for_go();
+    report_call(
+        strcmp(mode, "waitother-forever") == 0 ? "sigwaitinfo" : "sigtimedwait",
+        result,
+        error);
+    if (result == SIGUSR1) {
+      printf(
+          "child: code %s, %s\n",
+          code_name(info.si_code),
+          info.si_pid == getppid() ? "from the parent" : "NOT from the parent");
+    }
+    _exit(0);
+  }
+  if (strcmp(mode, "waitunblocked") == 0) {
+    sigset_t wanted;
+    sigemptyset(&wanted);
+    sigaddset(&wanted, SIGTERM);
+    child_ready();
+    siginfo_t info;
+    struct timespec timeout = {5, 0};
     int result = sigtimedwait(&wanted, &info, &timeout);
     int error = errno;
     child_wait_for_go();
@@ -710,6 +899,11 @@ static void report_status(int status) {
     printf("child exited %d\n", WEXITSTATUS(status));
   } else if (WIFSIGNALED(status)) {
     printf("child killed by %s\n", sigabbrev_np(WTERMSIG(status)));
+#ifdef WCOREDUMP
+    if (WCOREDUMP(status)) {
+      printf("child dumped core\n");
+    }
+#endif
   } else if (WIFSTOPPED(status)) {
     printf("child stopped by %s\n", sigabbrev_np(WSTOPSIG(status)));
   } else if (WIFCONTINUED(status)) {
@@ -792,6 +986,12 @@ int main(int argc, char **argv) {
     perror("pipe");
     return 1;
   }
+  if (strcmp(mode, "robust-fatal") == 0) {
+    setup_shared_robust();
+  }
+  if (strcmp(mode, "cleartid-fatal") == 0) {
+    setup_shared_tid_word();
+  }
   pid_t child = fork();
   if (child < 0) {
     perror("fork");
@@ -821,9 +1021,24 @@ int main(int argc, char **argv) {
     send_signal(how, child, SIGHUP, pidfd);
     send_signal(how, child, SIGWINCH, pidfd);
     send_signal(how, child, SIGCONT, pidfd);
-  } else if (strcmp(mode, "fatal") == 0 || strcmp(mode, "sigkill") == 0) {
-    send_signal(how, child, strcmp(mode, "fatal") == 0 ? SIGTERM : SIGKILL, pidfd);
-  } else if (strcmp(mode, "waitfatal") == 0) {
+  } else if (
+      strcmp(mode, "fatal") == 0 || strcmp(mode, "sigkill") == 0 ||
+      strcmp(mode, "fatal-two") == 0 || strcmp(mode, "pause-fatal") == 0 ||
+      strcmp(mode, "pause-core") == 0 || strcmp(mode, "sleep-fatal") == 0 ||
+      strcmp(mode, "robust-fatal") == 0 || strcmp(mode, "cleartid-fatal") == 0) {
+    if (strcmp(mode, "fatal") != 0 && strcmp(mode, "sigkill") != 0) {
+      let_the_child_block();
+    }
+    send_signal(
+        how,
+        child,
+        strcmp(mode, "sigkill") == 0      ? SIGKILL
+            : strcmp(mode, "pause-core") == 0 ? SIGQUIT
+                                              : SIGTERM,
+        pidfd);
+  } else if (
+      strcmp(mode, "waitfatal") == 0 || strcmp(mode, "waitother-forever") == 0 ||
+      strcmp(mode, "waitother") == 0 || strcmp(mode, "waitunblocked") == 0) {
     let_the_child_block();
     send_signal(how, child, SIGTERM, pidfd);
   } else if (strcmp(mode, "stop") == 0) {
@@ -854,6 +1069,26 @@ int main(int argc, char **argv) {
     if (WIFEXITED(status) || WIFSIGNALED(status)) {
       break;
     }
+  }
+  if (strcmp(mode, "robust-fatal") == 0) {
+    int locked = pthread_mutex_lock(shared_robust_mutex);
+    printf(
+        "parent: robust lock %s\n",
+        locked == EOWNERDEAD ? "OWNERDEAD" : locked == 0 ? "locked" : "failed");
+    if (locked == EOWNERDEAD) {
+      pthread_mutex_consistent(shared_robust_mutex);
+    }
+    if (locked == EOWNERDEAD || locked == 0) {
+      pthread_mutex_unlock(shared_robust_mutex);
+    }
+  }
+  if (strcmp(mode, "cleartid-fatal") == 0) {
+    uint32_t word = *shared_tid_word;
+    long waited = wait_tid_word(word);
+    printf(
+        "parent: tid word is 0: %s, futex wait %s\n",
+        word == 0 ? "yes" : "no",
+        waited == 0 ? "woke" : errno == EAGAIN ? "changed" : "timed out");
   }
   return 0;
 }

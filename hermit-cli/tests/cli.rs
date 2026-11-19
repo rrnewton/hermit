@@ -1380,7 +1380,34 @@ fn poll_timeout_vs_spinner_guest() -> &'static Path {
 }
 
 static SIGKILL_CROSS_PROCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PAUSE_CROSS_TASK_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KILL_CHILD_AND_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+fn pause_cross_task_signal_guest() -> &'static Path {
+    PAUSE_CROSS_TASK_SIGNAL_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("pause-cross-task-signal");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create pause-cross-task-signal guest directory");
+        let guest = build_root.join("pause_cross_task_signal");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/pause_cross_task_signal.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile pause-cross-task-signal guest");
+        assert!(
+            output.status.success(),
+            "pause-cross-task-signal guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
 
 fn kill_child_and_wait_guest() -> &'static Path {
     KILL_CHILD_AND_WAIT_GUEST.get_or_init(|| {
@@ -26087,6 +26114,31 @@ const SENDS_TO_A_PARKED_RECEIVER: [(&str, &str); 10] = [
     ("waitchild-ready", "tgkill"),
 ];
 
+/// The default-fatal sends of tests/c/cross_process_signal_admission.c, by
+/// `kill` and by `tgkill`, to a one-thread child: runnable, parked in
+/// `pause` or a long `nanosleep`.
+const SENDS_FATAL_TO_A_ONE_THREAD_TARGET: [(&str, &str); 6] = [
+    ("fatal", "kill"),
+    ("fatal", "tgkill"),
+    ("pause-fatal", "kill"),
+    ("pause-fatal", "tgkill"),
+    ("sleep-fatal", "kill"),
+    ("sleep-fatal", "tgkill"),
+];
+
+/// The default-fatal sends by `kill` whose death the parent then observes
+/// through an exit store or the wait status: a child in `pause` holding a
+/// robust mutex, with a `set_tid_address` word registered, or killed by a
+/// core-dumping SIGQUIT, whose wait status (killed by QUIT, core dumped)
+/// must match. Split from `SENDS_FATAL_TO_A_ONE_THREAD_TARGET` so each
+/// test stays well inside nextest's per-test CPU budget: every KVM case
+/// runs the guest natively, on KVM and twice more under `--verify`.
+const SENDS_FATAL_DEATH_STORES_TO_A_ONE_THREAD_TARGET: [(&str, &str); 3] = [
+    ("robust-fatal", "kill"),
+    ("cleartid-fatal", "kill"),
+    ("pause-core", "kill"),
+];
+
 /// The sends of tests/c/cross_process_signal_admission.c, by `kill` and by
 /// `tgkill`, across a wait, a new thread or an exec.
 const SENDS_ACROSS_A_WAIT_A_THREAD_OR_AN_EXEC: [(&str, &str); 8] = [
@@ -26334,6 +26386,65 @@ fn run_kvm_guest_sent_signal_ends_nanosleep_at_its_due_time() {
     assert_bitwise_parity(report, "--verify on kvm");
 }
 
+/// tests/c/cross_process_signal_admission.c's default-fatal SIGTERM sends
+/// (`SENDS_FATAL_TO_A_ONE_THREAD_TARGET`), on ptrace: the one-thread child
+/// dies by the signal — runnable, parked in `pause` or a long `nanosleep`.
+#[test]
+fn guest_fatal_signals_to_a_one_thread_target_match_linux() {
+    assert_admitted_sends_match_linux(
+        "guest_fatal_signals_to_a_one_thread_target_match_linux",
+        AdmittedOn::Ptrace,
+        &SENDS_FATAL_TO_A_ONE_THREAD_TARGET,
+    );
+}
+
+/// `guest_fatal_signals_to_a_one_thread_target_match_linux` on KVM, where
+/// stage X1 slice F-minimal of the KVM cross-process signal design
+/// (https://github.com/rrnewton/hermit/issues/4485) admits a default-fatal
+/// copy only for this shape — one live thread, no vfork barrier, no live
+/// vfork child — and the receiver dies at its own boundary through the
+/// ordinary fatal receipt, exit stores and robust-list walk included,
+/// each case also verified bitwise. A two-thread child stays refused by
+/// name (`run_kvm_guest_signals_kvm_cannot_yet_deliver_are_named_refusals`,
+/// its `fatal-two` case).
+#[test]
+fn run_kvm_guest_fatal_signals_to_a_one_thread_target_match_linux() {
+    assert_admitted_sends_match_linux(
+        "run_kvm_guest_fatal_signals_to_a_one_thread_target_match_linux",
+        AdmittedOn::Kvm,
+        &SENDS_FATAL_TO_A_ONE_THREAD_TARGET,
+    );
+}
+
+/// The death-store fatal sends (`SENDS_FATAL_DEATH_STORES_TO_A_ONE_THREAD_TARGET`),
+/// on ptrace: the one-thread child in `pause` dies by the signal — holding
+/// a process-shared robust mutex (the parent's next lock answers
+/// EOWNERDEAD), with a `set_tid_address` word in shared memory (the kernel
+/// clears such a word only while another thread uses the address space, so
+/// for this child it keeps its tid and no futex wake comes), or killed by
+/// a core-dumping SIGQUIT whose wait status carries the core flag.
+#[test]
+fn guest_fatal_death_stores_to_a_one_thread_target_match_linux() {
+    assert_admitted_sends_match_linux(
+        "guest_fatal_death_stores_to_a_one_thread_target_match_linux",
+        AdmittedOn::Ptrace,
+        &SENDS_FATAL_DEATH_STORES_TO_A_ONE_THREAD_TARGET,
+    );
+}
+
+/// `guest_fatal_death_stores_to_a_one_thread_target_match_linux` on KVM,
+/// where the same slice F-minimal admission applies and the receiver dies
+/// through the ordinary fatal receipt, exit stores and robust-list walk
+/// included, each case also verified bitwise.
+#[test]
+fn run_kvm_guest_fatal_death_stores_to_a_one_thread_target_match_linux() {
+    assert_admitted_sends_match_linux(
+        "run_kvm_guest_fatal_death_stores_to_a_one_thread_target_match_linux",
+        AdmittedOn::Kvm,
+        &SENDS_FATAL_DEATH_STORES_TO_A_ONE_THREAD_TARGET,
+    );
+}
+
 /// tests/c/cross_process_signal_admission.c, by `kill` and by `tgkill`, as in
 /// `guest_signals_to_another_process_by_kill_tgkill_or_tkill_match_linux`
 /// (`SENDS_ACROSS_A_WAIT_A_THREAD_OR_AN_EXEC`), on ptrace:
@@ -26372,13 +26483,17 @@ fn run_kvm_guest_signals_to_another_process_across_a_wait_a_thread_or_an_exec_ma
 /// the wait for a blocked default-fatal SIGTERM), the receivers the
 /// observation pass serves (`CatchReach::Parked`: `pause`, a polled `read`,
 /// a long `nanosleep`, a child wait with no child ready or with one already
-/// a zombie), and the first of two threads in a backend-served
+/// a zombie), the first of two threads in a backend-served
 /// `sigsuspend` (`CatchReach::BackendSuspend`), whose sibling must not take
-/// the copy. Native equality alone does not show that two runs commit the
-/// same schedule, so these rows need the bitwise comparison too (condition
-/// C1 of the deterministic-scheduling review of
+/// the copy, and the one-thread receivers a default-fatal copy ends
+/// (`SendAdmission::Die`: runnable, parked in `pause` or a long `nanosleep`,
+/// holding a robust mutex, with a `set_tid_address` word registered, or
+/// killed by a core-dumping SIGQUIT in `pause`). Native equality alone
+/// does not show that two runs commit the same schedule, so these rows
+/// need the bitwise comparison too (condition C1 of the
+/// deterministic-scheduling review of
 /// https://github.com/rrnewton/hermit/pull/5415).
-const STRICT_VERIFY_ADMITTED_MODES: [&str; 11] = [
+const STRICT_VERIFY_ADMITTED_MODES: [&str; 17] = [
     "runnable",
     "select",
     "pselect",
@@ -26390,6 +26505,12 @@ const STRICT_VERIFY_ADMITTED_MODES: [&str; 11] = [
     "sleep",
     "waitchild",
     "waitchild-ready",
+    "fatal",
+    "pause-fatal",
+    "sleep-fatal",
+    "robust-fatal",
+    "cleartid-fatal",
+    "pause-core",
 ];
 
 /// The modes of `SENDS_KVM_ADMITS` that ptrace refuses by name. With both of
@@ -26559,10 +26680,17 @@ const RAW_SELECT_MODES: [&str; 4] = [
 /// process that stage X1 still refuses by name, before any effect
 /// (https://github.com/rrnewton/hermit/issues/4485): a caught signal to a
 /// child in a `poll` whose probe never takes a pending signal (slice D) or
-/// waiting on a futex (N8a); a default-fatal SIGTERM (slice F); SIGKILL
-/// (slice G); and a default stop (stage X2). The `pause`, polled `read` and
-/// `nanosleep` receivers slice D1 admits are
-/// `run_kvm_guest_signals_to_a_parked_receiver_match_linux`. A fail-closed run ends with the policy-refusal status naming
+/// waiting on a futex (N8a); a default-fatal SIGTERM to a two-thread
+/// child or to a one-thread child polling in `rt_sigtimedwait` — for
+/// another signal (`waitother-*`) or for SIGTERM itself unblocked
+/// (`waitunblocked`), whose probe takes only wait-set copies and would
+/// not end the wait where Linux kills it at once (slice F; the native
+/// runs below show that behaviour); SIGKILL (slice G); and a default
+/// stop (stage X2). The
+/// `pause`, polled `read` and `nanosleep` receivers slice D1 admits are
+/// `run_kvm_guest_signals_to_a_parked_receiver_match_linux`, and the
+/// one-thread fatal shapes slice F-minimal admits are
+/// `run_kvm_guest_fatal_signals_to_a_one_thread_target_match_linux`. A fail-closed run ends with the policy-refusal status naming
 /// the refusal, and the sender prints nothing after its call. With
 /// `--allow-unsupported-syscalls` the call returns ENOSYS and the child sees
 /// nothing: it reports as if no signal had been sent.
@@ -26582,7 +26710,26 @@ fn run_kvm_guest_signals_kvm_cannot_yet_deliver_are_named_refusals() {
     let guest = cross_process_signal_admission_guest()
         .to_str()
         .expect("guest path should be UTF-8");
-    let cases: [(&str, &str, &str); 5] = [
+    // The native behaviour the three sigtimedwait refusals name: SIGTERM
+    // kills a child waiting for another signal (forever or with a timeout)
+    // and a child waiting for SIGTERM itself unblocked.
+    for mode in ["waitother-forever", "waitother", "waitunblocked"] {
+        let native = Command::new(guest)
+            .args([mode, "kill"])
+            .output()
+            .expect("run the cross-process-signal-admission guest natively");
+        assert!(native.status.success(), "{mode} native: {native:?}");
+        assert_eq!(
+            stdout(&native),
+            "kill of TERM: 0\nchild killed by TERM\n",
+            "{mode} native"
+        );
+    }
+    let die_reason = "its default action ends the process, which KVM cannot yet carry out for a signal \
+                      another process sends to a target with more than one live thread, \
+                      a vfork parent, a live vfork child, a receiver polling in rt_sigtimedwait, \
+                      or no chosen receiver (stage X1 slice F)";
+    let cases: [(&str, &str, &str); 7] = [
         (
             "poll",
             "polls in a call whose probe never takes a pending signal (poll, epoll_wait, an \
@@ -26598,10 +26745,21 @@ fn run_kvm_guest_signals_kvm_cannot_yet_deliver_are_named_refusals() {
              child: handler ran 0 time(s)\nchild exited 0\n",
         ),
         (
-            "fatal",
-            "its default action ends the process, which KVM cannot yet carry out for a signal \
-             another process sends (stage X1 slice F)",
-            "kill of TERM: -1 ENOSYS\nchild: handler ran 0 time(s)\nchild exited 0\n",
+            "fatal-two",
+            die_reason,
+            "kill of TERM: -1 ENOSYS\nchild exited 0\n",
+        ),
+        (
+            "waitother",
+            die_reason,
+            "kill of TERM: -1 ENOSYS\nchild: sigtimedwait returned -1 EAGAIN\n\
+             child exited 0\n",
+        ),
+        (
+            "waitunblocked",
+            die_reason,
+            "kill of TERM: -1 ENOSYS\nchild: sigtimedwait returned -1 EAGAIN\n\
+             child exited 0\n",
         ),
         (
             "sigkill",
@@ -26650,6 +26808,9 @@ fn run_kvm_guest_signals_kvm_cannot_yet_deliver_are_named_refusals() {
             "waits in select, and select has no signal mask the backend can check; use pselect6",
         );
     }
+    // The same fail-closed-only shape as a raw `select` with no timeout:
+    // allowed, the wait nothing ends has no transcript to compare.
+    assert_refused("waitother-forever", die_reason);
     for (mode, reason, allowed) in cases {
         assert_refused(mode, reason);
         let args = [
@@ -26671,6 +26832,79 @@ fn run_kvm_guest_signals_kvm_cannot_yet_deliver_are_named_refusals() {
             stderr(&output)
         );
     }
+}
+
+/// tests/c/pause_cross_task_signal.c whole, the KVM verify cell
+/// `c-programs/pause-cross-task-signal`: a parent signals its child parked
+/// in `pause` or a long `nanosleep`. Natively and on ptrace every case
+/// passes. On KVM, stage X1 slices D1 (caught copies to a parked receiver)
+/// and F-minimal (a default-fatal copy to a one-thread target) admit
+/// pause-fatal, pause-caught and pause-ignored, whose lines print exactly
+/// as natively; the next case, pause-stop's SIGTSTP, then stops the run
+/// with the named stage-X2 refusal, so sleep-fatal and sleep-caught do
+/// not run in this program on KVM (they are
+/// `run_kvm_guest_fatal_signals_to_a_one_thread_target_match_linux` and
+/// `run_kvm_guest_signals_to_a_parked_receiver_match_linux`).
+#[test]
+fn run_kvm_pause_cross_task_signal_stops_at_the_x2_case() {
+    if kvm_unavailable("run_kvm_pause_cross_task_signal_stops_at_the_x2_case") {
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let guest = pause_cross_task_signal_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let native = Command::new(guest)
+        .output()
+        .expect("run the pause-cross-task-signal guest natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let native = stdout(&native);
+    assert!(
+        native.ends_with("PAUSE_CROSS_TASK_SIGNAL_OK\n"),
+        "the native run is the oracle:\n{native}"
+    );
+    let args = [
+        "--backend=ptrace",
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), native, "ptrace");
+
+    let args = [
+        "--backend=kvm",
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+    let (out, err) = (stdout(&output), stderr(&output));
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "the KVM run must stop at pause-stop as a policy refusal\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    assert_eq!(
+        out,
+        "pause-fatal: killed by signal 15\n\
+         pause-caught: exit 10\n\
+         pause-ignored: killed by signal 15\n",
+        "KVM completes exactly the fatal, caught and ignored cases first"
+    );
+    assert!(
+        err.contains("HERMIT_POLICY_REFUSAL class=policy-refusal")
+            && err.contains("kill refused: KVM cannot deliver signal 20")
+            && err.contains(
+                "its default action stops the process, which KVM does not support (stage X2)"
+            ),
+        "the KVM run did not name the stage-X2 stop refusal\nstderr:\n{err}"
+    );
 }
 
 /// tests/c/kill_child_and_wait.c: a parent kills its own pausing child with

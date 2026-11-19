@@ -33,13 +33,37 @@
 //!    needs a thread to act now.
 //! 2. The transition its disposition requires: a handler (*catch*); a
 //!    default stop; a default action that ends the process (*die*); or
-//!    SIGKILL (*kill*). Only *catch* is admitted at this stage: *stop* waits
-//!    for stage X2 (the backend refuses it too), *die* for slice F and *kill*
-//!    for slice G. A receiver waiting for the signal in `rt_sigtimedwait`,
-//!    which its own mask blocks outside the wait, takes even a default-fatal
-//!    signal by that wait, as Linux's `complete_signal` leaves the group
-//!    alone for a thread whose `real_blocked` holds the signal; that is a
-//!    catch too.
+//!    SIGKILL (*kill*). *Catch* is admitted, and *die* for the one shape
+//!    slice F-minimal carries out: a target process with exactly one live
+//!    thread, which is neither a vfork parent waiting for its child nor a
+//!    live vfork child, and which is not itself polling in
+//!    `rt_sigtimedwait` (item 4's probe reach): that backend probe takes
+//!    only wait-set copies, so it would neither take a fatal copy of
+//!    another signal nor end the wait for the waited-for signal while it
+//!    is unblocked, where Linux ends the group at once. That receiver
+//!    reaches its own delivery boundary
+//!    (a parked observation included) and dies through the ordinary fatal
+//!    receipt, exit stores and robust-list walk included, exactly as a
+//!    fatal signal it sent itself; with no other thread there is no peer
+//!    for Detcore to end and no vfork copy its stores must reach. The
+//!    claim audit below therefore need not re-check the shape for a fatal
+//!    claim: before that boundary the receiver runs no guest code that
+//!    could create a thread or process or open a vfork window, and with
+//!    one thread no sibling can either. There is no filed pre-creation
+//!    clone request for admission to race, either: an ordinary clone or
+//!    fork runs inside the receiver's own turn and yields to the
+//!    scheduler only at its `ParentContinue` check-in, after
+//!    `CreateChildThread` has registered the child — by then a new
+//!    thread is in the live set admission reads (and the shape fails),
+//!    or a forked child process already exists in schedule order before
+//!    the send — and a vfork yields at its `BlockingVfork` request,
+//!    which the shape and reach already refuse. Every
+//!    other *die* shape waits for slice F, *stop* for stage X2 (the
+//!    backend refuses it too) and *kill* for slice G. A receiver waiting
+//!    for the signal in `rt_sigtimedwait`, which its own mask blocks
+//!    outside the wait, takes even a default-fatal signal by that wait,
+//!    as Linux's `complete_signal` leaves the group alone for a thread
+//!    whose `real_blocked` holds the signal; that is a catch too.
 //! 3. The receiver: the named thread for a thread-directed send, and for a
 //!    process-directed one the thread Linux's `complete_signal` chooses
 //!    (`process_signal_receiver::complete_signal`), each thread's wish read
@@ -215,7 +239,10 @@ pub enum SendRefusal {
     ExecInFlight,
     /// SIGKILL to another process: the kill transition, slice G.
     Kill,
-    /// A default action that ends the process: the die transition, slice F.
+    /// A default action that ends the process, for a target slice F-minimal
+    /// does not admit (more than one live thread, a vfork parent, a live
+    /// vfork child, a receiver polling in `rt_sigtimedwait`, or no chosen
+    /// receiver): the die transition, slice F.
     Die,
     /// A default stop: stage X2.
     Stop,
@@ -271,7 +298,9 @@ impl fmt::Display for SendRefusal {
             SendRefusal::Die => write!(
                 f,
                 "its default action ends the process, which KVM cannot yet carry out for a \
-                 signal another process sends (stage X1 slice F)"
+                 signal another process sends to a target with more than one live thread, \
+                 a vfork parent, a live vfork child, a receiver polling in rt_sigtimedwait, \
+                 or no chosen receiver (stage X1 slice F)"
             ),
             SendRefusal::Stop => write!(
                 f,
@@ -365,6 +394,14 @@ pub enum SendAdmission {
     Catch { receiver: DetTid, reach: CatchReach },
     /// Refused by name, before any effect.
     Refused(SendRefusal),
+    /// Admitted: the copy's default action ends `receiver`'s one-thread
+    /// process when `receiver` takes it, as `reach` says (slice
+    /// F-minimal). Downstream of admission a fatal copy is forwarded,
+    /// claimed and observed exactly as a caught one: the backend decides
+    /// the delivery's fate from the disposition at the dequeue, and the
+    /// fatal receipt retires the group. Appended after the slice-C
+    /// variants so their serialized discriminants do not move.
+    Die { receiver: DetTid, reach: CatchReach },
 }
 
 /// One standing copy of a guest-sent signal: which queue it waits in, its
@@ -658,7 +695,43 @@ impl Scheduler {
         // (`do_sigtimedwait`).
         if !caught && !receiver.is_some_and(|receiver| self.waits_for_blocked_signal(receiver, bit))
         {
-            return SendAdmission::Refused(SendRefusal::Die);
+            // Slice F-minimal carries out only the death a chosen receiver
+            // reaches by itself: its process's one live thread, under no
+            // vfork barrier of its own and no live vfork child (module
+            // docs, item 2). No chosen receiver, and every other shape,
+            // stays refused for slice F. The shape cannot change before
+            // the copy is taken: the receiver is the process's only thread
+            // and runs no guest code before the boundary that dequeues
+            // the copy, and no other thread exists to open a vfork window
+            // meanwhile.
+            let Some(receiver) = receiver else {
+                return SendAdmission::Refused(SendRefusal::Die);
+            };
+            if threads.len() != 1
+                || self.vfork_barriers.contains_key(&receiver)
+                || self
+                    .vfork_barriers
+                    .values()
+                    .any(|child| *child == Some(receiver))
+            {
+                return SendAdmission::Refused(SendRefusal::Die);
+            }
+            if signalfd {
+                return SendAdmission::Refused(SendRefusal::SignalfdCovered(receiver));
+            }
+            return match self.catch_reach(receiver) {
+                // The probe of an `rt_sigtimedwait` takes only wait-set
+                // copies: it would neither take this fatal copy of another
+                // signal nor end the wait for the waited-for signal while
+                // unblocked, where Linux ends the group at once. The
+                // blocked waiter above never reaches here (it takes the
+                // copy by the wait, a catch).
+                Ok(CatchReach::ProbeWaitSetOnly) => {
+                    SendAdmission::Refused(SendRefusal::Die)
+                }
+                Ok(reach) => SendAdmission::Die { receiver, reach },
+                Err(refusal) => SendAdmission::Refused(refusal),
+            };
         }
         // No thread wants it now: the first that can takes it from the
         // shared queue, as in Linux.
