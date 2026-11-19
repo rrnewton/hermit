@@ -715,18 +715,20 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         offset: Option<i64>,
         advances_offset: bool,
     ) -> Result<(), Error> {
-        // rr-like default (6805): the recorded result is the whole
-        // answer; no replay-root file or shared backing is touched.
-        // Reads of this descriptor are served from recorded bytes, so
-        // nothing later consumes these bytes from a real file.
-        if !self.write_output_files {
-            return Ok(());
-        }
         // The pages of a file that guest mappings share are the replay's
         // backing of it, which the write reaches too, as it reaches the page
-        // cache every mapping of the file maps under Linux.
+        // cache every mapping of the file maps under Linux. This runs in
+        // both modes (6805 slice 4): under the rr-like default the
+        // backing is a memfd, so no host file is touched, and later
+        // loads through the mapping must see these bytes.
         if let Some(offset) = offset.and_then(|offset| u64::try_from(offset).ok()) {
             super::mmap::write_shared_backing(task, fd, bytes, offset).map_err(Error::Io)?;
+        }
+        // rr-like default (6805): the replay-root file itself is not
+        // written; reads of this descriptor are served from recorded
+        // bytes, so nothing later consumes them from a real file.
+        if !self.write_output_files {
+            return Ok(());
         }
         if !self.fd_is_in_replay_root(task, fd) {
             return Ok(());
@@ -1180,8 +1182,10 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 let _guard = output_lock.lock().await;
                 truncate_replay_output(output, event.length)?;
             }
-            if self.write_output_files
-                && event.replay_regular_file
+            // The shared backing truncates in both modes (slice 4):
+            // under the default it is a memfd; only the replay-root
+            // file below stays gated.
+            if event.replay_regular_file
                 && event.output_fd.is_none()
                 && let Ok(length) = u64::try_from(event.length)
             {
