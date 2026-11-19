@@ -1786,7 +1786,13 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
             // Reverie. Replay must materialize its real OFD alias and validate
             // both successful fd allocation and failure errno.
             Syscall::Other(Sysno::pidfd_getfd, _) => self.handle_pidfd_getfd(guest, syscall).await,
-            unsupported => return Ok(guest.inject_with_retry(unsupported).await?),
+            // 6805 slice 5 drift tripwire, as in the recorder: a
+            // subscribed syscall with no arm here is drift, and a
+            // live injection would be unrecorded nondeterminism.
+            unsupported => panic!(
+                "record/replay subscription reached unhandled syscall {unsupported:?}: \
+                 classify it in both dispatch tables"
+            ),
         }?)
     }
 

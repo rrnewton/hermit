@@ -2301,19 +2301,13 @@ mod tests {
             link_placeholder_in(&mut backings, other_key, "41".to_owned()).is_err(),
             "one placeholder id linked two shared files"
         );
-        let resolved = placeholder_backing_in(
-            &backings,
-            || Some("41".to_owned()),
-            |fd| fd.try_clone(),
-        )
-        .unwrap();
+        let resolved =
+            placeholder_backing_in(&backings, || Some("41".to_owned()), |fd| fd.try_clone())
+                .unwrap();
         assert!(resolved.is_some(), "linked placeholder did not resolve");
-        let missing = placeholder_backing_in(
-            &backings,
-            || Some("99".to_owned()),
-            |fd| fd.try_clone(),
-        )
-        .unwrap();
+        let missing =
+            placeholder_backing_in(&backings, || Some("99".to_owned()), |fd| fd.try_clone())
+                .unwrap();
         assert!(missing.is_none(), "unlinked placeholder id resolved");
     }
 
