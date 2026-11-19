@@ -555,6 +555,120 @@ fn strict_vfork_child_sched_yield_is_deterministic() {
     run_strict_guest(&["--vfork"]);
 }
 
+/// The scheduler-turn bound of the strict checks below, passed as
+/// `--stop-after-turn`. A healthy run of the guest's `--vfork-spin`,
+/// `--spawn-spin` or `--vfork-child-first` mode takes 21 or 22 turns
+/// (measured with this file's flags on the fixing change). A starved
+/// `--spin-child` image commits one turn per 200 ms timeslice of its spinner
+/// and never finishes, so 200 turns, about nine times a healthy run, names the
+/// starvation; at about 0.2 s of host wall per turn on a loaded devserver that
+/// is well inside [`TIMEOUT_SECONDS`].
+const SPIN_CHILD_TURN_BOUND: u64 = 200;
+
+/// Run the guest under `run` with `run_args` and [`SPIN_CHILD_TURN_BOUND`],
+/// require a clean exit inside the bound, and return its stdout.
+fn strict_bounded_stdout(run_args: &[&str], guest_args: &[&str]) -> String {
+    let mut command = Command::new("timeout");
+    command
+        .arg("--kill-after=2s")
+        .arg(format!("{TIMEOUT_SECONDS}s"))
+        .arg(hermit_test::hermit_binary())
+        .arg("run")
+        .args(run_args)
+        .args([
+            "--base-env=minimal",
+            // x86-64-v2 beside --no-virtualize-cpuid: see chaos_output.
+            "--no-virtualize-cpuid",
+            "--cpu-profile=x86-64-v2",
+        ])
+        .arg(format!("--stop-after-turn={SPIN_CHILD_TURN_BOUND}"))
+        .arg("--")
+        .arg(guest())
+        .args(guest_args);
+
+    hermit_test::configure_guest_execution(&mut command);
+    let rendered = format!("{command:?}");
+    let output = hermit_test::hermit_output_attempts(&rendered, SKID_ATTEMPTS, &mut command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // A plain run reports the turn bound on stderr; a verified run keeps
+    // that warning in its captured logs and only fails.
+    assert!(
+        !stderr.contains("due to --stop-after-turn"),
+        "a thread starved: the run passed {SPIN_CHILD_TURN_BOUND} scheduler turns: \
+         {rendered}\nstderr:\n{stderr}",
+    );
+    assert_ne!(
+        output.status.code(),
+        Some(124),
+        "strict run hit the wall backstop: {rendered}"
+    );
+    assert!(
+        output.status.success(),
+        "guest failed: {rendered}\nstatus: {}\nstdout:\n{}\nstderr:\n{stderr}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+    );
+    String::from_utf8(output.stdout).expect("guest stdout should be UTF-8")
+}
+
+/// Run the guest once under `run --strict`, where a starved thread shows as
+/// the turn bound, then as a `--verify --verify-strict` pair, which must
+/// agree with it, and return its stdout.
+fn run_strict_bounded(guest_args: &[&str]) -> String {
+    let stdout = strict_bounded_stdout(&["--strict"], guest_args);
+    let verified = strict_bounded_stdout(&["--strict", "--verify", "--verify-strict"], guest_args);
+    assert_eq!(
+        stdout, verified,
+        "the strict run and the verified pair printed different output"
+    );
+    stdout
+}
+
+/// Start the guest's `--spin-child` image as a vfork child through `mode`,
+/// and require that its main thread, spinning without syscalls, let the
+/// sibling that sleeps for 1 ms run and set the flag. Detcore gave every vfork
+/// child a persistent priority ahead of every other thread, kept past its
+/// exec, so the new image's main thread kept the logical CPU and starved its
+/// own sibling for ever, without chaos: Debian's hey build hung that way in a
+/// Go `compile` that `go build` starts with `clone(CLONE_VM | CLONE_VFORK)`,
+/// and in a `go list` that a shell starts with `vfork`.
+fn assert_vfork_child_spinner_lets_its_sibling_run(mode: &str, marker: &str) {
+    let stdout = run_strict_bounded(&[mode]);
+    assert!(
+        stdout.contains("sched-yield-progress-ok spin-child") && stdout.contains(marker),
+        "missing progress markers for {mode}; stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn strict_vfork_child_spinner_lets_a_sleeping_sibling_run() {
+    assert_vfork_child_spinner_lets_its_sibling_run("--vfork-spin", "vfork-spin-progress-ok");
+}
+
+/// As above, through `posix_spawn(3)`, whose glibc implementation clones
+/// with `CLONE_VM | CLONE_VFORK`, the same kind of clone that `system(3)`,
+/// Go's `os/exec` and Python's `subprocess` make.
+#[test]
+fn strict_posix_spawn_child_spinner_lets_a_sleeping_sibling_run() {
+    assert_vfork_child_spinner_lets_its_sibling_run("--spawn-spin", "spawn-spin-progress-ok");
+}
+
+/// Inside the vfork interval the child still runs before every other
+/// runnable thread, which the vfork barrier provides whatever the child's
+/// priority (`Scheduler::step3_peek`): a sibling of the parent that counts
+/// without syscalls does not run between two reads the child makes around a
+/// call that takes a scheduler turn. Linux permits this schedule; Hermit
+/// chooses it, and it must not be lost now that a vfork child is born at the
+/// default priority.
+#[test]
+fn strict_vfork_child_runs_first_in_the_vfork_interval() {
+    let stdout = run_strict_bounded(&["--vfork-child-first"]);
+    assert!(
+        stdout.contains("sched-yield-progress-ok vfork-child-first"),
+        "the vfork child did not run first in the vfork interval; stdout:\n{stdout}"
+    );
+}
+
 #[test]
 fn preemption_replay_preserves_vfork_sched_yield_progress() {
     let schedule = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(

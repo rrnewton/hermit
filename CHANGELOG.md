@@ -68,6 +68,19 @@ branches from 0.5.0.
   ("Fatal glibc error: CPU does not support x86-64-v3", exit 127) is refused
   by name (exit 122) on the ptrace backend with virtual CPUID
   (<https://github.com/rrnewton/hermit/issues/4695>).
+- Scheduling: a thread started by `vfork`, which includes `posix_spawn`,
+  `system()`, `popen()`, Go's os/exec and Python's subprocess, is born at the
+  default priority, like any other new thread. It used to keep a priority
+  ahead of every other thread for its whole life, so a program it exec'd
+  that never blocked, such as a helper polling a flag, starved every other
+  thread and the run hung. The parent still waits, as on Linux, until the
+  child execs or exits; after the exec the child takes its turn with the
+  others, so output whose order depends on it can change, for example a
+  `posix_spawn` child and its parent each writing a line.
+  - Recordings: the record format moves from `0x1a1` to `0x1a2` and must
+    match exactly, so recordings made at `0x1a0` or `0x1a1`, under the old
+    priority, are refused (`Version mismatch`). Manifests from before the
+    psABI split still rerun on the legacy table.
 ## 0.5.7
 
 Release for the 2026-11-11 fbsource import. It pins Reverie 0.5.7

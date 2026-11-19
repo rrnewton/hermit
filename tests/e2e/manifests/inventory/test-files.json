@@ -1108,7 +1108,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/hb_spawn_echo.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/hb_spawn_echo.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test happens_before_posthook_before_anchor_orders_the_completed_write compiles this posix_spawn guest, whose parent and /bin/echo child each write a line, and checks that a happens-before edge from the parent's write to the child's orders only the parent reaching its write when fired at the prehook, and the completed write when fired at the posthook (https://github.com/rrnewton/hermit/issues/3929); it remains a guest fixture because a generic manifest cannot compare the two specs' output orders or check the hold."
+      "why": "tests/c/hb_spawn_echo.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test happens_before_posthook_before_anchor_orders_the_completed_write compiles this posix_spawn guest, whose parent and /bin/echo child each write a line, and checks that a happens-before edge from the parent's write to the child's orders only the parent reaching its write when fired at the prehook, and the completed write when fired at the posthook (https://github.com/rrnewton/hermit/issues/3929). Both specs print the parent's line first; the test tells the phases apart by the COMMIT turns of the anchor and of each write in the run's log. It remains a guest fixture because a generic manifest cannot compare those COMMIT turns or check the hold."
     },
     {
       "disposition": "guest-fixture",

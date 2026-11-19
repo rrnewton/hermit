@@ -740,14 +740,25 @@ mod tests {
             scheduler.record_logical_replay_priorities = true;
             scheduler.preemption_writer =
                 Some(PreemptionWriter::new(None).with_slice_boundaries().unwrap());
-            for (thread, priority, vfork) in [
-                (tid, REPLAY_FOREGROUND_PRIORITY, false),
-                (peer, REPLAY_DEFERRED_PRIORITY, true),
+            for (thread, priority) in [
+                (tid, REPLAY_FOREGROUND_PRIORITY),
+                (peer, REPLAY_DEFERRED_PRIORITY),
             ] {
                 scheduler.register_thread_for_test(thread);
                 scheduler.priorities.insert(thread, priority);
-                scheduler.register_preemption_thread(thread, priority, vfork);
+                scheduler.register_preemption_thread(thread, priority);
             }
+            // Every thread is born at the default logical priority, and the end
+            // of the schedule returns the dispatch priorities to the default as
+            // well. Give the peer's logical row a marker value through the
+            // writer, so that a change that copied a dispatch priority into the
+            // record at the end of the schedule would show.
+            let peer_logical = DEFAULT_PRIORITY - 1;
+            scheduler
+                .preemption_writer
+                .as_mut()
+                .unwrap()
+                .set_current(peer, peer_logical);
             scheduler.readmit_ready_thread(peer);
             let before = (scheduler.turn, scheduler.committed_time);
             scheduler.consume_schedevent(&branch);
@@ -760,20 +771,18 @@ mod tests {
             assert_eq!(scheduler.priorities[&peer], REPLAY_DEFERRED_PRIORITY);
             if exhaust {
                 scheduler.consume_boundary_record(&last).unwrap();
-                let late_vfork = DetTid::from_raw(7);
-                scheduler.register_thread_for_test(late_vfork);
-                assert!(
-                    !scheduler.replay_registration_priority(late_vfork, REPLAY_DEFERRED_PRIORITY)
-                );
-                scheduler.register_preemption_thread(late_vfork, REPLAY_DEFERRED_PRIORITY, true);
-                assert_eq!(scheduler.priorities[&late_vfork], DEFAULT_PRIORITY);
+                let late = DetTid::from_raw(7);
+                scheduler.register_thread_for_test(late);
+                assert!(!scheduler.replay_registration_priority(late, REPLAY_DEFERRED_PRIORITY));
+                scheduler.register_preemption_thread(late, REPLAY_DEFERRED_PRIORITY);
+                assert_eq!(scheduler.priorities[&late], DEFAULT_PRIORITY);
                 assert_eq!(
                     scheduler
                         .preemption_writer
                         .as_ref()
                         .unwrap()
-                        .current_priority(late_vfork),
-                    DEFAULT_PRIORITY - 1
+                        .current_priority(late),
+                    DEFAULT_PRIORITY
                 );
             }
             assert_eq!(
@@ -795,9 +804,9 @@ mod tests {
                     .unwrap();
             let rows = &exported["slice_boundary_recording"]["preemptions"]["per_thread"];
             assert_eq!(rows["3"]["final_prio"], DEFAULT_PRIORITY);
-            assert_eq!(rows["4"]["final_prio"], DEFAULT_PRIORITY - 1);
+            assert_eq!(rows["4"]["final_prio"], peer_logical);
             if exhaust {
-                assert_eq!(rows["7"]["final_prio"], DEFAULT_PRIORITY - 1);
+                assert_eq!(rows["7"]["final_prio"], DEFAULT_PRIORITY);
             }
             for thread in ["3", "4"] {
                 assert_eq!(rows[thread]["prio_changes"], serde_json::json!([]));

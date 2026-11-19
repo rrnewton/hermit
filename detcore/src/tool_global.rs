@@ -7343,11 +7343,7 @@ impl GlobalState {
                 }
             }
 
-            sched.register_preemption_thread(
-                child_dettid,
-                initial_priority,
-                parent_is_kernel_blocked,
-            );
+            sched.register_preemption_thread(child_dettid, initial_priority);
 
             // Describe *how* the admission side is chosen, but do not resolve it
             // (and in particular do not draw the post-fork PRNG) here: this
@@ -12329,8 +12325,10 @@ where
 /// Unlike an ordinary clone, the parent cannot perform this registration
 /// because the kernel has blocked it until the child execs or exits. The child
 /// therefore registers itself, carrying the inherited parent identity, flags,
-/// and starting priority. The starting priority is derived the same way as an
-/// ordinary clone so that chaos and replay scheduling stay deterministic.
+/// and starting priority. The starting priority is chosen as for an ordinary
+/// clone, so that chaos and replay scheduling stay deterministic: the default
+/// priority in plain mode, the replayed priority under a schedule replay, and
+/// a chaos draw (from entropy the parent drew before it blocked) under chaos.
 pub async fn create_vfork_child_thread<G, T>(
     guest: &mut G,
     child_dettid: DetTid,
@@ -12348,12 +12346,14 @@ pub async fn create_vfork_child_thread<G, T>(
             "vfork child priority entropy missing in chaos mode",
         )))
     } else {
-        // POSIX vfork suspends the parent until the child execs or _exits. Give
-        // the vfork child a strictly higher priority (lower number) than the
-        // parent's DEFAULT_PRIORITY so the deterministic scheduler always runs
-        // the child first, rather than round-robining the parent and child at
-        // equal priority (which leaves fork/exec ordering nondeterministic).
-        Some(DEFAULT_PRIORITY - 1)
+        // An ordinary clone child's priority. POSIX vfork suspends the parent
+        // until the child execs or _exits, and inside that interval the vfork
+        // barrier already runs this child before every other thread, whatever
+        // its priority (`gated_child` in `Scheduler::step3_peek`). A better
+        // priority would outlive the interval: it is the thread's persistent
+        // priority, so after an exec the new program's first thread would
+        // outrank every other thread and starve them all by spinning.
+        Some(DEFAULT_PRIORITY)
     };
 
     let resp = send_and_update_time(
@@ -18034,17 +18034,16 @@ mod tests {
             );
             let sched = state.sched.lock().unwrap();
             assert_eq!(sched.priorities[&child], priority);
+            // The root, an ordinary clone and a vfork child are all born at
+            // the default priority in a run without a replayed schedule, so
+            // each records that, whatever its dispatch band.
             assert_eq!(
                 sched
                     .preemption_writer
                     .as_ref()
                     .unwrap()
                     .current_priority(child),
-                if is_vfork {
-                    DEFAULT_PRIORITY - 1
-                } else {
-                    DEFAULT_PRIORITY
-                }
+                DEFAULT_PRIORITY
             );
             assert_eq!((sched.turn, sched.committed_time), before);
         }
@@ -23635,7 +23634,7 @@ mod tests {
                         0,
                         CloneFlags::CLONE_VFORK | CloneFlags::CLONE_VM,
                         libc::SIGCHLD,
-                        Some(DEFAULT_PRIORITY - 1),
+                        Some(DEFAULT_PRIORITY),
                     ),
                 ),
             )
@@ -24081,7 +24080,7 @@ mod tests {
                         0,
                         CloneFlags::CLONE_VFORK | CloneFlags::CLONE_VM,
                         libc::SIGCHLD,
-                        Some(DEFAULT_PRIORITY - 1),
+                        Some(DEFAULT_PRIORITY),
                     ),
                 ),
             )

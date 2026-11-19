@@ -1669,11 +1669,10 @@ declares x86-64-v3, or a recording chose by the declarations) or `explicit`;
 its rerun (`hermit run --from`)
 presents the same profile. x86-64-v2 is exactly the psABI level.
 What an older document means by it is told by its version: a
-recording from before the split (recording version 0x1a0, naming
-x86-64-v2 or no profile) replays on the legacy table it recorded
-with, which also advertised AVX, BMI1, HLE, AVX2, BMI2, RTM and
-ADX; a pre-split manifest (schema v1/v2) or saved run config
-(hermit-run-config/v1) likewise reruns on that table, with the
+pre-split manifest (schema v1/v2) or saved run config
+(hermit-run-config/v1) naming x86-64-v2 or no profile reruns on
+the legacy table it ran with, which also advertised AVX, BMI1,
+HLE, AVX2, BMI2, RTM and ADX, with the
 migration recorded in the run's manifest as
 `cpu_profile_migration` and a line in the log saying so. That
 table's public name is `x86-64-v2-legacy`: a manifest or saved
@@ -1688,7 +1687,11 @@ era-mapped profile wins over the environment variable, which
 supplies a value only where neither the document nor the flag
 names one, so overriding a document's era takes the flag. New recordings record the psABI table's digest
 as well as its name, and replay refuses a digest that is not
-this replayer's. The legacy table cannot be recorded onto.
+this replayer's. The legacy table cannot be recorded onto. A
+recording from before the split (recording version 0x1a0)
+replayed on the legacy table only up to recording version
+0x1a1; replay now refuses it by its version, as it refuses every
+recording an older version made.
 
 So software built for x86-64-v3 (CentOS Stream 10's glibc, for example)
 starts wherever v3 can be offered. Where it cannot, its loader prints
