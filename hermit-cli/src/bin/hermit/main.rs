@@ -20,6 +20,14 @@
 #[unsafe(link_section = ".preinit_array")]
 static CAPTURE_STARTUP_STDIN: unsafe extern "C" fn() = hermit::app::capture_startup_stdin;
 
+// Records the signals Hermit's launcher left ignored before any thread exists,
+// the table every guest starts from (reverie's `start_signals`). Executable
+// images only, like the capture above.
+#[used]
+#[unsafe(link_section = ".preinit_array")]
+static RECORD_LAUNCH_DISPOSITIONS: extern "C" fn() =
+    reverie::process::start_signals::record_launch_dispositions;
+
 fn main() {
     if let Some(status) = hermit::app::executable_entry() {
         std::process::exit(status);

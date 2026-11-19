@@ -271,6 +271,9 @@ where
     let mut factory = {
         let state = Rc::clone(&state);
         move || {
+            // Before the init forks a guest: the guest's descriptor table is
+            // then sized as in an unpinned run (`close_inherited_reservation`).
+            super::pinned_cpu::close_inherited_reservation();
             let mut alarm = None;
             let result = super::container::catch_child_panic_at(site, || {
                 super::container::stall_container_init_before_arming_if_asked();

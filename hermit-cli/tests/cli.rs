@@ -81077,3 +81077,228 @@ fn run_kvm_another_threads_directory_links_are_refused_by_name() {
     );
     assert_eq!(stdout(&output), "", "the guest printed past the refusal");
 }
+
+static BACKGROUND_TERMINAL_IO_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// `tests/c/background_terminal_io.c`, built once per test process.
+fn background_terminal_io_guest() -> &'static Path {
+    BACKGROUND_TERMINAL_IO_GUEST.get_or_init(|| compile_c_guest("background_terminal_io"))
+}
+
+/// Starts `command` with SIGTTIN and SIGTTOU set to `handler`, whatever this
+/// test process was started with.
+fn with_job_control_signals(command: &mut Command, handler: libc::sighandler_t) -> &mut Command {
+    // SAFETY: signal(2) is async-signal-safe and changes only the child.
+    unsafe {
+        command.pre_exec(move || {
+            for signal in [libc::SIGTTIN, libc::SIGTTOU] {
+                if libc::signal(signal, handler) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
+/// A guest starts with SIGTTIN and SIGTTOU ignored, whatever Hermit was started
+/// with. They are two of the named exceptions in the table every launched
+/// program starts with (reverie-process `start_signals`). The guest's
+/// background read of its controlling terminal fails with EIO, and its
+/// background write goes through. A native run started with both signals
+/// ignored prints the same.
+///
+/// With both at their defaults the guest wedged, measured 2026-11-18. The
+/// child's read raised SIGTTIN, Detcore held the signal until the call
+/// returned, and the kernel restarted the read and raised it again. The tracer
+/// logged "SIGTTIN replaces held SIGTTIN in the single pending-signal slot"
+/// 457,921 times, until safehermit killed the run at its output cap. This test
+/// fails, or times out, if the exception is dropped before that hold delivers
+/// the signal as a stop. KVM has no pseudoterminals yet (`posix_openpt` fails
+/// with EINVAL), so the guest runs on ptrace only.
+#[test]
+fn a_guest_starts_with_terminal_job_control_signals_ignored_and_does_not_wedge() {
+    let guest = background_terminal_io_guest();
+    let guest_path = guest.to_str().expect("guest path is UTF-8");
+    let expected = "started with SIGTTIN ignored, SIGTTOU ignored\n\
+                    read: failed: Input/output error\n\
+                    read: child exited 0\n\
+                    write: 4 bytes\n\
+                    write: child exited 0\n\
+                    session: exited 0\n";
+    let native = with_job_control_signals(&mut Command::new(guest), libc::SIG_IGN)
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "native run failed: {native:?}");
+    assert_eq!(
+        stdout(&native),
+        expected,
+        "native Linux with both signals ignored"
+    );
+
+    let directory = tempfile::tempdir().expect("failed to create report directory");
+    let report = directory.path().join("verify.json");
+    let report_arg = report.to_str().expect("report path is UTF-8");
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report_arg,
+        "--timeout",
+        "60",
+        "--",
+        guest_path,
+    ];
+    let mut command = hermit_command(&args);
+    let output = hermit_test::hermit_output(
+        &format!("hermit {args:?}"),
+        with_job_control_signals(&mut command, libc::SIG_DFL),
+    );
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        expected,
+        "ptrace --verify, started with both at default"
+    );
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+            .expect("parse the verification report");
+    assert_eq!(
+        verdict["bitwise_parity"],
+        serde_json::Value::Bool(true),
+        "{verdict}"
+    );
+}
+
+/// A strict run pins its threads, and the CPU reservation keeps its
+/// descriptors at 1000 and above. A fork sizes the new process's descriptor
+/// table for the highest descriptor the forking process has open, and
+/// `execve` keeps that size. The container init closes its copies of the
+/// reservation's descriptors before it forks the guest
+/// (`pinned_cpu::close_inherited_reservation`). So the guest's
+/// `/proc/self/status` shows the 64-descriptor table an unpinned run's guest
+/// gets, not 1024. Before that, a pinned and an unpinned run differed here
+/// (https://github.com/facebookexperimental/hermit/issues/484).
+#[test]
+fn a_pinned_runs_guest_gets_the_descriptor_table_of_an_unpinned_run() {
+    let args = [
+        "run",
+        "--strict",
+        "--",
+        "/bin/grep",
+        "FDSize",
+        "/proc/self/status",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "FDSize:\t64\n");
+}
+
+/// Starts `command` with exactly the signals in `ignored` ignored and every
+/// other signal at its default, whatever this test process was started with.
+/// It goes through the raw system call, because glibc's `sigaction` refuses
+/// signals 32 and 33.
+fn with_exactly_these_signals_ignored<'command>(
+    command: &'command mut Command,
+    ignored: &'static [libc::c_int],
+) -> &'command mut Command {
+    /// The kernel's `struct sigaction` on x86_64.
+    #[repr(C)]
+    struct KernelSigaction {
+        handler: libc::sighandler_t,
+        flags: libc::c_ulong,
+        restorer: usize,
+        mask: u64,
+    }
+    // SAFETY: rt_sigaction(2) is async-signal-safe and changes only the child;
+    // the loop allocates nothing.
+    unsafe {
+        command.pre_exec(move || {
+            for signal in 1..=64 {
+                if signal == libc::SIGKILL || signal == libc::SIGSTOP {
+                    continue;
+                }
+                let handler = if ignored.contains(&signal) {
+                    libc::SIG_IGN
+                } else {
+                    libc::SIG_DFL
+                };
+                let action = KernelSigaction {
+                    handler,
+                    flags: 0,
+                    restorer: 0,
+                    mask: 0,
+                };
+                let set = libc::syscall(
+                    libc::SYS_rt_sigaction,
+                    libc::c_long::from(signal),
+                    &action as *const KernelSigaction,
+                    std::ptr::null_mut::<KernelSigaction>(),
+                    std::mem::size_of::<u64>(),
+                );
+                if set == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    command
+}
+
+/// A guest starts with the same signals ignored on every backend. Those are
+/// the table every launched program starts with (reverie-process
+/// `start_signals`): the signals ignored when Hermit started, except SIGPIPE,
+/// plus SIGTTIN and SIGTTOU (see
+/// `a_guest_starts_with_terminal_job_control_signals_ignored_and_does_not_wedge`).
+/// Hermit starts here with SIGPIPE, SIGUSR2 and signal 33 ignored, and every
+/// other signal at its default. The guest's `SigIgn` must name SIGUSR2, 33,
+/// SIGTTIN and SIGTTOU, and nothing else.
+///
+/// Before, a ptrace guest started with the signals ignored in the Hermit
+/// process that forked it, at the moment it forked. glibc installs its own
+/// handler for signal 33 (SIGSETXID) when a process creates its first thread,
+/// so whether the guest kept the launcher's 33 depended on whether that process
+/// had created a thread yet. That was a race, which pinning settled
+/// differently (https://github.com/facebookexperimental/hermit/issues/484). A
+/// KVM guest started with no signal ignored at all.
+#[test]
+fn a_guest_starts_with_the_same_ignored_signals_on_every_backend() {
+    let test = "a_guest_starts_with_the_same_ignored_signals_on_every_backend";
+    const SIGSETXID: libc::c_int = 33;
+    let bit = |signal: libc::c_int| 1u64 << (signal - 1);
+    let expected = format!(
+        "SigIgn:\t{:016x}\n",
+        bit(libc::SIGUSR2) | bit(SIGSETXID) | bit(libc::SIGTTIN) | bit(libc::SIGTTOU)
+    );
+    let backends = procfs_backends_among(test, &["ptrace", "kvm"]);
+    assert!(
+        backends.contains(&"ptrace"),
+        "{test}: ptrace is not compared"
+    );
+    for backend in backends {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--",
+            "/bin/grep",
+            "SigIgn",
+            "/proc/self/status",
+        ];
+        let mut command = hermit_command(&args);
+        let output = hermit_test::hermit_output(
+            &format!("hermit {args:?}"),
+            with_exactly_these_signals_ignored(
+                &mut command,
+                &[libc::SIGPIPE, libc::SIGUSR2, SIGSETXID],
+            ),
+        );
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{backend}");
+    }
+}

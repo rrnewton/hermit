@@ -128,6 +128,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/background_terminal_io.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/background_terminal_io.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_guest_starts_with_terminal_job_control_signals_ignored_and_does_not_wedge compiles this guest, which opens a pseudoterminal, makes it a session's controlling terminal with TOSTOP, and has background children read and write it. The test requires the output of a native run started with SIGTTIN and SIGTTOU ignored from a ptrace --verify run started with both at their defaults, and fails if the run wedges. It remains a guest fixture because a generic manifest cannot set the launcher's dispositions or assert this exact output."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/bind_ephemeral_after_loopback_close.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/bind_ephemeral_after_loopback_close.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test runs this completed-loopback-connection rebind probe on ptrace and KVM for IPv4 and IPv6 and compares its output against a native run; it remains a guest fixture because a generic manifest cannot express the native comparison or the allocator port sequence it checks."

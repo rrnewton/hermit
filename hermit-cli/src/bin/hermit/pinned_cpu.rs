@@ -274,6 +274,33 @@ const RESERVATION_FD_FLOOR: libc::c_int = 1000;
 /// process makes at the same time (test threads, say) may draw its CPU too.
 static HELD: Mutex<Option<(usize, Reservation)>> = Mutex::new(None);
 
+/// In a process forked from the one that holds the reservation (a container's
+/// init): closes this process's copies of the reservation's descriptors and
+/// forgets them. The parent's copies keep the CPU reserved for the run.
+///
+/// A reservation's descriptors are the process's highest
+/// ([`RESERVATION_FD_FLOOR`]). A fork sizes the new process's descriptor table
+/// for the highest descriptor the forking process has open, and `execve`
+/// keeps that size. So a guest that the init forks while the copies are open
+/// reports `FDSize: 1024` in `/proc/self/status`, where an unpinned run's
+/// guest reports 64.
+///
+/// The copies are forgotten, not only closed. A later reservation made in this
+/// process would get the same numbers, and dropping the stale record would
+/// close it.
+///
+/// A mutex that another thread held at the fork stays held in the child.
+/// So this only tries the lock, and a child forked while another thread of
+/// its parent was placing itself keeps its copies.
+pub(crate) fn close_inherited_reservation() {
+    let inherited = match HELD.try_lock() {
+        Ok(mut held) => held.take(),
+        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner().take(),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    drop(inherited);
+}
+
 /// The descriptors that hold a CPU: the abstract socket's name, and, where the
 /// lock directory is usable, the CPU's lock file (`lock`). Either one held by
 /// another run makes the CPU held.
