@@ -1,8 +1,10 @@
-// Copyright (c) Meta Platforms, Inc. and affiliates.
-// All rights reserved.
-//
-// This source code is licensed under the BSD-style license found in the
-// LICENSE file in the root directory of this source tree.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
 
 //! The complete record/replay WORKLOADS preparation contract.
 //! Included by both the official producer and its test-harness consumer.
@@ -349,6 +351,10 @@ pub fn executable(path: &Path, directory: &Path) -> Result<(), String> {
 /// Checked once when WORKLOADS initializes. The official caller holds its shared
 /// preparation lock through child exit, excluding cooperative producers. This
 /// does not provide a per-guest check or exclude uncoordinated path mutations.
+/// It leaves out the change time: a link made to the file or removed from it
+/// changes that with the link count, and a build executor that gives several
+/// concurrent actions one input as hard links of one file does both while a
+/// workload runs, whose bytes, inode, size and modification time stay.
 #[derive(Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Generation {
@@ -356,10 +362,10 @@ struct Generation {
     ino: u64,
     size: u64,
     mode: u32,
+    uid: u32,
+    gid: u32,
     mtime: i64,
     mtime_nsec: i64,
-    ctime: i64,
-    ctime_nsec: i64,
 }
 
 impl Generation {
@@ -371,10 +377,10 @@ impl Generation {
             ino: m.ino(),
             size: m.len(),
             mode: m.mode(),
+            uid: m.uid(),
+            gid: m.gid(),
             mtime: m.mtime(),
             mtime_nsec: m.mtime_nsec(),
-            ctime: m.ctime(),
-            ctime_nsec: m.ctime_nsec(),
         })
     }
 }
@@ -438,8 +444,12 @@ pub fn consume_prepared(
     }
     let mut paths = BTreeMap::new();
     for entry in envelope.workloads {
-        if entry.generation != Generation::read(&entry.path)? {
-            return Err(format!("prepared record workload changed: {}", entry.name));
+        let now = Generation::read(&entry.path)?;
+        if entry.generation != now {
+            return Err(format!(
+                "prepared record workload changed: {}: prepared {:?}, now {now:?}",
+                entry.name, entry.generation
+            ));
         }
         if paths.insert(entry.name, entry.path).is_some() {
             return Err("duplicate prepared record workload alias".into());
@@ -1106,6 +1116,57 @@ mod tests {
         let replacement = fixture.executable("replacement");
         fs::rename(replacement, &paths["c_getpid"]).unwrap();
         assert!(consume_prepared(true, Some(&raw)).is_err());
+    }
+
+    /// A link made to a prepared workload changes its change time and link
+    /// count, not the workload, as another action's hard link of a shared
+    /// input does; a write still changes its witness.
+    #[test]
+    fn prepared_consumer_keeps_a_workload_another_link_was_made_to() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let raw = prepared_envelope(&paths).unwrap();
+        fs::hard_link(&paths["c_getpid"], fixture.0.join("another-actions-link")).unwrap();
+        assert!(consume_prepared(true, Some(&raw)).is_ok());
+        fs::File::options()
+            .write(true)
+            .open(&paths["c_getpid"])
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH)
+            .unwrap();
+        let refusal = consume_prepared(true, Some(&raw)).unwrap_err();
+        assert!(
+            refusal.starts_with("prepared record workload changed: c_getpid: prepared "),
+            "{refusal}"
+        );
+    }
+
+    /// A file renamed over a prepared workload changes its witness by the
+    /// inode alone when it has the workload's bytes, mode and times.
+    #[test]
+    fn prepared_consumer_refuses_a_replacement_with_the_workloads_times() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        let raw = prepared_envelope(&paths).unwrap();
+        let original = &paths["c_getpid"];
+        let replacement = fixture.executable("replacement");
+        let times = fs::metadata(original).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_accessed(times.accessed().unwrap())
+                    .set_modified(times.modified().unwrap()),
+            )
+            .unwrap();
+        fs::rename(replacement, original).unwrap();
+        let refusal = consume_prepared(true, Some(&raw)).unwrap_err();
+        assert!(
+            refusal.starts_with("prepared record workload changed: c_getpid: prepared "),
+            "{refusal}"
+        );
     }
 
     /// The directories in `build_root`, sorted.
