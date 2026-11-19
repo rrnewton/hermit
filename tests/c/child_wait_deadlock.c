@@ -9,12 +9,16 @@
 // A parent waits for a child that cannot exit, or for one that will
 // (https://github.com/rrnewton/hermit/issues/4430). Modes:
 //   pause   the child pauses forever: nothing can end the wait
+//   ppoll   the child waits forever in ppoll(NULL, 0, NULL, NULL, 0), which
+//           is pause by another name (aarch64's libc builds pause from it)
 //   futex   the child waits forever on a futex no one wakes
 //   chain   the child waits for a grandchild that pauses forever
 //   killer  the child pauses, and a second parent thread kills it after a
 //           one-second sleep: the wait ends with SIGKILL
 //   alarm   the child pauses with a caught SIGALRM from alarm(1), then exits
 //           3: the wait ends with status 3
+//   ppoll-alarm  as alarm, but the child waits in ppoll(NULL, 0, NULL, NULL,
+//           0), which the handler ends with EINTR, then exits 4
 // Prints "<mode>: child signal <n>" or "<mode>: child exit <n>" when the
 // wait ends.
 #define _GNU_SOURCE
@@ -63,11 +67,22 @@ int main(int argc, char** argv) {
       waitpid(grandchild, NULL, 0);
       _exit(2);
     }
+    if (!strcmp(mode, "ppoll")) {
+      for (;;) {
+        syscall(SYS_ppoll, NULL, 0, NULL, NULL, 0);
+      }
+    }
     if (!strcmp(mode, "alarm")) {
       signal(SIGALRM, on_alarm);
       alarm(1);
       pause();
       _exit(3);
+    }
+    if (!strcmp(mode, "ppoll-alarm")) {
+      signal(SIGALRM, on_alarm);
+      alarm(1);
+      syscall(SYS_ppoll, NULL, 0, NULL, NULL, 0);
+      _exit(4);
     }
     for (;;) {
       pause();

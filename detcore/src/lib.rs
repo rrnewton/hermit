@@ -7426,7 +7426,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 self.begin_traced_call(guest, &call);
             }
 
-            let syscall_cost_ns = syscall_time::cost_ns(call.number());
+            let syscall_cost_ns = syscall_time::call_cost_ns(&call);
             // The backend-runtime bootstrap window. A backend-resident runtime (the
             // LiteInst preload constructor) issues hundreds to thousands of syscalls
             // on one thread (315 for a small C program, 6,970 for emacs; see

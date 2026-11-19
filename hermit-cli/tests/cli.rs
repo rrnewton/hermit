@@ -58640,13 +58640,17 @@ fn run_kvm_virtual_timeout_is_reported_from_the_childs_note() {
 }
 
 /// A parent waiting for a child that cannot exit (its only thread paused
-/// forever, waiting on a futex no one wakes, or itself waiting for a paused
-/// grandchild) ends the run with Detcore's deadlock report, exit 121 (class
+/// forever, by `pause` or by the `ppoll` with nothing to poll, no timeout and
+/// no mask that is `pause` by another name, waiting on a futex no one wakes,
+/// or itself waiting for a paused grandchild) ends the run with Detcore's
+/// deadlock report, exit 121 (class
 /// deadlock-under-hermit-model), as the same child without the wait does. Before, the run
 /// spun until the outer timeout (https://github.com/rrnewton/hermit/issues/4430).
 /// The report is the same in two runs with the same epoch. A wait that can end
 /// (a second parent thread kills the child after a sleep; the child's alarm
-/// wakes it) still ends as on Linux (ptrace, `--strict`).
+/// wakes its `pause` or its `ppoll`) still ends as on Linux (ptrace,
+/// `--strict`), and the `ppoll` one also at bitwise parity under
+/// `--verify --verify-strict`.
 #[test]
 fn a_wait_for_a_child_that_cannot_exit_is_a_deadlock() {
     let guest = child_wait_deadlock_guest().to_str().unwrap().to_owned();
@@ -58673,6 +58677,7 @@ fn a_wait_for_a_child_that_cannot_exit_is_a_deadlock() {
     };
     for (mode, class) in [
         ("pause", "thread(s) waiting indefinitely"),
+        ("ppoll", "thread(s) waiting indefinitely"),
         ("futex", "thread(s) waiting on futex"),
         ("chain", "thread(s) waiting indefinitely"),
     ] {
@@ -58709,11 +58714,35 @@ fn a_wait_for_a_child_that_cannot_exit_is_a_deadlock() {
     for (mode, expected) in [
         ("killer", "killer: child signal 9\n"),
         ("alarm", "alarm: child exit 3\n"),
+        ("ppoll-alarm", "ppoll-alarm: child exit 4\n"),
     ] {
         let (code, stdout, log) = run(mode);
         assert_eq!(code, Some(0), "{mode}: {stdout}\n{log}");
         assert_eq!(stdout, expected, "{mode}: {log}");
     }
+    // The ppoll wait a caught signal ends, at bitwise parity across two runs.
+    let directory = tempfile::tempdir().expect("failed to create report directory");
+    let report = directory.path().join("verify.json");
+    let report_arg = report.to_str().expect("report path is UTF-8");
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report_arg,
+        "--epoch=2026-01-01T00:00:00Z",
+        "--",
+        guest.as_str(),
+        "ppoll-alarm",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "ppoll-alarm: child exit 4\n");
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+            .expect("parse the verification report");
+    assert_eq!(verdict["bitwise_parity"], true, "ppoll-alarm: {verdict}");
 }
 
 /// A parent-death signal (`prctl(PR_SET_PDEATHSIG)`) reaches the child when

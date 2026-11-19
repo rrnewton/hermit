@@ -84,6 +84,7 @@ use crate::syscalls::scm_rights::SentRights;
 use crate::syscalls::scm_rights::received_descriptors;
 use crate::syscalls::signal::STACK_RED_ZONE;
 use crate::syscalls::signal::kernel_installed_signal_mask;
+use crate::syscalls::signal::ppoll_is_pause;
 use crate::syscalls::signal::read_kernel_sigset;
 use crate::syscalls::threads::KernelSigset;
 use crate::tool_global::*;
@@ -2916,6 +2917,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Ppoll,
     ) -> Result<i64, Error> {
+        // `pause` by another name (`ppoll_is_pause`), which aarch64's libc
+        // makes for `pause`: the same wait for a signal, with no deadline.
+        if guest.config().sequentialize_threads && ppoll_is_pause(&call) {
+            return self.wait_as_pause(guest).await;
+        }
         // A masked ppoll under the in-guest delivery gate (A5 step 3c.1d, D50
         // reader (5)): `gated_masked_ppoll`, which reads the timeout itself.
         if self.cfg.in_guest_signal_delivery
