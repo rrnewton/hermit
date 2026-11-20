@@ -2189,6 +2189,9 @@ pub(crate) fn fork_copies(spec: &ForkSpec, place: serde_json::Value) -> Option<u
     let summary = serde_json::json!({
         "backend": guest_fork.name(),
         "parked_threads": template.parked.count(),
+        // The template's thread IDs, in the order each copy re-created them
+        // (its timeline-<i>.threads file counts them).
+        "parked_thread_ids": template.parked.threads(),
         "park_us": template.park_us,
         "spec": format!("{spec:?}"),
         "place": place,
@@ -2392,10 +2395,10 @@ fn become_timeline(
         return;
     }
     match parked.resurrect(affinity.as_ref()) {
-        Ok(threads) => {
+        Ok(recreated) => {
             let _ = std::fs::write(
                 dir.join(format!("timeline-{index}.threads")),
-                format!("{threads} {}\n", micros(threads_started)),
+                format!("{} {}\n", recreated.len(), micros(threads_started)),
             );
         }
         Err(error) => fail("re-creating threads", error),

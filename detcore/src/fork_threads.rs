@@ -617,6 +617,10 @@ fn is_user_worker(tid: libc::pid_t) -> bool {
 pub(crate) struct Parked {
     count: usize,
     session: u32,
+    /// The parked threads' IDs, in slot order: the order [`Parked::resurrect`]
+    /// re-creates them in. Allocated before anything parks, and filled from
+    /// the slots once every thread has parked.
+    threads: Vec<libc::pid_t>,
 }
 
 /// Parks every other thread of this process (kernel worker threads aside)
@@ -652,9 +656,12 @@ pub(crate) fn park_others(timeout: std::time::Duration) -> Result<Parked, String
     NEXT_SLOT.store(0, Ordering::Relaxed);
     PARKED.store(0, Ordering::Relaxed);
     let session = SESSION.fetch_add(1, Ordering::AcqRel) + 1;
-    let parked = Parked {
+    // Allocated now, while no thread is parked: a thread parked inside the
+    // C library's allocator would hold its lock until it is released.
+    let mut parked = Parked {
         count: tids.len(),
         session,
+        threads: Vec::with_capacity(tids.len()),
     };
     for &tid in &tids {
         // SAFETY: signals one thread of this process.
@@ -678,6 +685,12 @@ pub(crate) fn park_others(timeout: std::time::Duration) -> Result<Parked, String
             ));
         }
         futex_wait(&PARKED, count, Some(deadline - now));
+    }
+    for index in 0..parked.count {
+        // SAFETY: every parked thread wrote its slot before PARKED counted
+        // it, and the Acquire load above saw all of them; the push stays
+        // within the capacity allocated before parking.
+        parked.threads.push(unsafe { (*slot(index)).tid });
     }
     Ok(parked)
 }
@@ -726,6 +739,14 @@ impl Parked {
         self.count
     }
 
+    /// The parked threads' IDs (in the template), in the order
+    /// [`Self::resurrect`] re-creates them. A slice, so that reading it
+    /// allocates nothing while the threads are parked; `to_vec` it once they
+    /// are released, or in a copy once they are re-created.
+    pub(crate) fn threads(&self) -> &[libc::pid_t] {
+        &self.threads
+    }
+
     /// In the template: lets every parked thread go on.
     pub(crate) fn release(&self) {
         RELEASED.fetch_max(self.session, Ordering::AcqRel);
@@ -737,8 +758,15 @@ impl Parked {
     /// would have, and goes on as the original.
     /// `affinity`, when given, replaces each thread's saved CPU set, so that
     /// a copy pinned to its own CPU keeps all of its threads there.
-    pub(crate) fn resurrect(&self, affinity: Option<&libc::cpu_set_t>) -> Result<usize, String> {
+    /// Returns each re-created thread's (original ID, new ID), in
+    /// [`Self::threads`] order. The list is allocated before any thread is
+    /// re-created, as the copy's setup before this allocates.
+    pub(crate) fn resurrect(
+        &self,
+        affinity: Option<&libc::cpu_set_t>,
+    ) -> Result<Vec<(libc::pid_t, libc::pid_t)>, String> {
         let offset = glibc_layout()?;
+        let mut recreated = Vec::with_capacity(self.count);
         for index in 0..self.count {
             let slot = slot(index);
             if let Some(affinity) = affinity {
@@ -767,8 +795,9 @@ impl Parked {
                     std::io::Error::from_raw_os_error(-tid as i32)
                 ));
             }
+            recreated.push((self.threads[index], tid as libc::pid_t));
         }
-        Ok(self.count)
+        Ok(recreated)
     }
 }
 
@@ -930,23 +959,38 @@ mod tests {
 
     /// In a child of glibc's fork, whose C library is usable: parks a helper
     /// thread, forks a copy, and in the copy re-creates the helper and parks
-    /// again. Returns 0, or 1x for the template's park or fork, 2x for the
-    /// copy's (its exit code, as the template saw it; 25 is a mapping the
-    /// hand-off added), 30 for a copy that did not exit.
+    /// again. Returns 0, or 1x for the template's park or fork (13: the
+    /// parked thread is not the helper), 2x for the copy's (its exit code, as
+    /// the template saw it; 25 is a mapping the hand-off added, 26 a
+    /// re-created thread not named as the helper's new thread), 30 for a copy
+    /// that did not exit.
     fn capture_round() -> i32 {
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let helper_stop = stop.clone();
+        let helper_tid = std::sync::Arc::new(AtomicI32::new(0));
+        let helper_tid_out = helper_tid.clone();
         let helper = std::thread::spawn(move || {
+            // SAFETY: gettid has no preconditions.
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
+            helper_tid_out.store(tid, Ordering::Release);
             while !helper_stop.load(Ordering::Acquire) {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         });
+        while helper_tid.load(Ordering::Acquire) == 0 {
+            std::thread::yield_now();
+        }
+        let helper_tid = helper_tid.load(Ordering::Acquire);
         let Ok(parked) = park_others(std::time::Duration::from_secs(10)) else {
             return 10;
         };
         if parked.count() != 1 {
             parked.release();
             return 11;
+        }
+        if parked.threads() != [helper_tid] {
+            parked.release();
+            return 13;
         }
         let before = mapping_starts();
         let code = match fork_process() {
@@ -965,8 +1009,16 @@ mod tests {
                 } else if added != 0 {
                     25
                 } else {
-                    match parked.resurrect(None) {
-                        Ok(1) => match park_others(std::time::Duration::from_secs(5)) {
+                    match parked.resurrect(None).as_deref() {
+                        Ok(&[(old, new)])
+                            if old != helper_tid
+                                || new == helper_tid
+                                || !std::path::Path::new(&format!("/proc/self/task/{new}"))
+                                    .exists() =>
+                        {
+                            26
+                        }
+                        Ok(&[_]) => match park_others(std::time::Duration::from_secs(5)) {
                             Ok(again) => {
                                 let count = again.count();
                                 again.release();
