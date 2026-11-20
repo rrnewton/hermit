@@ -306,9 +306,11 @@ where
         }
     };
     // A virtual-timeout note an earlier child left is not this child's
-    // (`classify_container_result`), nor is a replay refusal note.
+    // (`classify_container_result`), nor is a replay refusal note or a
+    // choice-protocol note.
     super::terminal_outcome_note::clear();
     super::replay_refusal_note::clear();
+    super::choice_internal_note::clear();
     // The container init inherits this at clone, and it covers the setup Reverie
     // runs before the factory above can arm the init's own handlers.
     let stop_signal_bridge = super::container::ContainerInitStopSignalBridge::install()?;

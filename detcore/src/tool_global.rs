@@ -2649,6 +2649,11 @@ impl GlobalState {
             handle.await.expect("Global scheduler clean shutdown");
             debug!("Global state cleanup, continuing...");
         }
+        // The guest has finished: a run with a choice source finishes its
+        // session (`ChoiceSession::finish`), on every backend.
+        if let Some(session) = &self.choice_session {
+            session.finish();
+        }
         let departure = {
             let scheduler = self.sched.lock().unwrap();
             let summary = scheduler.replay_departure().cloned();
@@ -12243,6 +12248,45 @@ pub(crate) fn finish_thread_start<G, T>(
         .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
 }
 
+/// The startup reset after a thread's start grant ([`finish_thread_start`]),
+/// made by the run mode's choice boundary ([`crate::run_mode::ChoiceDraw`]):
+/// it draws the thread's first slice, a choice point, unless the grant's
+/// preemption history replays one ([`crate::tool_local::draws_timeslice`]).
+/// It owns what the grant carried (`thread_start_request`).
+pub(crate) struct StartupReset<'a> {
+    cfg: &'a Config,
+    history: Option<ThreadHistory>,
+    first_slice: Option<LogicalTime>,
+}
+
+impl<'a> StartupReset<'a> {
+    /// The reset after a start grant that carried `history` and
+    /// `first_slice`.
+    pub(crate) fn new(
+        cfg: &'a Config,
+        history: Option<ThreadHistory>,
+        first_slice: Option<LogicalTime>,
+    ) -> Self {
+        Self {
+            cfg,
+            history,
+            first_slice,
+        }
+    }
+}
+
+impl<T: RunMode, G: Guest<Detcore<T>>> crate::run_mode::ChoiceDraw<T, G> for StartupReset<'_> {
+    type Output = ();
+
+    fn draws(&self, _guest: &G) -> bool {
+        crate::tool_local::draws_timeslice(self.cfg, self.history.is_some())
+    }
+
+    fn draw(self, guest: &mut G, _announcement: crate::run_mode::Announcement<T::Choices>) {
+        finish_thread_start(self.cfg, guest, self.history, self.first_slice);
+    }
+}
+
 /// Keep only the clone pointer that requests an exit-time clear and wake.
 /// SETTID alone requests a birth-time store and must not register an exit wake.
 pub(crate) fn child_tid_clear_address(flags: CloneFlags, address: usize) -> usize {
@@ -12323,13 +12367,13 @@ where
                 Some(LAST_PRIORITY)
             }
         } else {
-            if Detcore::<T>::BOUNDARY_ACTS {
-                Detcore::<T>::before_choice(guest, crate::choice::ChoiceSite::ChildPriority).await;
-            }
             Some(
-                guest
-                    .thread_state_mut()
-                    .chaos_priority(crate::choice::ChoiceSite::ChildPriority),
+                <T::Boundary as crate::ChoiceBoundary<T::Choices>>::choose::<T, G, _>(
+                    guest,
+                    crate::choice::ChoiceSite::ChildPriority,
+                    crate::tool_local::PriorityDraw(crate::choice::ChoiceSite::ChildPriority),
+                )
+                .await,
             )
         }
     } else {
@@ -15762,6 +15806,63 @@ mod tests {
         crate::choice::SchedulingChoices::attach(&mut choices, Some(session()), tid);
         crate::choice::SchedulingChoices::attach(&mut choices, Some(session()), tid);
         panic!("a thread took a second session");
+    }
+
+    /// A run with a choice source finishes its session when its global state
+    /// cleans up (`ChoiceSession::finish`): an announcement left without its
+    /// draw ends the run there as Hermit's own fault, with the
+    /// internal-failure exit.
+    #[tokio::test]
+    async fn cleanup_finishes_the_choice_session() {
+        if !in_child_expecting_internal_failure(
+            "cleanup_finishes_the_choice_session",
+            "HERMIT_INTERNAL_FAILURE class=choice-internal choice 0: internal: boundary \
+             announcement without its draw when the run finished (announced: request 0, site \
+             priority, thread 3)",
+        ) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let tape = dir.path().join("t.tape");
+        std::fs::write(&tape, []).unwrap();
+        let config = Config {
+            choice_tape: Some(tape),
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let handle = state.choice_session.clone().unwrap();
+        handle.announce(DetTid::from_raw(3), crate::choice::ChoiceSite::Priority);
+        let _ = state.clean_up(false, &None).await;
+        panic!("cleanup finished a session with an announcement undrawn");
+    }
+
+    /// A run whose every announced draw was made cleans up as before.
+    #[tokio::test]
+    async fn cleanup_finishes_a_choice_session_whose_draws_were_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let tape = dir.path().join("t.tape");
+        std::fs::write(&tape, []).unwrap();
+        let config = Config {
+            choice_tape: Some(tape),
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let handle = state.choice_session.clone().unwrap();
+        let root = DetTid::from_raw(3);
+        handle.announce(root, crate::choice::ChoiceSite::Priority);
+        let answer = handle.choose(crate::choice::ChoicePoint {
+            kind: crate::choice::ChoiceKind::SchedPriority,
+            lo: 1,
+            hi: 9,
+            default: 5,
+            scale: 0,
+            dtid: root,
+            thread_rcbs: 0,
+            site: crate::choice::ChoiceSite::Priority,
+        });
+        assert_eq!(answer, 5, "an empty tape takes the default");
+        state.clean_up(false, &None).await.unwrap();
+        assert_eq!(handle.next_index(), 1);
     }
 
     /// The last positive candidate may be taken only once. Exhaustion stays
@@ -21784,6 +21885,32 @@ mod tests {
             output.status.code(),
             Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
             "{test}: the child was not refused\n{stderr}"
+        );
+        assert!(
+            stderr.contains(expected),
+            "{test}: missing {expected:?}\n{stderr}"
+        );
+        false
+    }
+
+    /// [`in_child_expecting_refusal`] for a fault of Hermit's own: the child
+    /// must end with the internal-failure status and print `expected`.
+    fn in_child_expecting_internal_failure(name: &str, expected: &str) -> bool {
+        const CHILD: &str = "HERMIT_TEST_INTERNAL_FAILURE_CHILD";
+        let test = format!("{}::{name}", module_path!().split_once("::").unwrap().1);
+        if std::env::var(CHILD).as_deref() == Ok(test.as_str()) {
+            return true;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env(CHILD, &test)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_INTERNAL_FAILURE_EXIT),
+            "{test}: the child did not end as an internal failure\n{stderr}"
         );
         assert!(
             stderr.contains(expected),

@@ -1190,37 +1190,6 @@ pub fn observes_sigreturns(cfg: &Config) -> bool {
 }
 
 impl<T: RunMode> Detcore<T> {
-    /// Whether this run mode acts before a draw ([`ChoiceBoundary::ACTS`]),
-    /// computed once per mode. Each draw site calls [`Self::before_choice`]
-    /// only where this holds, a compile-time constant, so the ordinary run's
-    /// sites hold no call and no await. A mode whose policy announces its
-    /// draws ([`choice::SchedulingChoices::ANNOUNCES`]) but whose boundary
-    /// does not act would have every draw refused as unannounced: it fails
-    /// to build here instead.
-    pub(crate) const BOUNDARY_ACTS: bool = {
-        let acts = <T::Boundary as ChoiceBoundary<T::Choices>>::ACTS;
-        assert!(
-            acts || !<T::Choices as choice::SchedulingChoices>::ANNOUNCES,
-            "a run mode whose choice policy announces its draws needs a choice boundary that acts"
-        );
-        acts
-    };
-
-    /// The run mode's choice boundary ([`ChoiceBoundary`]) before thread
-    /// `guest`'s next draw, a choice point at `site`. Called, where the mode
-    /// acts ([`Self::BOUNDARY_ACTS`]), immediately before the helper that
-    /// draws it, with no await between, wherever a draw follows and nowhere
-    /// else. The draw is announced to the run's policy
-    /// ([`choice::SchedulingChoices::announce`]), and the boundary runs with
-    /// what was announced.
-    pub(crate) async fn before_choice<G: Guest<Self>>(guest: &mut G, site: choice::ChoiceSite) {
-        let thread = guest.thread_state();
-        let announced =
-            choice::SchedulingChoices::announce(&thread.choices, thread.draw_context(), site);
-        <T::Boundary as ChoiceBoundary<T::Choices>>::before_choice::<T, G>(guest, site, announced)
-            .await;
-    }
-
     /// A5 step 3c.1e A, IR-15 (Detcore's half): whether the calling thread's
     /// process is the init of a PID namespace it created with `CLONE_NEWPID`
     /// (`Scheduler`'s `pid_namespace_inits`, through
@@ -4360,56 +4329,41 @@ impl<T: RunMode> Detcore<T> {
             } else {
                 None
             };
-            // Where the timer of the timeslice this ends was armed, for one
-            // armed with `--chaos-instruction-offset`: taken only where the
-            // slice really ends, and published for the change point that
+            // Closing the slice draws the next one (`tool_local::SliceClose`),
+            // except in a schedule replay's administrative pass. It also
+            // yields where the timer of the timeslice this ends was armed, for
+            // one armed with `--chaos-instruction-offset`: taken only where
+            // the slice really ends, and published for the change point that
             // ends it, which records it. A later pass of this loop ends no
             // armed slice.
-            let mut ended_offset = None;
-            // Closing the slice draws the next one (`close_slice`, or
-            // `next_timeslice`), except in a schedule replay's administrative
-            // pass below.
-            if Self::BOUNDARY_ACTS
-                && !(replay_checkpoint && !expiry_due)
-                && guest.thread_state().draws_next_timeslice(&self.cfg)
-            {
-                Self::before_choice(guest, choice::ChoiceSite::ChaosSlice).await;
-            }
-            let (maybe_prio, boundary) = {
+            let (maybe_prio, boundary, ended_offset) = if replay_checkpoint && !expiry_due {
+                // The event cursor may just have installed a future deadline,
+                // including through a TraceReplay resume. This administrative
+                // pass does not draw a slice end or close the slice; it only
+                // restarts the backstop, as the recorded run's new slice
+                // had it. Later real grants may update that authority
+                // normally; do not snapshot it here.
+                // Recording began a slice here, including its slowdown
+                // epoch. The cursor's future deadline is not this boundary.
+                // With no logical slice, recording skipped that refresh too.
                 let thread = guest.thread_state_mut();
-                if replay_checkpoint && !expiry_due {
-                    // The event cursor may just have installed a future deadline,
-                    // including through a TraceReplay resume. This administrative
-                    // pass does not draw a slice end or close the slice; it only
-                    // restarts the backstop, as the recorded run's new slice
-                    // had it. Later real grants may update that authority
-                    // normally; do not snapshot it here.
-                    // Recording began a slice here, including its slowdown
-                    // epoch. The cursor's future deadline is not this boundary.
-                    // With no logical slice, recording skipped that refresh too.
-                    if self
-                        .cfg
-                        .target_timeslice
-                        .or(self.cfg.max_timeslice)
-                        .is_some()
-                    {
-                        thread.refresh_chaos_epoch(&self.cfg, end_time);
-                    }
-                    thread.restart_replay_backstop(&self.cfg);
-                    (None, None)
-                } else if let Some(mut observed) = thread.slice_boundary.take() {
-                    ended_offset = thread.take_ended_slice_offset();
-                    let result =
-                        observed.close_slice(thread, &self.cfg, explicit_sched_yield, None);
-                    thread.slice_boundary = Some(observed);
-                    let closed = result.unwrap_or_else(|error| {
-                        crate::scheduler::exit_on_scheduler_refusal(&error)
-                    });
-                    (closed.next_priority, Some(Box::new(closed.boundary)))
-                } else {
-                    ended_offset = thread.take_ended_slice_offset();
-                    (thread.next_timeslice(&self.cfg), None)
+                if self
+                    .cfg
+                    .target_timeslice
+                    .or(self.cfg.max_timeslice)
+                    .is_some()
+                {
+                    thread.refresh_chaos_epoch(&self.cfg, end_time);
                 }
+                thread.restart_replay_backstop(&self.cfg);
+                (None, None, None)
+            } else {
+                <T::Boundary as ChoiceBoundary<T::Choices>>::choose::<T, G, _>(
+                    guest,
+                    choice::ChoiceSite::ChaosSlice,
+                    tool_local::SliceClose::new(&self.cfg, explicit_sched_yield),
+                )
+                .await
             };
 
             // A preemption replay's change point at or before the thread's
@@ -4457,10 +4411,13 @@ impl<T: RunMode> Detcore<T> {
             } else if let Some(prio) = maybe_prio {
                 Self::priority_changepoint_request(guest, end_time, prio)
             } else if chaos {
-                if Self::BOUNDARY_ACTS {
-                    Self::before_choice(guest, choice::ChoiceSite::Priority).await;
-                }
-                Self::random_priority_changepoint_request(guest, end_time)
+                let priority = <T::Boundary as ChoiceBoundary<T::Choices>>::choose::<T, G, _>(
+                    guest,
+                    choice::ChoiceSite::Priority,
+                    tool_local::PriorityDraw(choice::ChoiceSite::Priority),
+                )
+                .await;
+                Self::priority_changepoint_request(guest, end_time, priority)
             } else if explicit_sched_yield && self.cfg.replay_schedule_from.is_none() {
                 Self::sched_yield_request(guest)
             } else {
@@ -6682,14 +6639,19 @@ impl<T: RunMode> Tool for Detcore<T> {
         Box::pin(self.name_table_for_death(guest)).await;
 
         // Except for the root task, let's block until it's our turn to go:
-        let (th, first_slice) = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
+        let (history, first_slice) =
+            tool_global::thread_start_request(&self.cfg, guest, detpid).await;
 
         // The startup reset draws the thread's first slice, unless the start
         // grant's preemption history, installed just before it, replays one.
-        if Self::BOUNDARY_ACTS && tool_local::draws_timeslice(&self.cfg, th.is_some()) {
-            Self::before_choice(guest, choice::ChoiceSite::ChaosSlice).await;
-        }
-        tool_global::finish_thread_start(&self.cfg, guest, th, first_slice);
+        // The reset owns the grant from here, so no part of it waits in this
+        // future while the boundary runs.
+        <T::Boundary as ChoiceBoundary<T::Choices>>::choose::<T, G, _>(
+            guest,
+            choice::ChoiceSite::ChaosSlice,
+            tool_global::StartupReset::new(&self.cfg, history, first_slice),
+        )
+        .await;
 
         // The prehook is a noop for a thread just starting.  Can't end the timeslice.  There's no
         // RCB progress to record.  However, we call it for consistency with all the other handlers.

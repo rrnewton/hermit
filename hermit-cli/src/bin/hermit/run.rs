@@ -17743,6 +17743,13 @@ impl RunOpts {
         {
             super::replay_refusal_note::arm()?;
         }
+        // And where the child's choice session leaves a fault of Hermit's own
+        // in the choice protocol it exits 125 with (`classify_container_result`).
+        if self.det_opts.det_config.choice_tape.is_some()
+            || self.det_opts.det_config.choice_controller.is_some()
+        {
+            super::choice_internal_note::arm()?;
+        }
         super::owned_container::run(
             &mut container,
             (tmpfs, identity, guards, native_plan, gdbserver_port),

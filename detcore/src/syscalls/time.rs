@@ -657,17 +657,6 @@ impl<T: RunMode> Detcore<T> {
             .mk_request(ResourceID::SchedYield, Permission::W)
     }
 
-    /// Construct a random PriorityChangePoint request using the local PRNG.
-    pub fn random_priority_changepoint_request<G: Guest<Self>>(
-        guest: &mut G,
-        change_time: LogicalTime,
-    ) -> Resources {
-        let new_priority = guest
-            .thread_state_mut()
-            .chaos_priority(crate::choice::ChoiceSite::Priority);
-        Self::priority_changepoint_request(guest, change_time, new_priority)
-    }
-
     /// Construct a PriorityChangePoint request using the supplied time and priority.
     pub fn priority_changepoint_request<G: Guest<Self>>(
         guest: &mut G,

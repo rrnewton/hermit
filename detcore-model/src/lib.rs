@@ -131,6 +131,21 @@ const _: () = assert!(
 /// emits it and `hermit-cli` recognises it.
 pub const HERMIT_GUEST_DEADLOCK_EXIT: i32 = 121;
 
+/// Exit status for a failure of HERMIT ITSELF, as distinct from the guest's
+/// and from a refusal: **125**, the GNU wrapper-failed convention. The full
+/// account of the value, and the allocation table, are on `hermit-cli`'s
+/// re-export of this constant (`hermit::HERMIT_INTERNAL_FAILURE_EXIT`).
+///
+/// It lives here for the reason [`HERMIT_POLICY_REFUSAL_EXIT`] does: `detcore`
+/// emits it too (a fault of Hermit's own in the choice protocol,
+/// `detcore::choice`'s `internal:` reasons), and `hermit-cli` recognises it.
+pub const HERMIT_INTERNAL_FAILURE_EXIT: i32 = 125;
+
+const _: () = assert!(
+    HERMIT_INTERNAL_FAILURE_EXIT == 125,
+    "125 is the GNU wrapper-failed convention; see the allocation table in hermit-cli"
+);
+
 /// The stderr class line Hermit prints, last, for a run that ended with
 /// [`HERMIT_GUEST_DEADLOCK_EXIT`]: a deadlock under Hermit's model. Named for
 /// the model, not the guest, because the verdict is only as complete as the

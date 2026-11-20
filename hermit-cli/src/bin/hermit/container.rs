@@ -40,6 +40,7 @@ use hermit::Context;
 use hermit::Error;
 use hermit::FailureKind;
 use hermit::HERMIT_DEADLINE_EXIT;
+use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
 use hermit::HERMIT_LOG_CAP_EXIT;
 use hermit::SerializableError;
 use hermit::SkidOvershootError;
@@ -5714,6 +5715,26 @@ impl std::fmt::Display for PolicyRefusal {
 
 impl std::error::Error for PolicyRefusal {}
 
+/// The container child exited [`HERMIT_INTERNAL_FAILURE_EXIT`] for a fault of
+/// Hermit's own in its run's choice protocol, and left the note that says so
+/// (`choice_internal_note`). Context on the [`ContainerChildExit`] it
+/// explains, which keeps the child's status; the class line adds
+/// `cause=choice-internal`.
+#[derive(Debug)]
+pub struct ChoiceInternalFault;
+
+impl std::fmt::Display for ChoiceInternalFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Hermit failed: a fault of its own in the run's choice protocol ended the run. \
+             The fault is reported above; report it as a Hermit bug."
+        )
+    }
+}
+
+impl std::error::Error for ChoiceInternalFault {}
+
 /// The container child was terminated by a signal, reported as `128 + signo`.
 ///
 /// Reattaches "a `--timeout` deadline fired" on the PARENT side of the
@@ -5881,6 +5902,13 @@ fn policy_refusal_exit(late_events: Option<u64>) -> Error {
     }
 }
 
+/// A container child that exited `status` for a fault of Hermit's own in its
+/// run's choice protocol, as its note says (`choice_internal_note`): the
+/// child's exit, with the cause as context.
+pub(super) fn choice_internal_exit(status: ExitStatus) -> Error {
+    Error::new(ContainerChildExit(status)).context(ChoiceInternalFault)
+}
+
 /// Preserve the primary class from a settled container result. The owned CLI
 /// adapter also calls this for its strict error-only failed-child channel.
 pub fn classify_container_result<T>(
@@ -6016,6 +6044,17 @@ pub fn classify_container_result<T>(
                 .and_then(detcore_model::signal_from_exit_status)
                 .expect("guard just matched");
             Err(Error::new(SignalDeath(signal)))
+        }
+        // A fault of Hermit's own in the run's choice protocol: the child's
+        // choice session exits it 125 after leaving the note
+        // (`choice_internal_note`), and the note, not the status, names the
+        // cause. It stays the container child's exit with its status, and the
+        // cause is context on it.
+        Err(RunError::ExitStatus(status))
+            if status.code() == Some(HERMIT_INTERNAL_FAILURE_EXIT)
+                && super::choice_internal_note::take() =>
+        {
+            Err(choice_internal_exit(status))
         }
         Err(RunError::ExitStatus(status)) => Err(Error::new(ContainerChildExit(status))),
         // A spawn failure is a genuine CLI-side failure and keeps its prose.

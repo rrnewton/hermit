@@ -8903,7 +8903,7 @@ impl<T: crate::RunMode> ThreadState<T> {
 
     /// This thread's identity and position, for a choice point's request,
     /// and for its announcement before the run mode's choice boundary
-    /// (`Detcore::before_choice`).
+    /// ([`crate::run_mode::announce`]).
     pub(crate) fn draw_context(&self) -> crate::choice::DrawContext {
         crate::choice::DrawContext {
             dettid: self.dettid,
@@ -10745,12 +10745,120 @@ type RecordedSlice = (
 /// `ChoiceSite::ChaosSlice`, for a thread that replays recorded preemption
 /// points (`replays_preemptions`) or does not: with a logical timeslice, no
 /// recorded points, and a schedule that chaos draws
-/// (`Config::chaos_draws_schedule`). The run mode's choice boundary runs
-/// before that draw exactly when this holds (`Detcore::before_choice`).
+/// (`Config::chaos_draws_schedule`). The draws that call it take a choice
+/// point exactly when this holds ([`SliceClose`], and the startup reset,
+/// `tool_global::StartupReset`).
 pub(crate) fn draws_timeslice(cfg: &Config, replays_preemptions: bool) -> bool {
     cfg.target_timeslice.or(cfg.max_timeslice).is_some()
         && !replays_preemptions
         && cfg.chaos_draws_schedule()
+}
+
+/// A slice end's draw, made by the run mode's choice boundary
+/// ([`crate::run_mode::ChoiceDraw`]): closing the thread's timeslice draws
+/// the next one (`slice_boundary::Observations::close_slice` where the
+/// thread observes its slice boundaries, otherwise
+/// [`ThreadState::next_timeslice`]). It yields the next priority, the closed
+/// slice's boundary and where the ended slice's timer was armed
+/// ([`ThreadState::take_ended_slice_offset`]).
+pub(crate) struct SliceClose<'a> {
+    cfg: &'a Config,
+    explicit_sched_yield: bool,
+}
+
+impl<'a> SliceClose<'a> {
+    /// The close of a slice that `explicit_sched_yield` ends, or not.
+    pub(crate) fn new(cfg: &'a Config, explicit_sched_yield: bool) -> Self {
+        Self {
+            cfg,
+            explicit_sched_yield,
+        }
+    }
+}
+
+impl<T: RunMode, G: Guest<crate::Detcore<T>>> crate::run_mode::ChoiceDraw<T, G> for SliceClose<'_> {
+    type Output = (
+        Option<Priority>,
+        Option<Box<detcore_model::schedule::boundary::Boundary>>,
+        Option<InstructionOffset>,
+    );
+
+    fn draws(&self, guest: &G) -> bool {
+        guest.thread_state().draws_next_timeslice(self.cfg)
+    }
+
+    fn draw(
+        self,
+        guest: &mut G,
+        _announcement: crate::run_mode::Announcement<T::Choices>,
+    ) -> Self::Output {
+        let thread = guest.thread_state_mut();
+        if let Some(mut observed) = thread.slice_boundary.take() {
+            let ended_offset = thread.take_ended_slice_offset();
+            let result = observed.close_slice(thread, self.cfg, self.explicit_sched_yield, None);
+            thread.slice_boundary = Some(observed);
+            let closed =
+                result.unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
+            (
+                closed.next_priority,
+                Some(Box::new(closed.boundary)),
+                ended_offset,
+            )
+        } else {
+            let ended_offset = thread.take_ended_slice_offset();
+            (thread.next_timeslice(self.cfg), None, ended_offset)
+        }
+    }
+}
+
+/// A chaos priority draw at a site ([`ThreadState::chaos_priority`]), made by
+/// the run mode's choice boundary ([`crate::run_mode::ChoiceDraw`]): a
+/// priority redraw (`ChoiceSite::Priority`) or a new child's starting
+/// priority (`ChoiceSite::ChildPriority`). Always a choice point.
+pub(crate) struct PriorityDraw(pub(crate) crate::choice::ChoiceSite);
+
+impl<T: RunMode, G: Guest<crate::Detcore<T>>> crate::run_mode::ChoiceDraw<T, G> for PriorityDraw {
+    type Output = Priority;
+
+    fn draws(&self, _guest: &G) -> bool {
+        true
+    }
+
+    fn draw(
+        self,
+        guest: &mut G,
+        _announcement: crate::run_mode::Announcement<T::Choices>,
+    ) -> Priority {
+        guest.thread_state_mut().chaos_priority(self.0)
+    }
+}
+
+/// A vfork child's starting priority, prepared by its parent before the
+/// clone ([`ThreadState::prepare_vfork_child_priority`]) and made by the run
+/// mode's choice boundary ([`crate::run_mode::ChoiceDraw`]): a choice point
+/// where the run draws one (`draws`, `Detcore::draws_vfork_child_priority`),
+/// and otherwise nothing.
+pub(crate) struct VforkChildPriorityDraw {
+    pub(crate) draws: bool,
+}
+
+impl<T: RunMode, G: Guest<crate::Detcore<T>>> crate::run_mode::ChoiceDraw<T, G>
+    for VforkChildPriorityDraw
+{
+    type Output = Option<crate::choice::PreparedChildPriority>;
+
+    fn draws(&self, _guest: &G) -> bool {
+        self.draws
+    }
+
+    fn draw(
+        self,
+        guest: &mut G,
+        _announcement: crate::run_mode::Announcement<T::Choices>,
+    ) -> Self::Output {
+        self.draws
+            .then(|| guest.thread_state().prepare_vfork_child_priority())
+    }
 }
 
 /// The first recorded slice of an edited record (`--replay-edited-preemptions`)

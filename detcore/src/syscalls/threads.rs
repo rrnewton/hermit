@@ -2547,22 +2547,20 @@ impl<T: RunMode> Detcore<T> {
             .await?;
 
         // A vfork child's starting priority is drawn here, before the clone.
-        // (The condition is evaluated again below rather than held across
-        // the boundary's await, so the ordinary run keeps no value for it.)
-        if Self::BOUNDARY_ACTS && self.draws_vfork_child_priority(is_vfork) {
-            Self::before_choice(guest, crate::choice::ChoiceSite::VforkChildPriority).await;
-        }
+        let child_priority = <T::Boundary as crate::ChoiceBoundary<T::Choices>>::choose::<T, G, _>(
+            guest,
+            crate::choice::ChoiceSite::VforkChildPriority,
+            crate::tool_local::VforkChildPriorityDraw {
+                draws: self.draws_vfork_child_priority(is_vfork),
+            },
+        )
+        .await;
         let ts = guest.thread_state_mut();
         assert_eq!(ts.clone_flags, None);
         assert!(ts.pending_vfork.is_none());
         ts.clone_flags = Some(flags);
 
         let parent_dettid = ts.dettid;
-        let child_priority = if self.draws_vfork_child_priority(is_vfork) {
-            Some(ts.prepare_vfork_child_priority())
-        } else {
-            None
-        };
         let blocking_child_op_id = ExternalOpId::new(parent_dettid, ts.stats.syscall_count);
         if is_vfork {
             ts.pending_vfork = Some(PendingVfork {
@@ -5428,11 +5426,17 @@ impl<T: RunMode> Detcore<T> {
         if self.cfg.sequentialize_threads {
             match sched_yield_route(&self.cfg) {
                 SchedYieldRoute::ChaosReprioritize => {
-                    if Self::BOUNDARY_ACTS {
-                        Self::before_choice(guest, crate::choice::ChoiceSite::Priority).await;
-                    }
+                    // The draw does not move the thread's logical time, so
+                    // reading it after the draw reads what it was before.
+                    let priority =
+                        <T::Boundary as crate::ChoiceBoundary<T::Choices>>::choose::<T, G, _>(
+                            guest,
+                            crate::choice::ChoiceSite::Priority,
+                            crate::tool_local::PriorityDraw(crate::choice::ChoiceSite::Priority),
+                        )
+                        .await;
                     let change_time = guest.thread_state().thread_logical_time.as_nanos();
-                    let request = Self::random_priority_changepoint_request(guest, change_time);
+                    let request = Self::priority_changepoint_request(guest, change_time, priority);
                     resource_request(guest, request).await;
                 }
                 SchedYieldRoute::ReplayStrongYield => {

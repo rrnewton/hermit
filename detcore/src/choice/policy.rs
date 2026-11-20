@@ -18,12 +18,12 @@
 //!   to the run's [`ChoiceSession`], through the handle the thread received
 //!   when it started.
 //!
-//! Just before each draw, in a run mode that acts there
-//! ([`crate::ChoiceBoundary::ACTS`]), Detcore announces the draw to the policy
-//! ([`SchedulingChoices::announce`]) and runs the run mode's choice boundary
-//! with what was announced: for [`ControlledChoices`], the index of the
-//! request the draw takes, which the draw then checks it takes. The ordinary
-//! run ([`SeededChoices`], no boundary) does not act there at all.
+//! Every draw is made by the run mode's choice boundary
+//! ([`crate::ChoiceBoundary::choose`]), which first announces it to the policy
+//! ([`SchedulingChoices::announce`], through [`crate::run_mode::announce`]):
+//! for [`ControlledChoices`], the index of the request the draw takes, which
+//! the draw then checks it takes. A policy that announces nothing
+//! ([`SeededChoices`]) is never asked.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -62,10 +62,11 @@ pub trait SchedulingChoices: Default + Clone + Send + Sync + std::fmt::Debug + '
     type Announced: Copy + Send + Sync + std::fmt::Debug + 'static;
 
     /// The drawing thread's next draw, with context `ctx`, is a point at
-    /// `site`, and the run mode's choice boundary runs before it
-    /// ([`crate::ChoiceBoundary`]). Core calls this immediately before that
-    /// boundary, wherever a draw follows and nowhere else, and gives the
-    /// boundary what it returns.
+    /// `site`, which the run mode's choice boundary makes
+    /// ([`crate::ChoiceBoundary`]). The boundary has this called
+    /// ([`crate::run_mode::announce`]) immediately before it makes that draw,
+    /// for a draw that takes a point and nowhere else, and the draw is made
+    /// with what it returns. Called only where [`Self::ANNOUNCES`] holds.
     fn announce(&self, ctx: DrawContext, site: ChoiceSite) -> Self::Announced;
 
     /// Before the first draw of a thread that registers itself (the root,
@@ -262,6 +263,12 @@ impl ChoiceHandle {
     /// ([`ChoiceSession::next_index`]). Read-only: it draws nothing.
     pub fn next_index(&self) -> u64 {
         self.0.lock().unwrap().next_index()
+    }
+
+    /// Finish the run's session, once its guest has finished
+    /// ([`ChoiceSession::finish`]).
+    pub fn finish(&self) {
+        self.0.lock().unwrap().finish()
     }
 }
 

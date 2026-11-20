@@ -286,7 +286,11 @@ pub const HERMIT_ANALYZE_PRECONDITION_EXIT: i32 = 2;
 ///
 /// REVIEWER RULE: a change to `tests/stress_suite.rs` inside an exit-code head
 /// SHOULD BE REFUSED ON SIGHT AND QUESTIONED.
-pub const HERMIT_INTERNAL_FAILURE_EXIT: i32 = 125;
+///
+/// Defined once, in `detcore-model`, and re-exported here: `detcore` exits a
+/// container child with it for a fault of Hermit's own in the choice protocol
+/// (see the 125 row of the allocation table below).
+pub use detcore_model::HERMIT_INTERNAL_FAILURE_EXIT;
 
 /// A deadline hermit itself was asked to enforce expired: **124**.
 ///
@@ -421,7 +425,9 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //              read the refusal and change your program or flags, versus file a
 //              bug. Defined in `detcore-model` because `detcore` emits it and
 //              this crate recognises it, and that is the only crate both
-//              depend on.
+//              depend on. A run's choice session refuses a choice source or
+//              an answer this way (`HERMIT_CHOICE_REFUSED:`); a fault of
+//              Hermit's own in that protocol is 125 instead (below).
 //   123        HERMIT_LOG_CAP_EXIT -- a LOG BYTE CAP fired. Hermit's own
 //              `--max-log-bytes` budget on its tracing output, and the value
 //              reserved for dev-hermit's `bin/safehermit` log-cap kill (which,
@@ -443,6 +449,14 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //              relays hermit's status otherwise) and because 125/126/127 is one
 //              GNU scheme that cannot be broken up. Tracked as
 //              `hermit_s_125_collides`.
+//              Also the container child's own status for a fault of Hermit's
+//              own in a run's choice protocol (`detcore::choice`'s
+//              `internal:` reasons, never a choice source's or the guest's):
+//              the child prints `HERMIT_INTERNAL_FAILURE class=choice-internal`
+//              and leaves a note, and Hermit then prints
+//              `HERMIT_INTERNAL_FAILURE class=container-child-exit
+//              status=Exited(125) cause=choice-internal`. Defined in
+//              `detcore-model` for the reason 122 is.
 //   126        GUEST_PROGRAM_NOT_EXECUTABLE_EXIT.
 //   127        GUEST_PROGRAM_NOT_FOUND_EXIT -- the ABSOLUTE-PATH form. The
 //              bare-name-on-guest-PATH form currently exits 125 instead, which

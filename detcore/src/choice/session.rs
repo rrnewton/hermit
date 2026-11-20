@@ -111,12 +111,12 @@ impl ChoiceSession {
     }
 
     /// Announce the next request: the run mode's choice boundary is about to
-    /// run before thread `dtid` draws a point at `site`
+    /// make thread `dtid`'s draw of a point at `site`
     /// ([`crate::ChoiceBoundary`]), and that draw takes the next request.
     /// Returns the request's index. The draw checks that it is the one
     /// announced ([`Self::choose`]). A second announcement before it ends the
-    /// run: a boundary with no draw after it would have acted at a request
-    /// some other point takes.
+    /// run as a fault of Hermit's own ([`fail_run`]): a boundary with no draw
+    /// after it would have acted at a request some other point takes.
     pub fn announce(&mut self, dtid: DetTid, site: ChoiceSite) -> u64 {
         let announced = Announced {
             index: self.next_index,
@@ -124,19 +124,21 @@ impl ChoiceSession {
             dtid,
         };
         if let Some(pending) = self.announced.replace(announced) {
-            stop_run(undrawn_announcement(pending, dtid, site));
+            fail_run(undrawn_announcement(pending, dtid, site));
         }
         announced.index
     }
 
     /// Resolve one choice point: the source's answer, checked against the
     /// point's range and recorded. The point must be the draw last announced
-    /// ([`Self::announce`]). A draw not announced, a refusal, or a record
-    /// that cannot be written, ends the run ([`ChoiceSession::refuse_run`]).
+    /// ([`Self::announce`]): a draw not announced ends the run as a fault of
+    /// Hermit's own ([`ChoiceSession::fail_run_at`]). A refusal, or a record
+    /// that cannot be written, ends it as a refusal
+    /// ([`ChoiceSession::refuse_run`]).
     pub fn choose(&mut self, point: ChoicePoint) -> u64 {
         let req = self.request(point);
         if let Some(reason) = unannounced_draw(self.announced.take(), &req) {
-            self.refuse_run(&req, &reason);
+            self.fail_run_at(&req, &reason);
         }
         let v = match self.source.answer(&req).and_then(|v| within_range(&req, v)) {
             Ok(v) => v,
@@ -192,6 +194,21 @@ impl ChoiceSession {
     /// `"refused":reason`, so the record names where the run stopped, and the
     /// reason goes to stderr ([`stop_run`]).
     fn refuse_run(&mut self, req: &ChoiceRequest, reason: &str) -> ! {
+        self.record_stop(req, reason);
+        stop_run(format!("choice {}: {reason}", req.index))
+    }
+
+    /// End the run at `req` for `reason`, a fault of Hermit's own
+    /// (`internal:`): recorded as [`Self::refuse_run`] records a refusal, and
+    /// reported as an internal failure ([`fail_run`]).
+    fn fail_run_at(&mut self, req: &ChoiceRequest, reason: &str) -> ! {
+        self.record_stop(req, reason);
+        fail_run(format!("choice {}: {reason}", req.index))
+    }
+
+    /// Append `req` to the record, if there is one, with `"refused":reason`:
+    /// the request where the run stopped.
+    fn record_stop(&mut self, req: &ChoiceRequest, reason: &str) {
         if let Some(f) = self.record.as_mut() {
             let mut line = request_json(req);
             line.truncate(line.len() - 1);
@@ -199,7 +216,20 @@ impl ChoiceSession {
             line.push_str(&format!(",\"refused\":{reason}}}\n"));
             let _ = f.write_all(line.as_bytes());
         }
-        stop_run(format!("choice {}: {reason}", req.index))
+    }
+
+    /// Finish the session of a run whose guest finished: every announced
+    /// draw must have been made. Called once, explicitly, when the run's
+    /// global state cleans up after its scheduler has shut down
+    /// (`GlobalState::clean_up`), on every backend. An announcement without
+    /// its draw ends the run as a fault of Hermit's own ([`fail_run`]); a
+    /// later announcement would have caught it, but at the end of a run there
+    /// is none. A run that ends otherwise (a refusal, a fault, a signal) does
+    /// not finish its session, and dropping a session checks nothing.
+    pub fn finish(&mut self) {
+        if let Some(reason) = undrawn_at_finish(self.announced.take()) {
+            fail_run(reason);
+        }
     }
 }
 
@@ -217,8 +247,9 @@ impl std::fmt::Display for Announced {
 
 /// Why `req` cannot be drawn after `announced`, the announcement it takes:
 /// `None` when it is the draw announced, at the same request, site and
-/// thread. Either refusal is a fault of Hermit's own, never a controller's
-/// or the guest's, and its reason says so (`internal:`).
+/// thread. Either case is a fault of Hermit's own, never a controller's or
+/// the guest's: its reason says so (`internal:`), and it ends the run as one
+/// ([`fail_run`]).
 fn unannounced_draw(announced: Option<Announced>, req: &ChoiceRequest) -> Option<String> {
     let drawn = Announced {
         index: req.index,
@@ -247,6 +278,19 @@ fn undrawn_announcement(pending: Announced, dtid: DetTid, site: ChoiceSite) -> S
         pending.index,
         site.name()
     )
+}
+
+/// Why a session that finishes with `announced` still pending is refused: a
+/// boundary announcement without its draw, a fault of Hermit's own
+/// (`internal:`). `None` when every announced draw was made.
+fn undrawn_at_finish(announced: Option<Announced>) -> Option<String> {
+    announced.map(|pending| {
+        format!(
+            "choice {}: internal: boundary announcement without its draw when the run finished \
+             (announced: {pending})",
+            pending.index
+        )
+    })
 }
 
 /// The [`ChoiceSource`] contract's range promise, enforced once for every
@@ -284,14 +328,54 @@ pub(crate) fn refuse_other_session(dettid: crate::types::DetTid) -> ! {
     ))
 }
 
-/// End the run for `message`, a choice source that cannot serve it. The
-/// container child exits with Hermit's policy-refusal status, as
+/// End the run for `message`, a choice source that cannot serve it: an
+/// option, a source or a record that cannot be used, or an answer refused.
+/// The container child exits with Hermit's policy-refusal status, as
 /// `tool_global::unrecoverable_shutdown` does: the parent reports it as a
 /// refusal (exit 122, `class=policy-refusal`), not as a failure of Hermit's.
+/// A fault of Hermit's own in the protocol (an `internal:` reason) is never
+/// this: it ends the run through [`fail_run`].
 fn stop_run(message: String) -> ! {
     eprintln!("HERMIT_CHOICE_REFUSED: {message}");
     crate::guest_log::flush_unsent();
     std::process::exit(detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+}
+
+/// What a process does just before a fault of Hermit's own in the choice
+/// protocol exits it with `HERMIT_INTERNAL_FAILURE_EXIT` ([`fail_run`]). The
+/// status is all that crosses the process boundary, and it is not this
+/// fault's alone, so a parent that forked the process learns through this
+/// hook that the failure was the choice protocol's.
+pub type ChoiceInternalExitHook = fn();
+
+static CHOICE_INTERNAL_EXIT_HOOK: std::sync::Mutex<Option<ChoiceInternalExitHook>> =
+    std::sync::Mutex::new(None);
+
+/// Install (or, with `None`, remove) the [`ChoiceInternalExitHook`]. A process
+/// forked after this inherits it.
+pub fn set_choice_internal_exit_hook(hook: Option<ChoiceInternalExitHook>) {
+    *CHOICE_INTERNAL_EXIT_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+/// End the run for `message`, a fault of Hermit's own in the choice protocol
+/// (an `internal:` reason: a draw its boundary did not announce, or an
+/// announcement without its draw), never a source's, a controller's or the
+/// guest's. The container child exits with Hermit's internal-failure status,
+/// after the [`ChoiceInternalExitHook`]: the parent reports it as a failure
+/// of Hermit's (exit 125, `HERMIT_INTERNAL_FAILURE` with
+/// `cause=choice-internal`), not as a refusal.
+fn fail_run(message: String) -> ! {
+    eprintln!("HERMIT_INTERNAL_FAILURE class=choice-internal {message}");
+    crate::guest_log::flush_unsent();
+    let hook = *CHOICE_INTERNAL_EXIT_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(hook) = hook {
+        hook();
+    }
+    std::process::exit(detcore_model::HERMIT_INTERNAL_FAILURE_EXIT)
 }
 
 #[cfg(test)]
@@ -442,21 +526,32 @@ mod tests {
         );
     }
 
+    /// What the choice internal-fault exit hook prints in a test's child, so
+    /// the parent sees that it ran, and when.
+    const HOOK_RAN: &str = "test: the choice internal-fault exit hook ran";
+
+    fn print_hook_ran() {
+        eprintln!("{HOOK_RAN}");
+    }
+
     /// Runs the calling test's body (`body`) in a child copy of this test
     /// binary, on a session over an empty tape that records to a file, and
-    /// requires the child to end with the policy-refusal status and print
-    /// `HERMIT_CHOICE_REFUSED: {expected}`. Returns the record's lines. In
-    /// the child, runs `body`, which ends the process by refusing; a body
-    /// that returns lets the child pass, which fails the parent's check.
-    fn refused_in_child(
+    /// requires the child to end as a fault of Hermit's own: the
+    /// internal-failure status, the line `HERMIT_INTERNAL_FAILURE
+    /// class=choice-internal {expected}`, then the exit hook (installed in the
+    /// child), and no refusal line. Returns the record's lines. In the child,
+    /// runs `body`, which ends the process; a body that returns lets the child
+    /// pass, which fails the parent's check.
+    fn failed_in_child(
         name: &str,
         expected: &str,
         body: impl FnOnce(&mut ChoiceSession),
     ) -> Vec<serde_json::Value> {
-        const CHILD: &str = "HERMIT_CHOICE_REFUSAL_CHILD";
-        const RECORD: &str = "HERMIT_CHOICE_REFUSAL_RECORD";
+        const CHILD: &str = "HERMIT_CHOICE_FAULT_CHILD";
+        const RECORD: &str = "HERMIT_CHOICE_FAULT_RECORD";
         let test = format!("{}::{name}", module_path!().split_once("::").unwrap().1);
         if std::env::var(CHILD).as_deref() == Ok(test.as_str()) {
+            set_choice_internal_exit_hook(Some(print_hook_ran));
             let record = File::create(std::env::var_os(RECORD).unwrap()).unwrap();
             let mut session = ChoiceSession::new(Box::new(TapeSource::new(vec![])), Some(record));
             body(&mut session);
@@ -473,12 +568,20 @@ mod tests {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(
             output.status.code(),
-            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
-            "{test}: the child was not refused\n{stderr}"
+            Some(detcore_model::HERMIT_INTERNAL_FAILURE_EXIT),
+            "{test}: the child did not end as an internal failure\n{stderr}"
+        );
+        let line = format!("HERMIT_INTERNAL_FAILURE class=choice-internal {expected}\n");
+        let at = stderr
+            .find(&line)
+            .unwrap_or_else(|| panic!("{test}: missing {line:?}\n{stderr}"));
+        assert!(
+            stderr[at + line.len()..].contains(HOOK_RAN),
+            "{test}: the exit hook did not run after the fault's line\n{stderr}"
         );
         assert!(
-            stderr.contains(&format!("HERMIT_CHOICE_REFUSED: {expected}\n")),
-            "{test}: missing {expected:?}\n{stderr}"
+            !stderr.contains("HERMIT_CHOICE_REFUSED"),
+            "{test}: a fault of Hermit's own was reported as a refusal\n{stderr}"
         );
         std::fs::read_to_string(&record)
             .unwrap()
@@ -493,7 +596,7 @@ mod tests {
     fn an_unannounced_draw_ends_the_run_as_an_internal_fault() {
         let reason = "internal: draw without its boundary announcement (request 1, site \
                       priority, thread 3)";
-        let lines = refused_in_child(
+        let lines = failed_in_child(
             "an_unannounced_draw_ends_the_run_as_an_internal_fault",
             &format!("choice 1: {reason}"),
             |session| {
@@ -516,7 +619,7 @@ mod tests {
     fn a_draw_at_another_site_than_announced_ends_the_run_as_an_internal_fault() {
         let reason = "internal: draw is not the one its boundary announced (drawn: request 0, \
                       site priority, thread 3; announced: request 0, site chaos_slice, thread 3)";
-        let lines = refused_in_child(
+        let lines = failed_in_child(
             "a_draw_at_another_site_than_announced_ends_the_run_as_an_internal_fault",
             &format!("choice 0: {reason}"),
             |session| {
@@ -534,7 +637,7 @@ mod tests {
     fn a_draw_by_another_thread_than_announced_ends_the_run_as_an_internal_fault() {
         let reason = "internal: draw is not the one its boundary announced (drawn: request 0, \
                       site priority, thread 3; announced: request 0, site priority, thread 4)";
-        let lines = refused_in_child(
+        let lines = failed_in_child(
             "a_draw_by_another_thread_than_announced_ends_the_run_as_an_internal_fault",
             &format!("choice 0: {reason}"),
             |session| {
@@ -550,7 +653,7 @@ mod tests {
     /// Hermit's own fault. No draw came, so there is no request to record.
     #[test]
     fn an_announcement_without_its_draw_ends_the_run_as_an_internal_fault() {
-        let lines = refused_in_child(
+        let lines = failed_in_child(
             "an_announcement_without_its_draw_ends_the_run_as_an_internal_fault",
             "choice 1: internal: boundary announcement without its draw (announced: request 1, \
              site chaos_slice, thread 3; then thread 3 announced site priority)",
@@ -562,5 +665,36 @@ mod tests {
         );
         assert_eq!(lines.len(), 1, "only the answered request");
         assert!(lines[0].get("v").is_some());
+    }
+
+    /// A session that finishes with an announcement undrawn ends the run as
+    /// Hermit's own fault, naming the announcement: no later announcement is
+    /// left to catch it. No draw came, so there is no request to record.
+    #[test]
+    fn a_session_that_finishes_with_an_announcement_undrawn_ends_the_run_as_an_internal_fault() {
+        let lines = failed_in_child(
+            "a_session_that_finishes_with_an_announcement_undrawn_ends_the_run_as_an_internal_fault",
+            "choice 1: internal: boundary announcement without its draw when the run finished \
+             (announced: request 1, site chaos_slice, thread 3)",
+            |session| {
+                announced_choose(session, point(4));
+                session.announce(DetTid::from_raw(3), ChoiceSite::ChaosSlice);
+                session.finish();
+            },
+        );
+        assert_eq!(lines.len(), 1, "only the answered request");
+        assert!(lines[0].get("v").is_some());
+    }
+
+    /// A session whose every announcement was drawn finishes and goes on as
+    /// it was: finishing checks the announcement and nothing else.
+    #[test]
+    fn a_session_whose_announcements_were_all_drawn_finishes() {
+        let mut session = ChoiceSession::new(Box::new(TapeSource::new(vec![])), None);
+        session.finish();
+        assert_eq!(announced_choose(&mut session, point(4)), 4);
+        session.finish();
+        assert_eq!(session.next_index(), 1);
+        assert_eq!(undrawn_at_finish(None), None);
     }
 }

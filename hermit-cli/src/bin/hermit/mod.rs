@@ -19,6 +19,7 @@
 mod analyze;
 pub mod backend_hook;
 mod bisect;
+mod choice_internal_note;
 mod clean;
 mod cli_owned_lifecycle;
 mod container;
@@ -263,6 +264,7 @@ use self::analyze::AnalyzeOpts;
 use self::analyze::AnalyzeVerdict;
 use self::analyze::precondition_class;
 use self::bisect::BisectOpts;
+use self::container::ChoiceInternalFault;
 use self::container::ContainerChildExit;
 use self::container::ContainerChildPanic;
 use self::container::LogCapExceeded;
@@ -1368,7 +1370,10 @@ fn classify_failure(error: &Error) -> String {
     // defect this exists to remove.
     if is_outer_policy_refusal(error) {
         // NOT HERMIT_INTERNAL_FAILURE: hermit did not fail. It refused, on
-        // purpose, and printed why immediately above this line.
+        // purpose, and printed why immediately above this line. A run's choice
+        // session refuses a source or an answer here; its `internal:` faults
+        // are Hermit failing, exit 125 instead, and are classified with the
+        // container child's exit below (`cause=choice-internal`).
         return "HERMIT_POLICY_REFUSAL class=policy-refusal".to_string();
     }
     // ⚠️ THE MARKER IS WHAT MAKES 130 UNAMBIGUOUS, exactly as it is for 122. A
@@ -1412,6 +1417,15 @@ fn classify_failure(error: &Error) -> String {
     }
     // ONE discriminant, read once, covering all three flattenings.
     if let Some(ContainerChildExit(status)) = error.downcast_ref::<ContainerChildExit>() {
+        // A fault of Hermit's own in the run's choice protocol: the child
+        // chose 125 and named the cause in its note, and it printed the fault
+        // above. NOT HERMIT_POLICY_REFUSAL: nothing was refused, Hermit broke.
+        if error.downcast_ref::<ChoiceInternalFault>().is_some() {
+            return format!(
+                "HERMIT_INTERNAL_FAILURE class=container-child-exit status={status:?} \
+                 cause=choice-internal"
+            );
+        }
         // The child died with a status IT DID NOT CHOOSE: a kill, a fault, a
         // panic no handler caught. Nothing reported it; reverie observed it.
         return format!("HERMIT_INTERNAL_FAILURE class=container-child-exit status={status:?}");
@@ -3050,6 +3064,29 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A fault of Hermit's own in a run's choice protocol is Hermit failing:
+    /// the container child's 125 with its note exits 125 with the cause on the
+    /// class line, never as a refusal. The same status without the note keeps
+    /// the plain container-child line.
+    #[test]
+    fn a_choice_protocol_fault_is_an_internal_failure_with_its_cause() {
+        let status = reverie::process::ExitStatus::Exited(HERMIT_INTERNAL_FAILURE_EXIT);
+        let fault = super::container::choice_internal_exit(status);
+        assert_eq!(failure_exit_code(&fault), HERMIT_INTERNAL_FAILURE_EXIT);
+        assert_eq!(
+            classify_failure(&fault),
+            "HERMIT_INTERNAL_FAILURE class=container-child-exit status=Exited(125) \
+             cause=choice-internal"
+        );
+        assert!(!super::is_outer_policy_refusal(&fault));
+        let plain = Error::new(super::ContainerChildExit(status));
+        assert_eq!(failure_exit_code(&plain), HERMIT_INTERNAL_FAILURE_EXIT);
+        assert_eq!(
+            classify_failure(&plain),
+            "HERMIT_INTERNAL_FAILURE class=container-child-exit status=Exited(125)"
+        );
     }
 
     #[test]
