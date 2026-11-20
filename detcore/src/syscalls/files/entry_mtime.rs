@@ -96,7 +96,7 @@ use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 
 use super::StatFailure;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::tool_global::forget_retired_inode;
 use crate::tool_global::touch_file;
 use crate::tool_local::Detcore;
@@ -224,7 +224,7 @@ fn directory_spelling(path: &[u8]) -> Option<&[u8]> {
 /// `None` where the spelling cannot be read or is empty.
 fn directory_of<T, G>(guest: &G, name: Name<'_>) -> Option<(RawFd, Vec<u8>)>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let spelled: PathBuf = name.path.read(&guest.memory()).ok()?;
@@ -276,7 +276,7 @@ impl RenameTarget {
     }
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Whether this run keeps directory and new-object mtimes as Linux does
     /// (see the module documentation).
     fn models_entry_mtimes<G: Guest<Self>>(guest: &G) -> bool {
@@ -557,7 +557,6 @@ mod tests {
     use reverie::syscalls::SyscallArgs;
 
     use super::*;
-    use crate::record_or_replay::NoopTool;
     use crate::syscall_classification::all_pinned_syscalls;
     use crate::syscall_hot_path_tests::InjectGuest;
     use crate::syscall_hot_path_tests::detcore;
@@ -565,8 +564,11 @@ mod tests {
     /// A thread of a run with these two settings, the model's conditions,
     /// that records every call injected through it and has neither the
     /// registers nor the scratch stack a lookup needs (asking panics).
-    fn thread(virtualize_metadata: bool, sequentialize_threads: bool) -> InjectGuest<NoopTool> {
-        let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+    fn thread(
+        virtualize_metadata: bool,
+        sequentialize_threads: bool,
+    ) -> InjectGuest<crate::SeededMode> {
+        let mut guest = InjectGuest::<crate::SeededMode>::new(Ok(0));
         guest.config.virtualize_metadata = virtualize_metadata;
         guest.config.sequentialize_threads = sequentialize_threads;
         guest
@@ -579,7 +581,7 @@ mod tests {
     /// and a NULL path changes no name, again with nothing injected.
     #[test]
     fn nothing_is_looked_up_before_the_model_and_the_call_are_admitted() {
-        let tool = detcore::<NoopTool>();
+        let tool = detcore::<crate::SeededMode>();
         // Every argument a readable name, so that a lookup made in error
         // fails on the guest's refusals, not on a bad address.
         let spelled = std::ffi::CString::new("new").unwrap();
@@ -637,7 +639,7 @@ mod tests {
     /// not a lookup.
     #[test]
     fn each_admission_is_smaller_than_the_lookups_it_boxes() {
-        let tool = detcore::<NoopTool>();
+        let tool = detcore::<crate::SeededMode>();
         let mut guest = thread(true, true);
         let call = Syscall::from_raw(Sysno::mkdirat, SyscallArgs::new(3, 0x1000, 0, 0, 0, 0));
         let spelled = std::ffi::CString::new("new").unwrap();

@@ -12268,7 +12268,7 @@ fn is_start_answer(response: &GlobalResponse) -> bool {
 /// A start answer without callback history (`is_start_answer`) finds none
 /// active in the thread: the coordinator activates it only by sending one
 /// (`GlobalResponse::WithCallbackHistory`).
-fn check_start_without_callback_history<T>(
+fn check_start_without_callback_history<T: RunMode>(
     thread: &crate::ThreadState<T>,
     response: &GlobalResponse,
 ) {
@@ -23595,7 +23595,7 @@ mod tests {
             rcb_target: 120,
             instructions: 6,
         };
-        let start = GlobalResponse::StartNewThread(None, Some(LogicalTime::from_rcbs(83)));
+        let start = GlobalResponse::StartNewThread(None, Some(LogicalTime::from_rcbs(83)), None);
         let wrapped = GlobalResponse::WithReplayInstructionOffset(offset, Box::new(start.clone()));
         let resume = GlobalResponse::ResumeExec(ResumeStatus::Normal, None);
         let wrapped_resume =
@@ -23606,8 +23606,10 @@ mod tests {
         assert!(!super::is_start_answer(&wrapped_resume));
 
         let config = Config::default();
-        let inactive = crate::ThreadState::new(DetTid::from_raw(3), &config, ());
-        let mut active = crate::ThreadState::new(DetTid::from_raw(3), &config, ());
+        let inactive =
+            crate::ThreadState::<crate::SeededMode>::new(DetTid::from_raw(3), &config, ());
+        let mut active =
+            crate::ThreadState::<crate::SeededMode>::new(DetTid::from_raw(3), &config, ());
         active
             .callback_history
             .install(crate::preemptions::callback_history::Startup::default());
@@ -23634,7 +23636,7 @@ mod tests {
     /// operation fails.
     struct CannedAnswerGuest<'a> {
         config: &'a Config,
-        thread: crate::ThreadState<()>,
+        thread: crate::ThreadState<crate::SeededMode>,
         answer: GlobalResponse,
         requests: Mutex<Vec<GlobalRequest>>,
     }
@@ -23675,11 +23677,11 @@ mod tests {
             panic!("a canned answer must not access guest memory")
         }
 
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
             &mut self.thread
         }
 
-        fn thread_state(&self) -> &crate::ThreadState<()> {
+        fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
             &self.thread
         }
 
@@ -23737,7 +23739,7 @@ mod tests {
             rcb_target: 120,
             instructions: 6,
         };
-        let start = GlobalResponse::StartNewThread(None, Some(LogicalTime::from_rcbs(83)));
+        let start = GlobalResponse::StartNewThread(None, Some(LogicalTime::from_rcbs(83)), None);
         let wrapped = GlobalResponse::WithReplayInstructionOffset(offset, Box::new(start.clone()));
         let config = Config {
             sequentialize_threads: true,
@@ -23751,7 +23753,7 @@ mod tests {
             (&start, false),
             (&wrapped, false),
         ] {
-            let mut thread = crate::ThreadState::new(tid, &config, ());
+            let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
             thread.detpid = Some(process);
             if active {
                 thread

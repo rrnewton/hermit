@@ -1095,7 +1095,11 @@ fn kept_timer_schedule(
 /// ends records none (`update_logical_time_rcbs`); its point is one branch
 /// past `now`, so the next handler's overshoot check measures against it and
 /// does not report again the overshoot this stop has reported.
-fn rearm_kept_timer<T>(thread: &mut ThreadState<T>, kept: KeptTimer, now: u64) -> TimerSchedule {
+fn rearm_kept_timer<T: RunMode>(
+    thread: &mut ThreadState<T>,
+    kept: KeptTimer,
+    now: u64,
+) -> TimerSchedule {
     match kept {
         KeptTimer::Rearm(schedule) => schedule,
         KeptTimer::InsideOffset { .. } => {
@@ -11043,7 +11047,8 @@ mod rcb_overshoot_tests {
             instructions: 3,
         };
         let config = Config::default();
-        let mut thread = ThreadState::new(crate::types::DetPid::from_raw(3), &config, ());
+        let mut thread =
+            ThreadState::<crate::SeededMode>::new(crate::types::DetPid::from_raw(3), &config, ());
         thread.committed_clock_value = 100;
         thread.last_rcb_timer = Some(50);
         thread.armed_instruction_offset = Some(offset);

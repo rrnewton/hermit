@@ -1495,7 +1495,7 @@ fn resolved_open_path(
 /// `CLONE_THREAD` but without `CLONE_FILES` has a table of its own, and
 /// `/proc/<pid>/fd`, its leader's, may hold another file at the same
 /// number, or none (`resolved_open_path`).
-fn descriptor_table_task<T: RecordOrReplay, G: Guest<Detcore<T>>>(guest: &G) -> i32 {
+fn descriptor_table_task<T: RunMode, G: Guest<Detcore<T>>>(guest: &G) -> i32 {
     guest
         .thread_state()
         .physical_tid

@@ -67,7 +67,7 @@ pub(crate) async fn inject_with_scratch_reporting<G, T, const N: usize>(
 ) -> Result<(Result<i64, Errno>, [u8; N]), Errno>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match on_stack(guest, &initial, &call).await {
         Err(Errno::EFAULT) | Ok((Err(Errno::EFAULT), _)) => {
