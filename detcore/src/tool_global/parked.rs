@@ -148,7 +148,7 @@ pub(crate) async fn signal_dequeued<G, T>(
 ) -> Result<(), Errno>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if guest.signal_control_mode() != reverie::BackendSignalControlMode::ToolControlled {
         return Ok(());
@@ -183,7 +183,7 @@ where
 pub(crate) async fn terminate_protocol<G, T>(guest: &mut G, failure: ProtocolFailure) -> !
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let state = guest.thread_state();
     let _ = guest
@@ -208,7 +208,7 @@ pub(crate) async fn parked_wait_request<G, T>(
 ) -> ResumeStatus
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // Reverie decides whether this callback is a controlled parked site. A
     // backend without signal control, or one whose Tool did not opt into
@@ -231,7 +231,7 @@ where
 pub(crate) async fn child_wait_request<G, T>(guest: &mut G, spec: ChildWaitSpec) -> ResumeStatus
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if !guest.config().backend.emulates_child_waits
         || guest.signal_control_mode() != reverie::BackendSignalControlMode::ToolControlled
@@ -258,7 +258,7 @@ pub(crate) async fn polled_read_request<G, T>(
 ) -> ResumeStatus
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // As in `parked_wait_request`, the Reverie query alone decides whether
     // this read has a controlled site.
@@ -278,7 +278,7 @@ pub(super) async fn capable_resource_request<G, T>(
 ) -> ResumeStatus
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // A parked request publishes the guest's mask as an ordinary one does
     // (`resource_request`).

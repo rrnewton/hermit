@@ -20,7 +20,7 @@ use reverie::syscalls::Sysno;
 
 use super::VIRTUAL_CPUSET_BYTES;
 use crate::cpu_set::CpuSet;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::scheduler::pid_namespaces::GuestPidAnswer;
 use crate::tool_global::cpu_affinity;
 use crate::tool_global::set_cpu_affinity;
@@ -36,7 +36,7 @@ fn getaffinity_length_is_valid(len: u32, cpus: u32) -> bool {
         && (len as usize).is_multiple_of(std::mem::size_of::<libc::c_ulong>())
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// The task `pid` names for the affinity calls, as `find_process_by_pid`
     /// reads it: the caller for 0, no task (ESRCH) for a negative number or
     /// one no task of the caller's PID namespace has.

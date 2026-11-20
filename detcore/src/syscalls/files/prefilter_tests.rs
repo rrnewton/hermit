@@ -120,11 +120,11 @@ fn each_checks_syscalls_are_the_ones_its_own_table_acts_on() {
 #[test]
 fn every_prefiltered_call_is_one_each_check_answers_trivially() {
     futures::executor::block_on(async {
-        let mut tool = detcore::<NoopTool>();
+        let mut tool = detcore::<crate::SeededMode<NoopTool>>();
         tool.cfg.recordreplay_modes = false;
         for sysno in all_pinned_syscalls().filter(|sysno| !may_name_file_or_descriptor(*sysno)) {
             let call = Syscall::from_raw(sysno, zero_args());
-            let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+            let mut guest = InjectGuest::<crate::SeededMode>::new(Ok(0));
             guest.config.virtualize_metadata = true;
             guest.config.sequentialize_threads = true;
             assert_eq!(
@@ -214,7 +214,7 @@ impl crate::fifo_peer::GuestMadeFifos for OneFifo {
 fn a_representative_call_of_each_check_still_reaches_it() {
     let path = PATH.as_ptr() as usize;
     futures::executor::block_on(async {
-        let mut tool = detcore::<NoopTool>();
+        let mut tool = detcore::<crate::SeededMode<NoopTool>>();
         tool.cfg.recordreplay_modes = false;
         // aarch64 has unlinkat, not unlink.
         #[cfg(target_arch = "x86_64")]
@@ -227,8 +227,8 @@ fn a_representative_call_of_each_check_still_reaches_it() {
         let unlink = Syscall::from_raw(removal, args);
         assert!(may_name_file_or_descriptor(removal));
 
-        let mut guest =
-            InjectGuest::<NoopTool>::new(Err(reverie::Errno::ENOMEM)).with_registers(no_scratch());
+        let mut guest = InjectGuest::<crate::SeededMode>::new(Err(reverie::Errno::ENOMEM))
+            .with_registers(no_scratch());
         guest.config.virtualize_metadata = true;
         guest.config.sequentialize_threads = true;
         assert_eq!(
@@ -240,8 +240,8 @@ fn a_representative_call_of_each_check_still_reaches_it() {
 
         // A set of this test's own with one FIFO in it: the process-wide
         // registry stays untouched, so concurrent tests see no change.
-        let mut guest =
-            InjectGuest::<NoopTool>::new(Err(reverie::Errno::ENOMEM)).with_registers(no_scratch());
+        let mut guest = InjectGuest::<crate::SeededMode>::new(Err(reverie::Errno::ENOMEM))
+            .with_registers(no_scratch());
         let removed = tool
             .guest_made_fifos_removed_from(&mut guest, &unlink, &OneFifo((u64::MAX, u64::MAX)))
             .await;
@@ -258,7 +258,7 @@ fn a_representative_call_of_each_check_still_reaches_it() {
             SyscallArgs::new(path, path, 0, 0, 0x100, 0),
         );
         assert!(may_name_file_or_descriptor(Sysno::setxattr));
-        let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+        let mut guest = InjectGuest::<crate::SeededMode>::new(Ok(0));
         assert_eq!(
             tool.answer_rendered_procfs_path_call(&mut guest, &setxattr)
                 .await

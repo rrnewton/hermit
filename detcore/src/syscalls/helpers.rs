@@ -31,11 +31,11 @@ use reverie::syscalls::WaitPidFlag;
 
 use crate::fd::FdType;
 use crate::fd::ReceiveTimeout;
-use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::run_mode::RunMode;
 use crate::syscalls::entry_import::Displaced;
 use crate::syscalls::entry_import::EntryImport;
 use crate::syscalls::threads::BlockedWaitSignalError;
@@ -65,7 +65,7 @@ use crate::types::OpenFileId;
 use crate::types::SchedEvent;
 use crate::types::SyscallPhase;
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#2373)
     /// Apply the established unsupported-syscall refusal policy to a *supported*
@@ -1536,7 +1536,7 @@ pub enum IOAction {
 /// kernel's authority over the syscall result rather than exposing this advisory lookup error.
 pub fn ioaction_based_on_fd_status<
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
     C: NonblockableSyscall + Into<Syscall>,
 >(
     guest: &mut G,
@@ -1570,7 +1570,7 @@ pub fn ioaction_based_on_fd_status<
 /// [`ioaction_based_on_fd_status`] for the descriptor `fd` alone, before any
 /// flag of the call itself, for a caller whose call does not implement
 /// [`NonblockableSyscall`].
-pub(crate) fn ioaction_based_on_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+pub(crate) fn ioaction_based_on_fd<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     fd: i32,
 ) -> Result<IOAction, Errno> {
@@ -1640,7 +1640,7 @@ fn ioaction_for_fd_status(fd: i32, virt: bool, phys: bool, flags_forbid_waiting:
 ///
 /// Syscalls whose fd is not directly extractable (e.g. poll/ppoll, which carry a
 /// pointer to an fd array) return false and keep their existing handling.
-pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     call: Syscall,
 ) -> bool {
@@ -1675,7 +1675,7 @@ pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 /// It feeds only `Resources::polls_guest_state_only`, never the record/replay
 /// routing `syscall_targets_internal_fd` decides. An epoll wait's descriptor
 /// is its set, which this does not track.
-fn syscall_targets_guest_held_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+fn syscall_targets_guest_held_fd<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     call: Syscall,
 ) -> bool {
@@ -1705,7 +1705,7 @@ fn syscall_targets_guest_held_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 /// Other internal descriptors retain their existing readiness classification.
 /// In particular, this does not repair guest-only claims for pipes exported
 /// through SCM_RIGHTS or received from outside the guest.
-fn single_fd_poll_readiness<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+fn single_fd_poll_readiness<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     call: Syscall,
     internal_fd: bool,
@@ -1734,7 +1734,7 @@ const GUEST_HELD_POLL_MAX_FDS: usize = 1024;
 /// not guest-held, which keeps the call's classification as it was. It feeds
 /// only `Resources::polls_guest_state_only`. Record/replay retains its prior
 /// classification and does not use these new guest-held marks.
-pub(crate) fn poll_targets_guest_held<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+pub(crate) fn poll_targets_guest_held<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     fds: Option<usize>,
     nfds: usize,
@@ -1767,7 +1767,7 @@ pub(crate) fn poll_targets_guest_held<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 /// retry, for its existing FIFO-open decisions. It does not enable the new
 /// idle-poller jumps.
 /// Non-FD primitives retain the proof supplied by their own handlers.
-pub(crate) fn refresh_guest_poll_state<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+pub(crate) fn refresh_guest_poll_state<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     call: Syscall,
     resources: &mut Resources,
@@ -1844,7 +1844,7 @@ enum GuestHeldPollTargets {
 impl GuestHeldPollProof {
     pub(crate) fn capture<T, G>(guest: &mut G, call: Syscall, resources: &mut Resources) -> Self
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         let targets = resources
@@ -1866,7 +1866,7 @@ impl GuestHeldPollProof {
 
     pub(crate) fn revalidate<T, G>(&mut self, guest: &mut G, resources: &mut Resources)
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         if self.targets.is_some() && Self::read_targets(guest, self.call) != self.targets {
@@ -1890,7 +1890,7 @@ impl GuestHeldPollProof {
 
     fn identity<T, G>(guest: &mut G, fd: i32) -> Option<OpenFileId>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         guest
@@ -1904,7 +1904,7 @@ impl GuestHeldPollProof {
 
     fn read_targets<T, G>(guest: &mut G, call: Syscall) -> Option<GuestHeldPollTargets>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         let (address, nfds) = match call {
@@ -1952,7 +1952,7 @@ impl GuestHeldPollProof {
 
 /// Whether descriptor `fd` is a named FIFO that joined internal polling
 /// (`Resources::polls_a_named_fifo`).
-fn is_named_fifo<G: Guest<Detcore<T>>, T: RecordOrReplay>(guest: &mut G, fd: i32) -> bool {
+fn is_named_fifo<G: Guest<Detcore<T>>, T: RunMode>(guest: &mut G, fd: i32) -> bool {
     guest
         .thread_state()
         .with_detfd(fd, |detfd| detfd.is_named_fifo())
@@ -1965,7 +1965,7 @@ fn is_named_fifo<G: Guest<Detcore<T>>, T: RecordOrReplay>(guest: &mut G, fd: i32
 /// (`Resources::private_sigchld_decides`; R2b-2 stage 3,
 /// https://github.com/rrnewton/hermit/issues/4273). A socket read keeps
 /// holding it (rev4 1e).
-fn reads_a_pipe<G: Guest<Detcore<T>>, T: RecordOrReplay>(guest: &mut G, call: Syscall) -> bool {
+fn reads_a_pipe<G: Guest<Detcore<T>>, T: RunMode>(guest: &mut G, call: Syscall) -> bool {
     matches!(call, Syscall::Read(_) | Syscall::Readv(_))
         && get_fd(call).is_some_and(|fd| {
             guest
@@ -1978,10 +1978,7 @@ fn reads_a_pipe<G: Guest<Detcore<T>>, T: RecordOrReplay>(guest: &mut G, call: Sy
 /// Does `call` read a descriptor Detcore records as a signalfd
 /// (`Resources::reads_signalfd`)? Only `read`, `readv` and `preadv2` at the
 /// current offset can: a positioned read of a signalfd fails with ESPIPE.
-fn call_reads_signalfd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
-    guest: &mut G,
-    call: Syscall,
-) -> bool {
+fn call_reads_signalfd<G: Guest<Detcore<T>>, T: RunMode>(guest: &mut G, call: Syscall) -> bool {
     let fd = match call {
         Syscall::Read(c) => c.fd(),
         Syscall::Readv(c) => c.fd(),
@@ -2017,7 +2014,7 @@ fn read_family_fd(call: Syscall) -> Option<i32> {
 /// descriptor is not assumed to be served from the log. `recvmmsg` and `sendmmsg` are
 /// recorded by neither recorder nor replayer (on an accepted connection record/replay
 /// refuses them, see `refuse_log_served_mmsg`).
-fn replay_serves_socket_call_from_log<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+fn replay_serves_socket_call_from_log<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     call: Syscall,
 ) -> bool {
@@ -2057,7 +2054,7 @@ fn replay_serves_blocking_call_from_log(call: Syscall) -> bool {
 /// That is a socket Detcore created with `socket(2)` or `accept(2)`, but not a
 /// socketpair endpoint: replay recreates a socketpair, and its operations run
 /// live.
-fn is_log_served_socket<G: Guest<Detcore<T>>, T: RecordOrReplay>(guest: &mut G, fd: i32) -> bool {
+fn is_log_served_socket<G: Guest<Detcore<T>>, T: RunMode>(guest: &mut G, fd: i32) -> bool {
     guest
         .thread_state()
         .with_detfd(fd, |detfd| {
@@ -2070,7 +2067,7 @@ fn is_log_served_socket<G: Guest<Detcore<T>>, T: RecordOrReplay>(guest: &mut G, 
 /// replay keep such a connection only in the log, and replay stands in an
 /// eventfd for it, so an operation that runs live during replay meets that
 /// eventfd rather than a connected socket.
-pub(crate) fn is_accepted_connection<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+pub(crate) fn is_accepted_connection<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     fd: i32,
 ) -> bool {
@@ -2219,7 +2216,7 @@ pub trait NonblockableSyscall: SyscallInfo {
     /// setting a zero timeout, and sometimes it means something else.
     ///
     /// This may need to stack allocate, so it returns a StackGuard.
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>);
@@ -2344,7 +2341,7 @@ fn pipe_writev_resources(
 #[cfg(target_arch = "x86_64")]
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Poll {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         _guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2387,7 +2384,7 @@ impl TimeoutableSyscall for reverie::syscalls::Poll {
 
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Ppoll {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2417,7 +2414,7 @@ impl TimeoutableSyscall for reverie::syscalls::Ppoll {
 #[cfg(target_arch = "x86_64")]
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::EpollWait {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         _guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2448,7 +2445,7 @@ impl TimeoutableSyscall for reverie::syscalls::EpollWait {
 // return.
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::EpollPwait {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         _guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2478,7 +2475,7 @@ pub(crate) async fn take_outcome<T, G>(
     after: Option<(u64, u64)>,
 ) -> crate::scheduler::posix_timer_coalesce::TakeOutcome
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
@@ -2499,7 +2496,7 @@ where
     }
 }
 
-async fn zero_timespec<'stack, T: RecordOrReplay, G: Guest<Detcore<T>>>(
+async fn zero_timespec<'stack, T: RunMode, G: Guest<Detcore<T>>>(
     guest: &mut G,
 ) -> (Addr<'stack, Timespec>, <G::Stack as Stack>::StackGuard) {
     let mut stack = guest.stack().await;
@@ -2514,7 +2511,7 @@ async fn zero_timespec<'stack, T: RecordOrReplay, G: Guest<Detcore<T>>>(
 
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Wait4 {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         _guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2536,7 +2533,7 @@ impl NonblockableSyscall for reverie::syscalls::Wait4 {
 #[async_trait]
 /// Used only for FUTEX_WAIT
 impl NonblockableSyscall for reverie::syscalls::Futex {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2601,7 +2598,7 @@ impl TimeoutableSyscall for reverie::syscalls::Futex {
 
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::RtSigtimedwait {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2641,7 +2638,7 @@ impl TimeoutableSyscall for reverie::syscalls::RtSigtimedwait {
 /// ONLY for sockets and pipes.
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Read {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2663,7 +2660,7 @@ impl NonblockableSyscall for reverie::syscalls::Read {
 /// ONLY for sockets and pipes.
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Write {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2682,7 +2679,7 @@ impl NonblockableSyscall for reverie::syscalls::Write {
 /// Vectored reads have the same blocking behavior as scalar reads on pipes and sockets.
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Readv {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2703,7 +2700,7 @@ impl NonblockableSyscall for reverie::syscalls::Readv {
 /// waiting on a file the guest left blocking.
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Preadv2 {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2724,7 +2721,7 @@ impl NonblockableSyscall for reverie::syscalls::Preadv2 {
 /// Vectored writes have the same blocking behavior as scalar writes on pipes and sockets.
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Writev {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2745,7 +2742,7 @@ fn has_msg_dontwait(flags: u32) -> bool {
 /// A common helper shared among several network syscalls.
 /// We can't actually CONVERT these syscalls into nonblocking, but we can assert that they are by
 /// checking the status of their file descriptor.
-fn network_comm_syscall<T: RecordOrReplay, G: Guest<Detcore<T>>, C: SyscallInfo + Into<Syscall>>(
+fn network_comm_syscall<T: RunMode, G: Guest<Detcore<T>>, C: SyscallInfo + Into<Syscall>>(
     call: C,
     guest: &mut G,
 ) -> (C, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2770,7 +2767,7 @@ fn network_comm_syscall<T: RecordOrReplay, G: Guest<Detcore<T>>, C: SyscallInfo 
 
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Accept4 {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2794,7 +2791,7 @@ impl TimeoutableSyscall for reverie::syscalls::Accept4 {
 
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Recvfrom {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2820,7 +2817,7 @@ impl NonblockableSyscall for reverie::syscalls::Recvfrom {
 
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Recvmsg {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2861,7 +2858,7 @@ impl NonblockableSyscall for reverie::syscalls::Recvmmsg {
     // writeback and partial-count differences predate the socket
     // deadlines and are tracked separately (see the diff that added
     // this comment).
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2890,7 +2887,7 @@ impl NonblockableSyscall for reverie::syscalls::Recvmmsg {
 
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Sendto {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2908,7 +2905,7 @@ impl NonblockableSyscall for reverie::syscalls::Sendto {
 
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Sendmmsg {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2926,7 +2923,7 @@ impl NonblockableSyscall for reverie::syscalls::Sendmmsg {
 
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Sendmsg {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2944,7 +2941,7 @@ impl NonblockableSyscall for reverie::syscalls::Sendmsg {
 
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Connect {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -2989,7 +2986,7 @@ pub async fn retry_nonblocking_syscall<T, G, C>(
 ) -> Result<i64, Error>
 where
     C: NonblockableSyscall + Into<Syscall>,
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     // Bogus 99 return value is dead code below:
@@ -3206,7 +3203,7 @@ pub(crate) async fn inject_keeping_kernel_restart<T, G, S>(
     call: S,
 ) -> Result<i64, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
     S: SyscallInfo,
 {
@@ -3230,7 +3227,7 @@ pub(crate) async fn resume_kernel_wait<T, G>(
     sysno: Sysno,
 ) -> Result<i64, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let result = resumed_kernel_wait_result(guest.inject(restart).await).map_err(Error::from);
@@ -3246,7 +3243,7 @@ pub(crate) async fn keep_restart_block<T, G>(
     call: RestartCall,
     deadline: Option<LogicalTime>,
 ) where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if matches!(result, Err(Error::Errno(errno)) if *errno == Errno::ERESTART_RESTARTBLOCK) {
@@ -3296,7 +3293,7 @@ pub(crate) fn poll_deadline_for<T, G>(
     deadline: Option<LogicalTime>,
 ) -> Option<LogicalTime>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if guest.config().recordreplay_modes {
@@ -3318,7 +3315,7 @@ pub async fn retry_nonblocking_syscall_with_timeout<T, G, C>(
 ) -> Result<i64, Error>
 where
     C: NonblockableSyscall + TimeoutableSyscall + Into<Syscall>,
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let maybe_tup = maybe_timeout.map(|t| (t, call.timeout_return_val()));
@@ -3350,7 +3347,7 @@ where
 /// unrelated host task.
 pub(crate) fn guest_signal_state_task<T, G>(guest: &G) -> Option<(i32, i32)>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let config = guest.config();
@@ -3372,7 +3369,7 @@ async fn own_disposition_interrupts<T, G>(
     action_addr: AddrMut<'_, KernelSigaction>,
 ) -> Result<bool, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let query = syscalls::RtSigprocmask::new()
@@ -3401,7 +3398,7 @@ async fn progress_signal_interrupts<T, G>(
     status: ResumeStatus,
 ) -> Result<bool, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let mut stack = guest.stack().await;
@@ -3420,7 +3417,7 @@ where
 /// alias, so a later F_SETFL or FIONBIO through any of them shows here.
 fn inotify_description_of<T, G, C>(guest: &G, call: C) -> Option<crate::fd::DetFd>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
     C: NonblockableSyscall + Into<Syscall>,
 {
@@ -3520,7 +3517,7 @@ async fn carried_signal_ends<T, G>(
     gated: bool,
 ) -> Result<bool, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let carried = guest
@@ -3565,7 +3562,7 @@ where
 fn interrupt_errno_at_entry<T, G, C>(guest: &G, call: &C, default: Errno) -> Errno
 where
     C: NonblockableSyscall + Into<Syscall>,
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let timeout = socket_timeout_fd((*call).into()).and_then(|(fd, direction)| {
@@ -3672,7 +3669,7 @@ fn socket_timeout_interrupt_errno(default: Errno, socket_timeout: Option<Receive
 fn restarts_without_a_handler_through_erestartsys<T, G, C>(guest: &G, call: &C) -> bool
 where
     C: NonblockableSyscall,
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     woken_call_ends_through_erestartsys(
@@ -3750,7 +3747,7 @@ pub(crate) async fn woken_poll_errno<T, G>(
     status: ResumeStatus,
 ) -> Result<Errno, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if let Ok(sets) = guest.signal_sets(guest.tid()) {
@@ -3895,7 +3892,7 @@ pub(crate) fn settle_woken_wait_at_return<T, G>(
     res: Result<i64, Error>,
 ) -> Settlement
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let send = match std::mem::take(&mut guest.thread_state_mut().woken_wait) {
@@ -4014,7 +4011,7 @@ pub(crate) async fn check_woken_wait_delivery<T, G>(
     delivered: bool,
 ) -> Option<String>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let WokenWait::Settled(mut settled) = guest.thread_state().woken_wait else {
@@ -4223,7 +4220,7 @@ async fn retry_nonblocking_syscall_helper<T, G, C>(
 ) -> Result<i64, Error>
 where
     C: NonblockableSyscall + Into<Syscall>,
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     // Capture the same mark-dependent classification that the first retry
@@ -4769,7 +4766,7 @@ where
 async fn finish_after_read_shutdown<T, G, C>(guest: &mut G, call: C) -> Option<Result<i64, Error>>
 where
     C: NonblockableSyscall + Into<Syscall>,
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let fd = get_fd(call.into()).filter(|_| call.ends_at_read_shutdown())?;
@@ -4817,7 +4814,7 @@ where
 /// `RCV_SHUTDOWN` is set (`datagram_poll`, `unix_dgram_poll`, `tcp_poll`).
 async fn read_side_shut_down<T, G>(guest: &mut G, fd: i32) -> bool
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let mut stack = guest.stack().await;
@@ -4869,7 +4866,7 @@ fn put_back_entry_import<T, G>(
     completed: bool,
 ) -> Result<(), Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let (Some(entry), Some(displaced)) = (entry_import, displaced) else {
@@ -4894,7 +4891,7 @@ where
 /// still the ones the call moved its bytes through.
 fn keep_entry_view<T, G>(guest: &mut G, entry_import: Option<Box<EntryImport>>)
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let view =
@@ -4989,7 +4986,7 @@ async fn read_turn_signals<T, G>(
     real_time: NamedRealTime,
 ) -> Result<TurnSignals, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     Ok(
@@ -5008,7 +5005,7 @@ async fn read_turn_signals_and_state<T, G>(
     real_time: NamedRealTime,
 ) -> Result<(TurnSignals, KernelSignalState), Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let state = crate::syscalls::read_guest_group_wait_signal_state(guest)?;
@@ -5034,7 +5031,7 @@ async fn turn_signals_from_state<T, G>(
     private: KernelSigset,
 ) -> TurnSignals
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let before =
@@ -5082,7 +5079,7 @@ async fn turn_signals_with_block<T, G>(
     published: &mut PublishedWaitMask,
 ) -> Result<TurnSignals, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let mask = wait.as_ref().and_then(KernelSignalWait::effective_mask);
@@ -5187,7 +5184,7 @@ enum NamedRealTime {
 /// waiter: `posix-sigwait` in `process_signal_target.c`).
 fn decides_interruption_at_turn<T, G>(guest: &G, task: Option<(i32, i32)>) -> bool
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     task.is_some() && turn_decides_interruption(guest.config())
@@ -5218,7 +5215,7 @@ async fn install_turn_mask<T, G>(
     cell: AddrMut<'_, KernelSigset>,
 ) -> Result<KernelSigset, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     // A copy Linux discarded at send that the kernel still holds (a traced
@@ -5248,7 +5245,7 @@ where
 /// too.
 pub(crate) fn gated_own_mask<T, G>(guest: &G, fallback: KernelSigset) -> KernelSigset
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let own = Resources::new(guest.thread_state().dettid);
@@ -5268,7 +5265,7 @@ pub(crate) fn gated_wait_end<T, G>(
     fallback: Option<KernelSigset>,
 ) -> Result<Option<crate::wait_signal_end::WaitSignalEnd>, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     gated_wait_end_with_virtual(guest, fallback, 0)
@@ -5284,7 +5281,7 @@ pub(crate) fn gated_wait_end_with_virtual<T, G>(
     virtual_caught: KernelSigset,
 ) -> Result<Option<crate::wait_signal_end::WaitSignalEnd>, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if !guest.config().in_guest_signal_delivery {
@@ -5308,7 +5305,7 @@ pub(crate) fn gated_wait_ends<T, G>(
     fallback: Option<KernelSigset>,
 ) -> Result<bool, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let end = gated_wait_end(guest, fallback)?;
@@ -5345,7 +5342,7 @@ where
 /// (`None`): the call runs. With the gate off, `None`.
 pub(crate) fn kernel_run_entry_refusal<T, G>(guest: &mut G) -> Result<Option<Error>, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     match gated_wait_end(guest, None)? {
@@ -5387,7 +5384,7 @@ const MAX_IGNORED_REMOVALS: usize = 1 << 16;
 /// errno the guest's call could see.
 pub(crate) async fn remove_ignored_signals<T, G>(guest: &mut G, set: u64) -> Result<(), Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     remove_pending_ignored(guest, set, IgnoredRemoval::NotHeldByLinux).await
@@ -5404,7 +5401,7 @@ pub(crate) async fn remove_signals_discarded_under_a_temporary_mask<T, G>(
     set: u64,
 ) -> Result<(), Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     remove_pending_ignored(guest, set, IgnoredRemoval::LetInByTemporaryMask).await
@@ -5421,7 +5418,7 @@ pub(crate) async fn remove_signals_discarded_under_a_temporary_mask_in<T, G>(
     timeout: AddrMut<'_, Timespec>,
 ) -> Result<(), Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if set == 0 {
@@ -5468,7 +5465,7 @@ async fn remove_pending_ignored<T, G>(
     why: IgnoredRemoval,
 ) -> Result<(), Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if set == 0 {
@@ -5505,7 +5502,7 @@ async fn remove_pending_ignored_in<T, G>(
     why: IgnoredRemoval,
 ) -> Result<(), Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     for _ in 0..MAX_IGNORED_REMOVALS {
@@ -5584,7 +5581,7 @@ pub(crate) async fn remove_ignored_from_queue<T, G>(
     queue: OneQueue,
 ) -> Result<(), Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let bit = crate::syscalls::kernel_sigset_bit(signal);
@@ -5740,7 +5737,7 @@ pub(crate) async fn temporary_mask_check<T, G>(
     epoll: bool,
 ) -> Result<TemporaryMaskCheck, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     use crate::wait_signal_end::WaitSignalEnd;
@@ -5812,7 +5809,7 @@ where
 /// for the restart checkpoint's caught row (A5 design D40).
 pub(crate) async fn caught_action_flags<T, G>(guest: &mut G, signal: i32) -> Result<u64, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     Ok(caught_action(guest, signal).await?.flags)
@@ -5829,7 +5826,7 @@ pub(crate) async fn caught_action<T, G>(
     signal: i32,
 ) -> Result<crate::wait_signal_end::CaughtAction, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let mut stack = guest.stack().await;
@@ -5883,7 +5880,7 @@ pub(crate) async fn publish_wait_mask<T, G>(
     mask: Option<KernelSigset>,
     published: &mut PublishedWaitMask,
 ) where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if mask == published.0 || !publishes_guest_masks(guest.config()) {
@@ -5910,7 +5907,7 @@ pub(crate) async fn finish_wait_mask<T, G>(
     interrupted: bool,
     published: &mut PublishedWaitMask,
 ) where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if published.0.is_none() || !publishes_guest_masks(guest.config()) {
@@ -5932,7 +5929,7 @@ async fn retry_blocking_wait_with_kernel_signal_state<T, G, C>(
 ) -> Result<i64, Error>
 where
     C: NonblockableSyscall + Into<Syscall>,
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     retry_blocking_wait_under_mask(guest, call0, rsrc, maybe_timeout, None)
@@ -5958,7 +5955,7 @@ pub(crate) async fn retry_blocking_wait_under_mask<T, G, C>(
 ) -> (Result<i64, Error>, bool)
 where
     C: NonblockableSyscall + Into<Syscall>,
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let mut guest_held = GuestHeldPollProof::capture(guest, call0.into(), &mut rsrc);
@@ -6260,7 +6257,7 @@ pub(crate) fn tool_decided_injection_failure(
 /// reaches the guest as the backend answered.
 pub(crate) fn fail_on_tool_decided_injection<T, G>(guest: &mut G, sysno: Sysno)
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let refusal = guest.take_unsupported_refusal();
@@ -6275,7 +6272,7 @@ pub(crate) fn judge_backend_refusal<T, G>(
     refusal: Option<reverie::UnsupportedRefusal>,
     sysno: Sysno,
 ) where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let dettid = guest.thread_state().dettid;
@@ -6329,7 +6326,7 @@ pub(crate) async fn refuse_unserviceable_operation_with<T, G>(
     reason: Option<&str>,
 ) -> Result<i64, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     crate::syscall_histogram::mark_refused::<T, G>(guest);
@@ -6403,7 +6400,7 @@ impl IgnoredSignalShield {
     /// (`MaskChangeRefused::Failed`).
     pub(crate) async fn raise<T, G>(guest: &mut G) -> Result<Self, Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         let state = match crate::syscalls::read_guest_thread_signal_state(guest) {
@@ -6436,7 +6433,7 @@ impl IgnoredSignalShield {
     /// shield, so a mask that cannot be put back ends the run.
     pub(crate) async fn lower<T, G>(mut self, guest: &mut G) -> Result<(), Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         let Some(guest_mask) = self.guest_mask.take() else {
@@ -6518,7 +6515,7 @@ pub(crate) async fn refuse_held_signal_loss<T, G>(
     result: Result<i64, Error>,
 ) -> Result<i64, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     use std::io::Write as _;
@@ -6627,7 +6624,7 @@ pub(crate) fn unblocked_by_ignored(
 /// holds no real-time signal. Asked in the calling thread's turn.
 pub(crate) async fn pending_real_time_among<T, G>(guest: &mut G, candidates: KernelSigset) -> u64
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let candidates = candidates & REAL_TIME_SIGNALS;
@@ -6650,7 +6647,7 @@ pub(crate) async fn act_on_pending_real_time<T, G>(
     observable: KernelSigset,
     discarded: KernelSigset,
 ) where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let observed = pending & observable;
@@ -6675,7 +6672,7 @@ pub(crate) async fn act_on_pending_real_time<T, G>(
 /// only when one is pending.
 pub(crate) async fn observe_under_mask<T, G>(guest: &mut G, mask: KernelSigset) -> Result<(), Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let pending = pending_real_time_among(guest, !mask).await;
@@ -6922,7 +6919,7 @@ impl KernelSignalWait {
         restart_errno: Errno,
     ) -> Self
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         Self {
@@ -6971,7 +6968,7 @@ impl KernelSignalWait {
     /// commits it to the thread in that turn (`admit`).
     pub(crate) fn for_select<T, G>(guest: &G) -> Self
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         Self {
@@ -7078,7 +7075,7 @@ impl KernelSignalWait {
         published: &mut PublishedWaitMask,
     ) -> Result<KernelSigset, Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         if (committed | recorded) & !host_timed == 0 {
@@ -7121,7 +7118,7 @@ impl KernelSignalWait {
     /// the wait mask when it has one (`could_interrupt`). Read from the kernel's state in this turn.
     pub(crate) fn observable_now<T, G>(&self, guest: &G) -> Result<KernelSigset, Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         let state = crate::syscalls::read_guest_group_wait_signal_state(guest)?;
@@ -7164,7 +7161,7 @@ impl KernelSignalWait {
         guest: &G,
     ) -> Result<(bool, KernelSignalState), Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         Ok(self.interrupted_in(crate::syscalls::read_guest_group_wait_signal_state(guest)?))
@@ -7274,7 +7271,7 @@ impl KernelSignalWait {
         call: S,
     ) -> Result<Result<i64, Errno>, Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
         S: SyscallInfo,
     {
@@ -7312,7 +7309,7 @@ impl KernelSignalWait {
         call: S,
     ) -> Result<Result<i64, Errno>, Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
         S: SyscallInfo,
     {
@@ -7353,7 +7350,7 @@ impl KernelSignalWait {
         state: KernelSignalState,
     ) -> Result<Result<i64, Errno>, Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
         S: SyscallInfo,
     {
@@ -7373,7 +7370,7 @@ impl KernelSignalWait {
         first_probe: bool,
     ) -> Result<Result<i64, Errno>, Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
         S: SyscallInfo,
     {
@@ -7651,7 +7648,7 @@ impl KernelSignalWait {
         scratch: Option<AddrMut<'a, KernelSigset>>,
     ) -> Result<(), Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         let guest_mask = crate::syscalls::read_guest_group_wait_signal_state(guest)?.blocked;
@@ -7724,7 +7721,7 @@ impl KernelSignalWait {
         host_timed: KernelSigset,
     ) -> Result<bool, Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         // As `install_turn_mask` does for `writev`: the signals a host-timed
@@ -7784,7 +7781,7 @@ impl KernelSignalWait {
     /// mask is fatal without any further speculative restoration.
     async fn release_probe_mask_in_place<T, G>(&mut self, guest: &mut G) -> Result<(), Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         let Some(guest_mask) = self.saved_mask else {
@@ -7850,7 +7847,7 @@ impl KernelSignalWait {
         scratch: Option<AddrMut<'a, KernelSigset>>,
     ) -> Result<(), Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         let Some(guest_mask) = self.saved_mask else {
@@ -7900,7 +7897,7 @@ impl KernelSignalWait {
         scratch: Option<AddrMut<'a, KernelSigset>>,
     ) -> Result<(), Error>
     where
-        T: RecordOrReplay,
+        T: RunMode,
         G: Guest<Detcore<T>>,
     {
         // Under the all-blocked mask only a signal that cannot be blocked (SIGKILL,
@@ -8056,7 +8053,7 @@ async fn inject_signal_mask<'a, T, G>(
     scratch: Option<AddrMut<'a, KernelSigset>>,
 ) -> Result<(), Errno>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     match scratch {
@@ -8125,7 +8122,7 @@ pub(crate) fn probe_was_interrupted_by_signal(errno: Errno) -> bool {
 pub(crate) async fn record_retry_event<G, C, T>(guest: &mut G, call: C)
 where
     C: SyscallInfo,
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let dettid = guest.thread_state().dettid;
@@ -8147,7 +8144,7 @@ where
 pub fn with_guest_time<G, T>(guest: &G, event: SchedEvent) -> SchedEvent
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let dettime = &guest.thread_state().thread_logical_time;
     event.with_dettime(dettime)
@@ -8157,7 +8154,7 @@ where
 pub async fn with_guest_rip<G, T>(guest: &mut G, mut event: SchedEvent) -> SchedEvent
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     assert!(event.end_rip.is_none());
 
@@ -8170,7 +8167,7 @@ where
 
 // Convert to absolute logical time point for the timeout.
 // 0 duration means no timeout, and this will return None.
-pub async fn millis_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+pub async fn millis_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     timeout_millis: i32,
 ) -> Option<LogicalTime> {
@@ -8195,7 +8192,7 @@ fn positive_millis_as_nanos(timeout_millis: i32) -> Option<u128> {
 
 // Convert to absolute logical time point for the timeout.
 // 0 duration means no timeout, and this will return None.
-pub async fn nanos_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+pub async fn nanos_duration_to_absolute_timeout<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     timeout_nanos: u128,
 ) -> Option<LogicalTime> {
@@ -9287,7 +9284,7 @@ pub(crate) mod kernel_signal_wait_failures {
 
     struct WaitGuest {
         config: Config,
-        thread: ThreadState<()>,
+        thread: ThreadState<crate::SeededMode>,
         pid: Pid,
         tid: Pid,
         commit_fails: bool,
@@ -9303,7 +9300,7 @@ pub(crate) mod kernel_signal_wait_failures {
         /// installed.
         fn new(tid: Pid, mask: KernelSigset) -> (Self, Kernel) {
             let config = Config::default();
-            let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
+            let thread = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ());
             let kernel = Arc::new(Mutex::new(FakeKernel {
                 blocked: mask,
                 ..FakeKernel::default()
@@ -10219,10 +10216,10 @@ pub(crate) mod kernel_signal_wait_failures {
                 kernel.caught,
             ))
         }
-        fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
             &mut self.thread
         }
-        fn thread_state(&self) -> &ThreadState<()> {
+        fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
             &self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -13814,15 +13811,18 @@ mod backend_refusal_tests {
     /// refused with `refusal`.
     fn fail_closed(
         refusal: Option<reverie::UnsupportedRefusal>,
-    ) -> (Detcore<NoopTool>, InjectGuest<NoopTool>) {
+    ) -> (
+        Detcore<crate::SeededMode>,
+        InjectGuest<crate::SeededMode<NoopTool>>,
+    ) {
         let config = Config {
             panic_on_unsupported_syscalls: true,
             exit_on_unsupported_syscall: true,
             shutdown_on_unsupported_syscall: false,
             ..Config::default()
         };
-        let tool = <Detcore<NoopTool> as Tool>::new(Pid::from_raw(4242), &config);
-        let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+        let tool = <Detcore<crate::SeededMode> as Tool>::new(Pid::from_raw(4242), &config);
+        let mut guest = InjectGuest::<crate::SeededMode>::new(Ok(0));
         guest.config = config;
         if let Some(refusal) = refusal {
             guest = guest.with_refusal(refusal);

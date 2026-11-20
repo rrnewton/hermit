@@ -57,10 +57,10 @@ impl Guest<Detcore> for LegacyDeadlineGuest<'_> {
     fn memory(&self) -> Self::Memory {
         self.inner.memory()
     }
-    fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+    fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
         &mut self.inner.thread
     }
-    fn thread_state(&self) -> &crate::ThreadState<()> {
+    fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
         &self.inner.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
@@ -122,7 +122,7 @@ async fn legacy_history_same_time_timer_checkin_has_distinct_pre_and_post_expiry
     assert!(config.use_preemption_timer());
     let (config, state, tid, process) = cancellation_test_state_with_config(config);
     install_test_registration(&state, tid, Ivar::new());
-    let mut thread = crate::ThreadState::new(tid, &config, ());
+    let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
     thread.detpid = Some(process);
     let start = thread.thread_logical_time.as_nanos();
     thread.next_timeslice(&config);
@@ -243,7 +243,7 @@ async fn legacy_callback_close_trial(
         .as_mut()
         .unwrap()
         .register_thread(tid, DEFAULT_PRIORITY);
-    let mut thread = crate::ThreadState::new(tid, &config, ());
+    let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
     thread.detpid = Some(process);
     thread.next_timeslice(&config);
     if input.is_none() {
@@ -639,7 +639,7 @@ async fn legacy_callback_history_restores_actual_progress_after_same_leader_relo
                     && startup.checkpoints == loaded_points
                     && matches!(
                         response.as_ref(),
-                        GlobalResponse::StartNewThread(None, None)
+                        GlobalResponse::StartNewThread(None, None, None)
                     )
             });
             assert_eq!(
@@ -717,7 +717,7 @@ async fn legacy_callback_history_old_chaos_replay_record_flags_make_no_authority
     config = crate::clock_identity::test_sources::qualified(config);
     config.validate();
     let (config, state, tid, process) = cancellation_test_state_with_config(config);
-    let mut thread = crate::ThreadState::new(tid, &config, ());
+    let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
     thread.detpid = Some(process);
     let mut guest = ExternalRegistrationGuest {
         global: &state,
@@ -766,7 +766,7 @@ async fn legacy_callback_branch_deadline_trial(annotated: bool, owner_switch: bo
     .with_backend(|backend| backend.delivers_preemption_timer_events = true);
     config = crate::clock_identity::test_sources::qualified(config);
     config.validate();
-    let start = crate::ThreadState::new(tid, &config, ())
+    let start = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ())
         .thread_logical_time
         .as_nanos();
     let at = start + Duration::from_nanos(100);
@@ -806,7 +806,7 @@ async fn legacy_callback_branch_deadline_trial(annotated: bool, owner_switch: bo
     state
         .past_first_execve
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let mut thread = crate::ThreadState::new(tid, &config, ());
+    let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
     thread.detpid = Some(process);
     thread.past_global_first_execve = true;
     thread.next_timeslice(&config);
@@ -862,7 +862,7 @@ async fn legacy_callback_branch_deadline_trial(annotated: bool, owner_switch: bo
                 .thread_tree
                 .add_child(tid, peer, false);
             install_test_registration(&state, peer, Ivar::new());
-            let mut peer_thread = crate::ThreadState::new(peer, &config, ());
+            let mut peer_thread = crate::ThreadState::<crate::SeededMode>::new(peer, &config, ());
             peer_thread.detpid = Some(process);
             let mut peer_guest = ExternalRegistrationGuest {
                 global: &state,
@@ -1121,7 +1121,7 @@ async fn legacy_callback_expired_deadline_trial_recording_at(
     }
     config = crate::clock_identity::test_sources::qualified(config);
     config.validate();
-    let start = crate::ThreadState::new(tid, &config, ())
+    let start = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ())
         .thread_logical_time
         .as_nanos();
     let at = start + Duration::from_nanos(110);
@@ -1177,7 +1177,7 @@ async fn legacy_callback_expired_deadline_trial_recording_at(
     state
         .past_first_execve
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let mut thread = crate::ThreadState::new(tid, &config, ());
+    let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
     thread.detpid = Some(process);
     thread.past_global_first_execve = true;
     thread.next_timeslice(&config);
@@ -1253,7 +1253,7 @@ async fn legacy_callback_expired_deadline_trial_recording_at(
                     .resources
                     .contains_key(&ResourceID::TraceReplay)
             );
-            let mut peer_thread = crate::ThreadState::new(peer, &config, ());
+            let mut peer_thread = crate::ThreadState::<crate::SeededMode>::new(peer, &config, ());
             peer_thread.detpid = Some(process);
             let mut peer_guest = ExternalRegistrationGuest {
                 global: &state,
@@ -1469,7 +1469,7 @@ async fn an_instruction_offset_slice_is_armed_recorded_and_replayed_alike() {
         .as_mut()
         .unwrap()
         .register_thread(tid, DEFAULT_PRIORITY);
-    let mut thread = crate::ThreadState::new(tid, &config, ());
+    let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
     thread.detpid = Some(process);
     thread.next_timeslice(&config);
     let steps = thread.slice_instruction_offset;
@@ -1595,7 +1595,7 @@ async fn an_instruction_offset_slice_is_armed_recorded_and_replayed_alike() {
     replay.validate();
     let (replay, state, tid, process) = cancellation_test_state_with_config(replay);
     install_test_registration(&state, tid, Ivar::new());
-    let mut thread = crate::ThreadState::new(tid, &replay, ());
+    let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &replay, ());
     thread.detpid = Some(process);
     thread.preemption_points = Some(history.into_iter());
     thread.next_timeslice(&replay);
@@ -1659,7 +1659,7 @@ async fn an_instruction_offset_slice_is_armed_recorded_and_replayed_alike() {
         .as_mut()
         .unwrap()
         .register_thread(tid, DEFAULT_PRIORITY);
-    let mut thread = crate::ThreadState::new(tid, &off, ());
+    let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &off, ());
     thread.detpid = Some(process);
     thread.next_timeslice(&off);
     assert_eq!(thread.slice_instruction_offset, 0);
@@ -1768,7 +1768,7 @@ async fn a_schedule_replay_arms_a_recorded_instruction_offset() {
         state
             .past_first_execve
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let mut thread = crate::ThreadState::new(tid, &config, ());
+        let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
         thread.detpid = Some(process);
         thread.past_global_first_execve = true;
         thread.next_timeslice(&config);
@@ -1901,7 +1901,7 @@ async fn legacy_chaos_replay_ends_an_expired_deadline_as_without_chaos() {
 fn schedule_replay_guest<'a>(
     state: &'a GlobalState,
     config: &'a Config,
-    thread: crate::ThreadState<()>,
+    thread: crate::ThreadState<crate::SeededMode>,
     reported_rcbs: u64,
 ) -> LegacyDeadlineGuest<'a> {
     LegacyDeadlineGuest {
@@ -1931,7 +1931,7 @@ fn schedule_replay_thread(
     config: Config,
     events: &[SchedEvent],
     more: impl FnOnce(&mut crate::preemptions::PreemptionWriter),
-) -> (Config, GlobalState, crate::ThreadState<()>) {
+) -> (Config, GlobalState, crate::ThreadState<crate::SeededMode>) {
     let mut writer = crate::preemptions::PreemptionWriter::new(None)
         .with_identity(crate::clock_identity::test_sources::known());
     let tid = DetTid::from_raw(17);
@@ -1947,7 +1947,7 @@ fn schedule_replay_thread(
     state
         .past_first_execve
         .store(true, std::sync::atomic::Ordering::SeqCst);
-    let mut thread = crate::ThreadState::new(tid, &config, ());
+    let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
     thread.detpid = Some(process);
     thread.past_global_first_execve = true;
     thread.next_timeslice(&config);
@@ -2132,7 +2132,7 @@ async fn a_replayed_checkpoint_that_keeps_the_slice_restarts_its_backstop() {
         }
         .with_backend(|backend| backend.delivers_preemption_timer_events = true);
         config.validate();
-        let start = crate::ThreadState::new(tid, &config, ())
+        let start = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ())
             .thread_logical_time
             .as_nanos();
         let at = start + Duration::from_nanos(110);
@@ -2289,7 +2289,7 @@ async fn a_replayed_callback_slice_end_refreshes_its_slowdown_epoch_without_repl
             } else {
                 RcbTimeMultiplier::ONE
             };
-            let mut clock = crate::ThreadState::new(tid, &config, ()).thread_logical_time;
+            let mut clock = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ()).thread_logical_time;
             let rcbs = if logical_slice { 1_100 } else { 0 };
             if logical_slice {
                 clock.add_rcbs_with_multiplier(rcbs, initial_factor);
@@ -2348,7 +2348,7 @@ async fn a_replayed_callback_slice_end_refreshes_its_slowdown_epoch_without_repl
             state
                 .past_first_execve
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            let mut thread = crate::ThreadState::new(tid, &config, ());
+            let mut thread = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ());
             thread.detpid = Some(process);
             thread.past_global_first_execve = true;
             thread.next_timeslice(&config);
@@ -2545,7 +2545,7 @@ async fn a_post_crash_checkpoint_restarts_at_the_effective_bound() {
             backend.kernel_signal_state_is_guests = true;
         });
         config.validate();
-        let start = crate::ThreadState::new(tid, &config, ())
+        let start = crate::ThreadState::<crate::SeededMode>::new(tid, &config, ())
             .thread_logical_time
             .as_nanos();
         let at = start + Duration::from_nanos(110);

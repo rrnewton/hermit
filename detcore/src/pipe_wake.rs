@@ -158,7 +158,7 @@ pub(crate) fn progress_of(
     }
 }
 
-impl<T: crate::record_or_replay::RecordOrReplay> crate::Detcore<T> {
+impl<T: crate::run_mode::RunMode> crate::Detcore<T> {
     /// The channel end behind the guest descriptor `fd`, when
     /// `--pipe-wake-latency` is in effect and Detcore knows it.
     pub(crate) fn pipe_channel_end<G: reverie::Guest<Self>>(

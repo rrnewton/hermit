@@ -80,10 +80,10 @@ use crate::procfs::locks::FlockPoll;
 use crate::procfs::locks::FlockRequest;
 use crate::procfs::locks::WAITER_DESCRIPTOR_GONE_REFUSAL;
 use crate::procfs_inode;
-use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::run_mode::RunMode;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::types::DetPid;
 use crate::types::OpenFileId;
@@ -280,7 +280,7 @@ pub(crate) enum FlockRoute {
 /// is never made nonblocking.
 #[async_trait]
 impl NonblockableSyscall for syscalls::Flock {
-    async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    async fn into_nonblocking<T: RunMode, G: Guest<Detcore<T>>>(
         self,
         _guest: &mut G,
     ) -> (Self, Option<<G::Stack as Stack>::StackGuard>) {
@@ -292,7 +292,7 @@ impl NonblockableSyscall for syscalls::Flock {
     }
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Whether this backend's guest descriptors are host descriptions with
     /// the guest's own lifetime, on which Detcore mirrors its decisions and
     /// the kernel can decide a file the model leaves: wherever guest threads

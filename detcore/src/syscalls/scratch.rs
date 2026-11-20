@@ -22,7 +22,7 @@ use reverie::syscalls::Syscall;
 use tracing::info;
 use tracing::warn;
 
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::tool_local::Detcore;
 
 /// Inject the syscall that `call` makes for a buffer of `N` bytes holding
@@ -47,7 +47,7 @@ pub(crate) async fn inject_with_scratch<G, T, const N: usize>(
 ) -> Result<(i64, [u8; N]), Errno>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (result, bytes) = inject_with_scratch_reporting(guest, initial, call).await?;
     Ok((result?, bytes))
@@ -90,7 +90,7 @@ async fn on_stack<G, T, const N: usize>(
 ) -> Result<(Result<i64, Errno>, [u8; N]), Errno>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let mut stack = guest.stack().await;
     let buffer = stack.reserve::<[u8; N]>().cast::<u8>();
@@ -124,7 +124,7 @@ async fn in_transient_page<G, T, const N: usize>(
 ) -> Result<(Result<i64, Errno>, [u8; N]), Errno>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let mapped = guest
         .inject_with_retry(Syscall::Mmap(
@@ -168,7 +168,7 @@ async fn run<G, T, const N: usize>(
 ) -> Result<(Result<i64, Errno>, [u8; N]), Errno>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     guest.memory().write_exact(buffer, initial)?;
     let result = match guest.inject_with_retry(call(buffer)).await {

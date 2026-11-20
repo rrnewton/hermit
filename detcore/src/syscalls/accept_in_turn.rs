@@ -42,10 +42,10 @@ use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 
 use crate::fd::ReceiveTimeout;
-use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::run_mode::RunMode;
 use crate::syscalls::helpers::record_retry_event;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::resource_request;
@@ -298,7 +298,7 @@ impl Drop for AcceptWait {
     }
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Run the guest's `accept4` on a listener eligible for accept in turn
     /// (`DetFd::is_accept_in_turn_listener`).
     ///

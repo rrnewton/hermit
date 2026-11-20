@@ -96,7 +96,7 @@ unsafe impl NativeSuccessorConsumer<detcore::Detcore> for Consumer {
         config: &detcore::Config,
         state: &VerifiedSuccessorState,
         binding: SuccessorBinding,
-    ) -> io::Result<(detcore::Detcore, detcore::ThreadState<()>)> {
+    ) -> io::Result<(detcore::Detcore, detcore::ThreadState<detcore::SeededMode>)> {
         if binding != self.admitted || self.stats.is_some() || self.restored {
             return Err(refusal("native successor decode binding or phase differs"));
         }

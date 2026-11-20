@@ -829,6 +829,76 @@ backend; the others refuse them), and conflict with an explicit
 nanoseconds (one RCB at the default clock multiplier), and MIN no larger than
 MAX.
 
+#### Choice points for an external controller (experimental)
+
+Under `--chaos`, Detcore draws a thread's timeslice length, a thread's
+priority at a redraw, and a new thread's or process's starting priority
+(a vfork child's included) from its seeded streams. Each of these draws is a
+*choice point*, which an external search tool, such as a fuzzer, can answer
+instead:
+
+```bash
+hermit run --chaos --sched-seed=0 --choice-tape=tape.bin --choice-record=choices.jsonl -- PROGRAM
+hermit run --chaos --sched-seed=0 --choice-controller=/path/to/socket -- PROGRAM
+```
+
+- `--choice-tape FILE` answers from a byte tape, one byte per choice in run
+  order. Byte 0, or the end of the tape, takes the value the seeded run would
+  use, so an empty tape is the ordinary `--chaos --sched-seed` run. (One
+  exception: a seeded slice longer than 2^32-1 RCBs, about 43 virtual
+  seconds, is cut to that length. That happens only when the mean slice, by
+  default `--max-timeslice`, is several virtual seconds or more.) A slice
+  byte `b` picks the mean slice times 2^((b-128)/16), rounded half up and
+  computed in fixed point, so it is the same on every host; a priority byte
+  spreads 255 levels over the priority range. A fuzzer can mutate the tape like
+  any other input.
+- `--choice-controller SOCKET` connects to a controller listening on a Unix
+  stream socket, sends one JSON line per choice point, and reads one line per
+  answer: `{"i":N,"v":V}`, `{"i":N,"default":true}` or
+  `{"i":N,"refuse":"reason"}`, exactly one of the three. A refusal, and any
+  other reply (two answers in one, a wrong type, another index, a value
+  outside `[lo, hi]`, any other key, such as a `"capture"` command, which is
+  named), stops the run as a policy refusal
+  (exit 122, `class=policy-refusal`), names the choice on stderr
+  (`HERMIT_CHOICE_REFUSED: choice N: ...`) and ends the record with the refused
+  request and its `"refused"` reason, which locates the first divergence of a
+  replay to one choice.
+- `--choice-record FILE` writes every choice request and the answer used, one
+  JSON line each. Under `--verify` the file holds the choices of the last of
+  the two runs.
+
+Every request line is
+`{"schema":1,"i":N,"kind":K,"lo":L,"hi":H,"default":D,"scale":S,"ctx":{"dtid":T,"thread_rcbs":R,"site":W}}`.
+`kind` is `sched.slice` (RCBs) or `sched.priority`, and `default` is the value
+the seeded run would use. `site` names the draw: `chaos_slice`, `priority` (a
+redraw), `child_priority` (a new thread or process) or `vfork_child_priority`;
+`dtid` is the thread that drew, which for a child's starting priority is its
+parent. A record line adds `"v":V`. The same tape or the same controller
+answers give the same run; the run stays deterministic and can be verified at
+L2 (`--verify --verify-strict`). Hermit waits for a controller's answer without
+a deadline, so bound the run from outside.
+
+To reproduce a run, keep a record of its choices. A tape run is reproduced by
+its command line and its tape. A controller run is only as reproducible as the
+controller, unless you keep one of two records: run with `--choice-record`
+and answer a rerun from it (a controller that replies to request `i` with the
+record's `"v"`), or run with `--record-preemptions-to FILE` and rerun with
+`--replay-preemptions-from FILE` and no choice options. The run manifest does
+neither: it names the controller's socket path, not its answers, so `hermit
+run --from` does not reproduce a controller run.
+
+Timeslice choices need the preemption timer. Without it (no usable performance
+counters, or `--max-timeslice=disabled`) the run has priority choices only, and
+Hermit warns so by name.
+
+Not every chaos draw is a choice point yet: the wake thresholds of
+`--chaos-timed-wait-spread`, the per-thread mean of `--chaos-timeslice-range`
+and `--chaos-instruction-offset` still come from the seed alone. The options
+need `--chaos`, and conflict with each other, with `--replay-preemptions-from`
+and `--replay-schedule-from`, and with `--chaos-target-races` (which sets a new
+thread's priority itself). They have been tested on the ptrace backend, and the
+other backends refuse them.
+
 ### Verify Mode
 
 Verification is an option to `run`, not a separate top-level command:

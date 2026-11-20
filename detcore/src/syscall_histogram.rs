@@ -38,12 +38,12 @@ use reverie::syscalls::Errno;
 use reverie::syscalls::Sysno;
 
 use crate::Detcore;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 
 /// Record that a Detcore refusal policy answered the current syscall.
 pub(crate) fn mark_refused<T, G>(guest: &mut G)
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     guest.thread_state_mut().stats.syscall_refused = true;
@@ -78,7 +78,7 @@ pub(crate) fn finish<T, G>(
     result: &Result<i64, Error>,
     injected_at_entry: Option<u64>,
 ) where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let injected_now = guest.injected_syscalls();
@@ -102,7 +102,7 @@ pub(crate) fn finish_raw<T, G>(
     result: &Result<i64, Error>,
     injected_at_entry: Option<u64>,
 ) where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let injected_now = guest.injected_syscalls();

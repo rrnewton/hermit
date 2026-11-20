@@ -44,11 +44,11 @@ use tracing::trace;
 
 use crate::config::SchedHeuristic;
 use crate::fd::FdType;
-use crate::record_or_replay::RecordOrReplay;
 use crate::resources::LOOPBACK_POLL_YIELD_FYI;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::run_mode::RunMode;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::syscalls::files::SocketRole;
 use crate::syscalls::helpers::GuestHeldPollProof;
@@ -253,7 +253,7 @@ impl<Guard> StagedCells<Guard> {
     fn release<G, T>(self, guest: &mut G)
     where
         G: Guest<Detcore<T>>,
-        T: RecordOrReplay,
+        T: RunMode,
     {
         if let StagedCellsStorage::RedZone { at, len, saved } = self.storage
             && let Err(errno) = AddrMut::<u8>::from_raw(at)
@@ -297,7 +297,7 @@ async fn stage_private_cells<G, T>(
 ) -> Result<Option<StagedCells<<G::Stack as Stack>::StackGuard>>, Errno>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let len = cells.len();
     let mut stack = guest.stack().await;
@@ -387,7 +387,7 @@ async fn entry_pselect6_temporary_mask<G, T>(
 ) -> Result<Option<KernelSigset>, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let Some(wrapper) = call.sigmask() else {
         return Ok(None);
@@ -421,7 +421,7 @@ where
 fn pselect6_names_no_mask<G, T>(guest: &mut G, call: syscalls::Pselect6) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let Some(wrapper) = call.sigmask() else {
         return true;
@@ -442,7 +442,7 @@ fn read_pselect6_argument<G, T>(
 ) -> Option<Pselect6SigmaskArg>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let mut bytes = [0u8; std::mem::size_of::<Pselect6SigmaskArg>()];
     guest
@@ -472,7 +472,7 @@ fn replayed_pselect6_temporary_mask<G, T>(
 ) -> Option<KernelSigset>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let wrapper = call.sigmask()?;
     let argument: Pselect6SigmaskArg = guest.memory().read_value(wrapper.cast()).ok()?;
@@ -501,7 +501,7 @@ where
 async fn replayed_pselect6_delivery_fits<G, T>(guest: &mut G, call: syscalls::Pselect6) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let Some(wrapper) = call.sigmask() else {
         return true;
@@ -552,7 +552,7 @@ async fn end_replayed_pselect6_under_its_temporary_mask<G, T>(
     temporary_mask: KernelSigset,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let Ok(state) = crate::syscalls::read_guest_thread_signal_state(guest) else {
         return;
@@ -593,7 +593,7 @@ async fn end_replayed_pselect6_under_its_temporary_mask<G, T>(
 async fn inject_signal_delivery<G, T>(guest: &mut G, mask: usize, zero_timeout: usize)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let _ = guest
         .inject(
@@ -644,7 +644,7 @@ fn pselect6_probe_result(result: Result<i64, Errno>) -> Result<i64, Errno> {
 async fn inject_ppoll_probe<G, T>(guest: &mut G, probe: syscalls::Ppoll) -> Result<i64, Errno>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     loop {
         let result = guest.inject(probe).await;
@@ -678,7 +678,7 @@ fn ignored_signals_let_in(sets: &reverie::SignalSets, mask: KernelSigset) -> Opt
 fn ignored_signals_let_in_now<G, T>(guest: &G, mask: KernelSigset) -> Option<KernelSigset>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     guest
         .signal_sets(guest.tid())
@@ -772,7 +772,7 @@ fn masked_pselect6_refusal_reason_now<G, T>(
 ) -> &'static str
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     masked_pselect6_refusal_reason(guest.signal_sets(guest.tid()).ok().as_ref(), mask, nfds)
 }
@@ -783,7 +783,7 @@ pub(super) fn read_pselect6_fd_set<T, G>(
     len: usize,
 ) -> Result<Option<Vec<u8>>, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let Some(address) = address else {
@@ -805,7 +805,7 @@ pub(super) fn write_pselect6_fd_set<T, G>(
     bytes: &Option<Vec<u8>>,
 ) -> Result<(), Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if let (Some(address), Some(bytes)) = (address, bytes)
@@ -826,7 +826,7 @@ fn copy_pselect6_fd_set<T, G>(
     len: usize,
 ) -> Result<(), Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if let (Some(source), Some(destination)) = (source, destination)
@@ -893,7 +893,7 @@ fn check_recvmmsg_call<M: MemoryAccess>(
 /// probe. `LogicalTime + Duration` saturates, where a nanosecond count cast to
 /// u64 would wrap a 2^64 ns timeout to none at all (Claude review of
 /// https://github.com/rrnewton/hermit/pull/4235).
-async fn ppoll_start<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+async fn ppoll_start<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     timeout: Option<Duration>,
 ) -> (Option<LogicalTime>, Option<LogicalTime>) {
@@ -910,7 +910,7 @@ async fn ppoll_start<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 /// EINVAL for a size the kernel rejects. `first` says the read is the call's
 /// first injection, so a signal that stops it restarts the call
 /// (`restart_if_first_probe_not_run`).
-async fn read_ppoll_mask<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+async fn read_ppoll_mask<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     call: syscalls::Ppoll,
     first: bool,
@@ -1122,7 +1122,7 @@ fn canonicalize_written_timestamps(
 /// the receive's.
 fn written_control_length<T, G>(guest: &G, header: usize) -> usize
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     Addr::<usize>::from_raw(header + std::mem::offset_of!(Msghdr, msg_controllen))
@@ -1449,7 +1449,7 @@ fn remaining_poll_millis(now: Instant, end: Instant) -> i32 {
     i32::try_from(left.div_ceil(1_000_000)).unwrap_or(i32::MAX)
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// poll syscall (MAYHANG)
     ///
     /// `restart` is the record the thread's previous syscall kept for its
@@ -5507,7 +5507,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 /// send passes out of the guest.
 fn clear_guest_created<T, G>(guest: &G, sent: &[RawFd])
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     for &fd in sent {
@@ -5527,7 +5527,7 @@ where
 /// a `msg_len` may cover.
 fn msg_len_may_overwrite_control<T, G>(guest: &G, sent: &[usize], read_back: &[usize]) -> bool
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let mut controls = Vec::with_capacity(read_back.len());
@@ -5555,7 +5555,7 @@ where
 /// data names `SCM_RIGHTS` descriptors, or is too long to read here.
 fn uncounted_entry_may_carry_rights<T, G>(guest: &G, header: usize) -> bool
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let Some(message) = Addr::<Msghdr>::from_raw(header)
@@ -5592,7 +5592,7 @@ fn sent_rights<T, G>(
     sent_bytes: impl Fn(usize) -> usize,
 ) -> SentRights
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let mut rights = SentRights::default();
@@ -5617,7 +5617,7 @@ where
 /// (`Detcore::note_peer_gone`).
 fn sends_to_a_name<T, G>(guest: &G, headers: &[usize]) -> bool
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     headers.first().is_none_or(|&header| {
@@ -5683,7 +5683,7 @@ fn send_headers(call: Syscall) -> Option<(RawFd, Vec<usize>)> {
 /// Never true for one message (`sendmsg`, or a one-entry batch).
 pub(crate) fn batch_results_may_feed_control<T, G>(guest: &G, headers: &[usize]) -> bool
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     // Every entry but the last writes a result a later entry may read; every
@@ -5719,7 +5719,7 @@ where
 /// buffer (`____sys_sendmsg` copies `msg_controllen` bytes).
 fn reads_control_data<T, G>(guest: &G, header: usize) -> bool
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     Addr::<Msghdr>::from_raw(header)
@@ -5748,7 +5748,7 @@ pub(crate) fn tool_runs_in_guest_process(backend: &reverie::BackendCapabilities)
 /// the list may be incomplete (`mark_exported_listeners`).
 pub(crate) fn sent_descriptors<T, G>(guest: &G, headers: &[usize]) -> (Vec<RawFd>, bool)
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let mut sent: Vec<RawFd> = Vec::new();
@@ -5784,7 +5784,7 @@ where
     (sent, unread)
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Sends a message batch and invalidates process-wide flock knowledge when the
     /// kernel reports at least one message sent. This intentionally includes
     /// descriptors named only by an unsent tail message: the mutable guest array is

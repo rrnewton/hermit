@@ -1575,6 +1575,9 @@ fn record_or_replay_config_with_timer_support(
         strict_schedule_boundaries: false,
         record_preemptions: false,
         record_preemptions_to: None,
+        choice_tape: None,
+        choice_controller: None,
+        choice_record: None,
         replay_preemptions_from: None,
         replay_schedule_from: None,
         replay_exhausted_panic: false,
@@ -1962,8 +1965,14 @@ mod tests {
     #[test]
     fn record_and_replay_subscribe_every_determinized_syscall() {
         let config = record_or_replay_config(Path::new("replay-data"));
-        let record = <detcore::Detcore<hermit_record::Recorder> as Tool>::subscriptions(&config);
-        let replay = <detcore::Detcore<hermit_replay::Replayer> as Tool>::subscriptions(&config);
+        let record =
+            <detcore::Detcore<detcore::SeededMode<hermit_record::Recorder>> as Tool>::subscriptions(
+                &config,
+            );
+        let replay =
+            <detcore::Detcore<detcore::SeededMode<hermit_replay::Replayer>> as Tool>::subscriptions(
+                &config,
+            );
 
         for (phase, subscriptions) in [("record", record), ("replay", replay)] {
             let delivered = subscriptions.iter_syscalls().collect::<Vec<_>>();

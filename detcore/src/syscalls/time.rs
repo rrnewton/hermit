@@ -34,12 +34,11 @@ use crate::cpu_clock::ClockIdClass;
 use crate::cpu_clock::ClockLookup;
 use crate::cpu_clock::ClockTask;
 use crate::detlog;
-use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::run_mode::RunMode;
 use crate::scheduler::Priority;
-use crate::scheduler::entropy_to_priority;
 use crate::tool_global::PosixTimerNotification;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::SigalrmControl;
@@ -185,7 +184,7 @@ fn deterministic_timex(now: Timespec) -> libc::timex {
 pub(crate) async fn guest_clock_time<G, T>(guest: &mut G) -> LogicalTime
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let raw = thread_observe_time(guest).await;
     guest.thread_state().observe_guest_clock(raw)
@@ -436,7 +435,7 @@ fn snapshot_timeval_words<'a, G, T>(
 ) -> TimevalWordSnapshot
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     TIMEVAL_WORDS.map(|(field, offset)| {
         let addr = timeval_word_addr(field, tv_addr, offset).map_err(|_| Errno::EFAULT)?;
@@ -563,7 +562,7 @@ async fn overwrite_failed_gettimeofday_tv<'a, G, T>(
 ) -> Result<(), Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let values = [tv.tv_sec as libc::time_t, tv.tv_usec as libc::time_t];
     for (index, (field, offset)) in TIMEVAL_WORDS.into_iter().enumerate() {
@@ -612,7 +611,7 @@ async fn overwrite_failed_gettimeofday_tv<'a, G, T>(
 ) -> Result<(), Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     Err(tv_repair_error("tv", TvRepairFailureKind::NoStoreProbe))
 }
@@ -632,7 +631,7 @@ fn remaining_sleep_duration(target: LogicalTime, now: LogicalTime) -> Duration {
     }
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Convenience function for constructing a sleep request with a nanosecond offset from "now".
     /// A zero offset marks the request a zero-length sleep (`Resources::zero_length_sleep`).
     pub async fn sleep_request<G: Guest<Self>>(guest: &mut G, ns_delta: Duration) -> Resources {
@@ -670,8 +669,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         change_time: LogicalTime,
     ) -> Resources {
-        let entropy = guest.thread_state_mut().chaos_prng_next_u64("priority");
-        let new_priority = entropy_to_priority(entropy);
+        let new_priority = guest
+            .thread_state_mut()
+            .chaos_priority(crate::choice::ChoiceSite::Priority);
         Self::priority_changepoint_request(guest, change_time, new_priority)
     }
 
@@ -1636,7 +1636,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 /// The scheduler's remaining time (`None`: the caller's own answer stands)
 /// and overrun of the calling process's POSIX timer `id` at `now`, where it
 /// keeps them (`DiscardedSignalControl::TimerReadout`); `None` elsewhere.
-async fn posix_timer_readout<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+async fn posix_timer_readout<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &mut G,
     id: i32,
     now: LogicalTime,
@@ -1812,7 +1812,7 @@ mod tests {
                 tv_usec: 8,
             }));
             let tv_addr = tv as *mut Timeval as usize;
-            let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+            let mut guest = InjectGuest::<crate::SeededMode>::new(Ok(0));
             let virtual_tv = Timeval {
                 tv_sec: 1,
                 tv_usec: 2,
@@ -2095,13 +2095,13 @@ mod sleep_request_tests {
     /// from (`thread_observe_time`), answered with `now()`.
     struct ClockReader {
         config: Config,
-        thread: ThreadState<()>,
+        thread: ThreadState<crate::SeededMode>,
     }
 
     impl ClockReader {
         fn new() -> Self {
             let config = Config::default();
-            let mut thread = ThreadState::new(THREAD, &config, ());
+            let mut thread = ThreadState::<crate::SeededMode>::new(THREAD, &config, ());
             thread.detpid = Some(THREAD);
             Self { config, thread }
         }
@@ -2167,10 +2167,10 @@ mod sleep_request_tests {
         fn memory(&self) -> Self::Memory {
             panic!("building a sleep request must not read guest memory")
         }
-        fn thread_state(&self) -> &ThreadState<()> {
+        fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
             &self.thread
         }
-        fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
             &mut self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {

@@ -17,7 +17,7 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::ioctl::Request;
 
 use crate::fd::FdType;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::tool_local::Detcore;
 use crate::types::LogicalTime;
 
@@ -67,7 +67,7 @@ fn logical_timespec(now: LogicalTime) -> libc::timespec {
     }
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-912)
     /// Return the logical timestamp stored by the last successful socket receive.

@@ -891,56 +891,58 @@ fn timer_slack_virtual_state_is_isolated_from_physical_tracee_body() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let tracer =
-            reverie_ptrace::spawn_fn_with_config::<detcore::Detcore<PhysicalTimerSlackProbe>, _>(
-                move || unsafe {
-                    let bracket = &*bracket;
-                    assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), 50_000);
-                    assert_eq!(
-                        std::fs::read_to_string("/proc/self/timerslack_ns")
-                            .unwrap()
-                            .trim(),
-                        "50000"
-                    );
-                    bracket
-                        .physical_before
-                        .store(libc::prctl(libc::PR_GET_DUMPABLE), Ordering::Release);
-                    bracket.stage.store(1, Ordering::Release);
-                    while bracket.stage.load(Ordering::Acquire) != 2 {
-                        std::hint::spin_loop();
-                    }
-
-                    assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, VIRTUAL_REQUEST_NS), 0);
-                    assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), VIRTUAL_REQUEST_NS);
-                    assert_eq!(
-                        std::fs::read_to_string("/proc/self/timerslack_ns")
-                            .unwrap()
-                            .trim(),
-                        VIRTUAL_REQUEST_NS.to_string()
-                    );
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .open("/proc/self/timerslack_ns")
+        let tracer = reverie_ptrace::spawn_fn_with_config::<
+            detcore::Detcore<detcore::SeededMode<PhysicalTimerSlackProbe>>,
+            _,
+        >(
+            move || unsafe {
+                let bracket = &*bracket;
+                assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), 50_000);
+                assert_eq!(
+                    std::fs::read_to_string("/proc/self/timerslack_ns")
                         .unwrap()
-                        .write_all(b"888888888\n")
-                        .unwrap();
-                    assert_eq!(
-                        libc::prctl(libc::PR_GET_TIMERSLACK),
-                        VIRTUAL_PROC_REQUEST_NS
-                    );
-                    bracket
-                        .physical_after
-                        .store(libc::prctl(libc::PR_GET_DUMPABLE), Ordering::Release);
-                    bracket.stage.store(3, Ordering::Release);
-                    while bracket.stage.load(Ordering::Acquire) != 4 {
-                        std::hint::spin_loop();
-                    }
-                },
-                config,
-                true,
-            )
-            .await
-            .unwrap();
+                        .trim(),
+                    "50000"
+                );
+                bracket
+                    .physical_before
+                    .store(libc::prctl(libc::PR_GET_DUMPABLE), Ordering::Release);
+                bracket.stage.store(1, Ordering::Release);
+                while bracket.stage.load(Ordering::Acquire) != 2 {
+                    std::hint::spin_loop();
+                }
+
+                assert_eq!(libc::prctl(libc::PR_SET_TIMERSLACK, VIRTUAL_REQUEST_NS), 0);
+                assert_eq!(libc::prctl(libc::PR_GET_TIMERSLACK), VIRTUAL_REQUEST_NS);
+                assert_eq!(
+                    std::fs::read_to_string("/proc/self/timerslack_ns")
+                        .unwrap()
+                        .trim(),
+                    VIRTUAL_REQUEST_NS.to_string()
+                );
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open("/proc/self/timerslack_ns")
+                    .unwrap()
+                    .write_all(b"888888888\n")
+                    .unwrap();
+                assert_eq!(
+                    libc::prctl(libc::PR_GET_TIMERSLACK),
+                    VIRTUAL_PROC_REQUEST_NS
+                );
+                bracket
+                    .physical_after
+                    .store(libc::prctl(libc::PR_GET_DUMPABLE), Ordering::Release);
+                bracket.stage.store(3, Ordering::Release);
+                while bracket.stage.load(Ordering::Acquire) != 4 {
+                    std::hint::spin_loop();
+                }
+            },
+            config,
+            true,
+        )
+        .await
+        .unwrap();
         let bracket = unsafe { &*bracket };
 
         async fn await_stage(stage: &AtomicU8, expected: u8) {

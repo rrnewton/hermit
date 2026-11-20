@@ -1130,6 +1130,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hermit-run-choices"
+version = "0.5.7"
+dependencies = [
+ "hermit-detcore",
+ "reverie-core",
+ "reverie-ptrace",
+]
+
+[[package]]
 name = "hermit-run-kvm"
 version = "0.5.7"
 dependencies = [
@@ -1142,6 +1151,7 @@ name = "hermit-run-ptrace"
 version = "0.5.7"
 dependencies = [
  "hermit-detcore",
+ "hermit-run-choices",
  "reverie-core",
  "reverie-ptrace",
 ]

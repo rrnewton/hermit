@@ -171,7 +171,7 @@ use reverie::syscalls::Sysno;
 use reverie::syscalls::ioctl::Request;
 use tracing::warn;
 
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::tool_local::Detcore;
 use crate::types::RawFd;
 
@@ -765,7 +765,7 @@ fn past_count(taken: Option<usize>, length: usize) -> PastCount {
 async fn queued<G, T>(guest: &mut G, fd: RawFd) -> Option<usize>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (_, bytes) = crate::syscalls::scratch::inject_with_scratch(guest, [0_u8; 4], |base| {
         syscalls::Ioctl::new()
@@ -808,7 +808,7 @@ pub(crate) struct QueueCount {
 pub(crate) async fn begin_count<G, T, C>(guest: &mut G, fd: RawFd, call: C)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
     C: SyscallInfo + Into<Syscall> + crate::syscalls::helpers::NonblockableSyscall,
 {
     use crate::syscalls::helpers::IOAction;
@@ -839,7 +839,7 @@ where
 pub(crate) async fn count_before_attempt<G, T>(guest: &mut G, call: Syscall)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let Some(count) = guest.thread_state().inotify_queue else {
         return;
@@ -856,7 +856,7 @@ where
 pub(crate) fn end_count<G, T>(guest: &mut G) -> Option<usize>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     end_count_waiting(guest).0
 }
@@ -865,7 +865,7 @@ where
 fn end_count_waiting<G, T>(guest: &mut G) -> (Option<usize>, bool)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     guest
         .thread_state_mut()
@@ -889,7 +889,7 @@ async fn left_nothing_queued<G, T>(
 ) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if before.is_none() {
         return false;
@@ -904,7 +904,7 @@ fn took_all_and_only(before: Option<usize>, after: Option<usize>, length: usize)
     matches!((before, after), (Some(before), Some(0)) if before == length)
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// One read of the inotify descriptor `fd` into `destination` (`None`:
     /// iovecs Hermit could not read), as Detcore runs it: `call` is the
     /// guest's `read`, `readv` or `preadv2` (`sysno`), or one part of a
@@ -1158,7 +1158,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 async fn taken<G, T>(guest: &mut G, fd: RawFd, before: Option<usize>) -> Option<usize>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let before = before?;
     before.checked_sub(queued(guest, fd).await?)
@@ -1180,7 +1180,7 @@ pub(crate) async fn finish<G, T>(
 ) -> Result<i64, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let dettid = guest.thread_state().dettid;
     let returned = match &result {
@@ -1251,7 +1251,7 @@ async fn renumber_returned<G, T>(
     queued: Option<usize>,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let dettid = guest.thread_state().dettid;
     let next = destination.possibly_written(length);
@@ -1333,7 +1333,7 @@ async fn renumber_faulted<G, T>(
     taken: usize,
 ) where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let dettid = guest.thread_state().dettid;
     let copied = if guest.thread_state().may_use_protection_keys() {

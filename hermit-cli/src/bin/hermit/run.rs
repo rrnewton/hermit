@@ -9739,6 +9739,32 @@ fn chaos_timed_wait_spread_parses_round_trips_and_is_refused_where_inert() {
     );
 }
 
+/// The choice driver's sources are accepted on the ptrace backend and refused
+/// by name on the others.
+#[test]
+fn choice_sources_are_refused_off_ptrace() {
+    for source in ["--choice-tape=t", "--choice-controller=c"] {
+        let mut accepted = run_opts_for(&["hermit", "run", "--chaos", source, "fakeprog"]);
+        accepted
+            .validate_args_with_perf_support(true)
+            .unwrap_or_else(|error| panic!("{source} was refused: {error:#}"));
+        let option = source.split('=').next().unwrap();
+        for backend in ["--backend=liteinst", "--backend=kvm"] {
+            let argv = ["hermit", backend, "run", "--chaos", source, "fakeprog"];
+            let error = run_opts_for(&argv)
+                .validate_args_with_perf_support(true)
+                .err()
+                .unwrap_or_else(|| panic!("{argv:?} was accepted"));
+            assert!(
+                format!("{error:#}").contains(&format!(
+                    "{option} has been tested only on the ptrace backend"
+                )),
+                "{argv:?}: {error:#}"
+            );
+        }
+    }
+}
+
 /// A preemption replay of a record made under another
 /// `--chaos-timed-wait-spread`, or another scheduler seed than the one it
 /// names, is refused before launch with the values to replay with; the
@@ -15177,6 +15203,7 @@ impl RunOpts {
         self.validate_summary_json_visibility()?;
         self.validate_work_span_report_visibility()?;
         self.validate_access_trace_visibility()?;
+        self.refuse_unusable_choice_paths()?;
         if self.happens_before.is_some() {
             // Resolve the spec against the guest binary's debug info now and cache
             // it so every subsequent `effective_det_config()` (including both
@@ -16048,6 +16075,24 @@ impl RunOpts {
             config.max_timeslice = None;
             self.timer_downgrade = Some(unavailable.clone());
         }
+        // Timeslice choices exist only while the preemption timer draws
+        // slices. Without it (no usable performance counters, or
+        // --max-timeslice=disabled) a choice source answers priorities only;
+        // say so by name rather than offer choices that never come.
+        if (config.choice_tape.is_some() || config.choice_controller.is_some())
+            && config.max_timeslice.is_none()
+        {
+            let option = if config.choice_tape.is_some() {
+                "--choice-tape"
+            } else {
+                "--choice-controller"
+            };
+            crate::app::tracing::write_stderr_diagnostic(&format!(
+                "WARNING: {option}: --max-timeslice is off (no usable preemption timer, or \
+                 --max-timeslice=disabled), so this run has no timeslice choices, only \
+                 priority choices.\n"
+            ));
+        }
         // Without RCB time, which needs the preemption timer, syscall charges
         // are the only progress of virtual time and trapped syscalls the only
         // points where a thread yields, so a loop on the calls this untraps
@@ -16151,6 +16196,27 @@ impl RunOpts {
                     "--chaos-timed-wait-spread has been tested only on the ptrace backend (and \
                      e9patch preprocessing, which runs on it); backend `{}` is refused, use \
                      --backend=ptrace",
+                    backend.as_str()
+                );
+            }
+        }
+
+        // The choice driver answers the choice points of Detcore's chaos
+        // scheduler from one controller per Hermit process (`detcore::choice`).
+        // A backend that runs Detcore in each guest process would split that
+        // one sequence, and only ptrace has been tested, so the others are
+        // refused. (The options need `--chaos`, which keeps threads
+        // sequentialized and conflicts with `--namespace-only`.)
+        if config.choice_tape.is_some() || config.choice_controller.is_some() {
+            let option = if config.choice_tape.is_some() {
+                "--choice-tape"
+            } else {
+                "--choice-controller"
+            };
+            if !matches!(backend, Backend::Ptrace) {
+                anyhow::bail!(
+                    "{option} has been tested only on the ptrace backend; backend `{}` is \
+                     refused, use --backend=ptrace",
                     backend.as_str()
                 );
             }
@@ -17120,8 +17186,35 @@ impl RunOpts {
         let Some(path) = path else {
             return Ok(());
         };
+        if let Some((cause, remedy)) = self.hidden_in_container(path, "Write") {
+            anyhow::bail!(
+                "{flag} {} is not visible inside the run container: {cause}. The {what} \
+                 is written from inside the container, so it would be lost. {remedy}",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Refuse an input file the run reads from inside its container (`flag`'s
+    /// `what`) at a path the container hides.
+    fn validate_input_visibility(&self, flag: &str, what: &str, path: &Path) -> Result<(), Error> {
+        if let Some((cause, remedy)) = self.hidden_in_container(path, "Put") {
+            anyhow::bail!(
+                "{flag} {} is not visible inside the run container: {cause}. The {what} \
+                 is read from inside the container, so the run could not find it. {remedy}",
+                path.display()
+            );
+        }
+        Ok(())
+    }
+
+    /// Why the run container hides absolute `path`, and the remedy, starting
+    /// with `verb` ("Write" for an output, "Put" for an input), or `None` when
+    /// the container sees it where the host does.
+    fn hidden_in_container(&self, path: &Path, verb: &str) -> Option<(&'static str, String)> {
         if self.no_namespace || !path.is_absolute() {
-            return Ok(());
+            return None;
         }
         let hidden = match self.mapped_host_program(path) {
             GuestPathMapping::Hidden => true,
@@ -17134,31 +17227,61 @@ impl RunOpts {
             }),
             GuestPathMapping::Unchanged => false,
         };
-        if hidden {
-            let (cause, remedy) = if path.starts_with(TMP_DIR) {
-                (
-                    "it is under host /tmp, but Hermit replaces guest /tmp with an isolated \
-                     directory (or the --tmp directory)",
-                    "Write it outside /tmp, or pass --tmp=/tmp to expose host /tmp.",
-                )
-            } else if path.starts_with(GUEST_DEV_SHM) {
-                (
-                    "it is under host /dev/shm, but Hermit gives the guest a private /dev/shm",
-                    "Write it outside /dev/shm, or pass --bind /dev/shm to keep the host's.",
-                )
-            } else {
-                (
-                    "a --mount without a source hides it",
-                    "Write it outside that mount.",
-                )
-            };
-            anyhow::bail!(
-                "{flag} {} is not visible inside the run container: {cause}. The {what} \
-                 is written from inside the container, so it would be lost. {remedy}",
+        if !hidden {
+            return None;
+        }
+        Some(if path.starts_with(TMP_DIR) {
+            (
+                "it is under host /tmp, but Hermit replaces guest /tmp with an isolated \
+                 directory (or the --tmp directory)",
+                format!("{verb} it outside /tmp, or pass --tmp=/tmp to expose host /tmp."),
+            )
+        } else if path.starts_with(GUEST_DEV_SHM) {
+            (
+                "it is under host /dev/shm, but Hermit gives the guest a private /dev/shm",
+                format!("{verb} it outside /dev/shm, or pass --bind /dev/shm to keep the host's."),
+            )
+        } else {
+            (
+                "a --mount without a source hides it",
+                format!("{verb} it outside that mount."),
+            )
+        })
+    }
+
+    /// The choice driver's files: Detcore opens `--choice-tape` and
+    /// `--choice-controller` and writes `--choice-record` from inside the run
+    /// container, at the run's first thread, where a failure could only stop
+    /// the run part way. So each is checked here, before the guest starts: the
+    /// tape is readable, the controller's socket exists, and the container sees
+    /// all three where the host does.
+    fn refuse_unusable_choice_paths(&self) -> Result<(), Error> {
+        let config = &self.det_opts.det_config;
+        if let Some(path) = &config.choice_tape {
+            if let Err(error) = std::fs::File::open(path) {
+                anyhow::bail!(
+                    "--choice-tape {}: cannot read the tape: {error}. Name a readable file \
+                     (an empty file gives the seeded run).",
+                    path.display()
+                );
+            }
+            self.validate_input_visibility("--choice-tape", "tape", path)?;
+        }
+        if let Some(path) = &config.choice_controller {
+            use std::os::unix::fs::FileTypeExt;
+            anyhow::ensure!(
+                std::fs::metadata(path).is_ok_and(|meta| meta.file_type().is_socket()),
+                "--choice-controller {}: no Unix socket is there. Start the controller, \
+                 listening on that path, before the run.",
                 path.display()
             );
+            self.validate_input_visibility("--choice-controller", "controller socket", path)?;
         }
-        Ok(())
+        self.validate_scheduler_output(
+            "--choice-record",
+            "choice record",
+            config.choice_record.as_deref(),
+        )
     }
 
     fn validate_program(&self) -> Result<(), Error> {

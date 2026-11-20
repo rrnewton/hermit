@@ -87,7 +87,7 @@ use crate::procfs::RenderedFiles;
 use crate::procfs::placeholder_link_path;
 use crate::procfs::placeholder_name;
 use crate::procfs_inode;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::stat::DetStat;
 use crate::stat::StatxAttributes;
 use crate::syscalls::namespace::proc_fd_target;
@@ -2579,7 +2579,7 @@ pub(super) struct RenderedTarget {
     pub(super) via_link: bool,
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Whether Detcore renders procfs files for this guest thread now.
     pub(crate) fn renders_procfs<G: Guest<Self>>(&self, guest: &G) -> bool {
         !self.cfg.recordreplay_modes
@@ -3929,7 +3929,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         /// `PIDFD_GET_USER_NAMESPACE`, `_IO(PIDFS_IOCTL_MAGIC, 9)`
         /// (include/uapi/linux/pidfd.h).
         const PIDFD_GET_USER_NAMESPACE: usize = 0xff09;
-        async fn retried<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+        async fn retried<G: Guest<Detcore<T>>, T: RunMode>(
             guest: &mut G,
             call: Syscall,
         ) -> Result<i64, Errno> {
@@ -3940,7 +3940,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
         }
-        async fn close<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+        async fn close<G: Guest<Detcore<T>>, T: RunMode>(
             guest: &mut G,
             fd: RawFd,
             what: &str,
@@ -5440,7 +5440,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn inject_reader_bounding_and_ambient<G: Guest<Self>>(
         guest: &mut G,
     ) -> (Option<u64>, Option<u64>) {
-        async fn set<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+        async fn set<G: Guest<Detcore<T>>, T: RunMode>(
             guest: &mut G,
             args: impl Fn(usize) -> [usize; 6],
         ) -> Option<u64> {
@@ -7764,7 +7764,7 @@ fn access_arguments_invalid(mode: u64, flags: u64) -> bool {
         || mode & !7 != 0
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Answer a path call (or an `AT_EMPTY_PATH`/NULL-path call on a
     /// descriptor) if it names a procfs file Detcore renders, as Linux
     /// answers for the procfs file: the backend has no such file, and the
@@ -8786,7 +8786,7 @@ mod tests {
         use crate::record_or_replay::NoopTool;
         use crate::syscall_hot_path_tests::InjectGuest;
         futures::executor::block_on(async {
-            let mut tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+            let mut tool = crate::syscall_hot_path_tests::detcore::<crate::SeededMode<NoopTool>>();
             tool.cfg.backend = reverie::BackendCapabilities::PTRACE;
             assert!(crate::syscalls::timerfd::detcore_runs_outside_the_guest(
                 &tool.cfg.backend
@@ -8794,7 +8794,7 @@ mod tests {
             assert!(!crate::syscalls::timerfd::detcore_runs_outside_the_guest(
                 &reverie::BackendCapabilities::LITEINST_IN_GUEST
             ));
-            let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+            let mut guest = InjectGuest::<crate::SeededMode>::new(Ok(0));
             // SAFETY: plain integers; zero is a valid value for each.
             let mut stat: libc::stat = unsafe { std::mem::zeroed() };
             stat.st_mode = libc::S_IFREG;
@@ -8820,7 +8820,7 @@ mod tests {
     #[test]
     fn the_kernel_serves_every_address_space_file_where_procfs_is_its() {
         use crate::record_or_replay::NoopTool;
-        let mut tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+        let mut tool = crate::syscall_hot_path_tests::detcore::<crate::SeededMode<NoopTool>>();
         for (backend, kernels) in [
             (reverie::BackendCapabilities::PTRACE, true),
             (reverie::BackendCapabilities::DBT, true),
@@ -8889,7 +8889,7 @@ mod tests {
     /// call being answered (`openat`), and nothing else is used.
     struct RefusalGuest<'a> {
         config: &'a crate::config::Config,
-        thread: crate::ThreadState<()>,
+        thread: crate::ThreadState<crate::SeededMode>,
     }
 
     struct RefusalStack;
@@ -8949,10 +8949,10 @@ mod tests {
         fn memory(&self) -> Self::Memory {
             panic!("binding a task identity reads no guest memory")
         }
-        fn thread_state(&self) -> &crate::ThreadState<()> {
+        fn thread_state(&self) -> &crate::ThreadState<crate::SeededMode> {
             &self.thread
         }
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
+        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<crate::SeededMode> {
             &mut self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -9015,7 +9015,11 @@ mod tests {
             let tool = Detcore::new(reverie::Tid::from_raw(3), &config);
             let mut guest = RefusalGuest {
                 config: &config,
-                thread: crate::ThreadState::new(crate::types::DetTid::from_raw(3), &config, ()),
+                thread: crate::ThreadState::<crate::SeededMode>::new(
+                    crate::types::DetTid::from_raw(3),
+                    &config,
+                    (),
+                ),
             };
             let mut file = ProcfsFile::from_path(Path::new("/proc/stat")).unwrap();
             let result = tool
@@ -10680,7 +10684,7 @@ mod tests {
         use crate::syscall_hot_path_tests::InjectGuest;
         use crate::syscall_hot_path_tests::detcore;
         futures::executor::block_on(async {
-            let tool = detcore::<NoopTool>();
+            let tool = detcore::<crate::SeededMode<NoopTool>>();
             for spelling in ["/proc/self/comm", "/proc/thread-self/comm", "/proc/3/comm"] {
                 for via_link in [false, true] {
                     for flags in [
@@ -10694,7 +10698,7 @@ mod tests {
                         let mut procfs = ProcfsFile::from_path(Path::new(spelling)).unwrap();
                         procfs.bind_task(3, 5);
                         let target = RenderedTarget { procfs, via_link };
-                        let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+                        let mut guest = InjectGuest::<crate::SeededMode>::new(Ok(0));
                         let answer = tool
                             .open_rendered_procfs(&mut guest, flags, target)
                             .await

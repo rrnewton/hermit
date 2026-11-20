@@ -36,7 +36,7 @@ use crate::Detcore;
 use crate::GlobalState;
 use crate::ThreadState;
 use crate::record_or_replay::NoopTool;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::types::DetPid;
 
 const TID: i32 = 4242;
@@ -45,9 +45,9 @@ const TID: i32 = 4242;
 /// with `reply`. Nothing else it offers is expected to be used, but for its
 /// registers where a test supplies them (`with_registers`), and a backend's
 /// typed refusal where a test supplies one (`with_refusal`).
-pub(crate) struct InjectGuest<T: RecordOrReplay<ThreadState = ()>> {
+pub(crate) struct InjectGuest<T: RunMode<RecordReplay: reverie::Tool<ThreadState = ()>>> {
     pub(crate) config: Config,
-    thread: ThreadState<()>,
+    thread: ThreadState<T>,
     reply: Result<i64, Errno>,
     registers: Option<libc::user_regs_struct>,
     refusal: Option<reverie::UnsupportedRefusal>,
@@ -56,10 +56,10 @@ pub(crate) struct InjectGuest<T: RecordOrReplay<ThreadState = ()>> {
     _tool: std::marker::PhantomData<T>,
 }
 
-impl<T: RecordOrReplay<ThreadState = ()>> InjectGuest<T> {
+impl<T: RunMode<RecordReplay: reverie::Tool<ThreadState = ()>>> InjectGuest<T> {
     pub(crate) fn new(reply: Result<i64, Errno>) -> Self {
         let config = Config::default();
-        let thread = ThreadState::new(DetPid::from_raw(TID), &config, ());
+        let thread = ThreadState::<T>::new(DetPid::from_raw(TID), &config, ());
         Self {
             config,
             thread,
@@ -120,7 +120,9 @@ impl Stack for UnusedStack {
 }
 
 #[reverie::tool]
-impl<T: RecordOrReplay<ThreadState = ()>> GlobalRPC<GlobalState> for InjectGuest<T> {
+impl<T: RunMode<RecordReplay: reverie::Tool<ThreadState = ()>>> GlobalRPC<GlobalState>
+    for InjectGuest<T>
+{
     async fn send_rpc(
         &self,
         message: <GlobalState as GlobalTool>::Request,
@@ -133,7 +135,9 @@ impl<T: RecordOrReplay<ThreadState = ()>> GlobalRPC<GlobalState> for InjectGuest
 }
 
 #[reverie::tool]
-impl<T: RecordOrReplay<ThreadState = ()>> Guest<Detcore<T>> for InjectGuest<T> {
+impl<T: RunMode<RecordReplay: reverie::Tool<ThreadState = ()>>> Guest<Detcore<T>>
+    for InjectGuest<T>
+{
     type Memory = LocalMemory;
     type Stack = UnusedStack;
     fn pid(&self) -> Pid {
@@ -148,10 +152,10 @@ impl<T: RecordOrReplay<ThreadState = ()>> Guest<Detcore<T>> for InjectGuest<T> {
     fn memory(&self) -> LocalMemory {
         LocalMemory::new()
     }
-    fn thread_state(&self) -> &ThreadState<()> {
+    fn thread_state(&self) -> &ThreadState<T> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+    fn thread_state_mut(&mut self) -> &mut ThreadState<T> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
@@ -191,7 +195,7 @@ impl<T: RecordOrReplay<ThreadState = ()>> Guest<Detcore<T>> for InjectGuest<T> {
     }
 }
 
-pub(crate) fn detcore<T: RecordOrReplay<ThreadState = ()>>() -> Detcore<T> {
+pub(crate) fn detcore<T: RunMode<RecordReplay: reverie::Tool<ThreadState = ()>>>() -> Detcore<T> {
     <Detcore<T> as Tool>::new(Pid::from_raw(TID), &Config::default())
 }
 
@@ -214,13 +218,13 @@ fn forwarding_without_a_record_tool_matches_noop_tool() {
     futures::executor::block_on(async {
         for reply in [Ok(42), Ok(0), Err(Errno::EBADF), Err(Errno::EINTR)] {
             for call in calls() {
-                let tool = detcore::<NoopTool>();
-                let mut direct = InjectGuest::<NoopTool>::new(reply);
+                let tool = detcore::<crate::SeededMode<NoopTool>>();
+                let mut direct = InjectGuest::<crate::SeededMode>::new(reply);
                 let forwarded = tool
                     .record_or_replay_preserving_tool_errors(&mut direct, call)
                     .await;
 
-                let mut through_tool = InjectGuest::<NoopTool>::new(reply);
+                let mut through_tool = InjectGuest::<crate::SeededMode>::new(reply);
                 let expected = NoopTool
                     .handle_syscall_event(&mut through_tool.into_guest(), call)
                     .await;
@@ -272,8 +276,8 @@ fn a_custom_record_tool_without_an_impl_still_answers_forwarded_calls() {
     assert!(!crate::record_or_replay::injects_only::<u64>());
     futures::executor::block_on(async {
         for call in calls() {
-            let tool = detcore::<AnsweringTool>();
-            let mut guest = InjectGuest::<AnsweringTool>::new(Ok(7));
+            let tool = detcore::<crate::SeededMode<AnsweringTool>>();
+            let mut guest = InjectGuest::<crate::SeededMode<AnsweringTool>>::new(Ok(7));
             let result = tool
                 .record_or_replay_preserving_tool_errors(&mut guest, call)
                 .await
@@ -292,8 +296,8 @@ fn future_size<F: Future>(_: &F) -> usize {
 /// is moved at least once (into its box, or into its parent's state), so a
 /// smaller future is a shorter copy on every syscall.
 fn hot_path_future_sizes() -> Vec<(&'static str, usize)> {
-    let tool = detcore::<NoopTool>();
-    let mut guest = InjectGuest::<NoopTool>::new(Ok(0));
+    let tool = detcore::<crate::SeededMode<NoopTool>>();
+    let mut guest = InjectGuest::<crate::SeededMode>::new(Ok(0));
     let call = calls()[0];
     let handler = <Detcore as Tool>::handle_syscall_event(&tool, &mut guest, call);
     let handler_size = std::mem::size_of_val(&*handler);

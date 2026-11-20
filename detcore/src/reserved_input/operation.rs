@@ -41,7 +41,7 @@ use reverie::syscalls::Sysno;
 use super::acquisition::AcquisitionClass;
 use super::persistent;
 use crate::Detcore;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 
 #[derive(Debug, Default)]
 struct State {
@@ -160,21 +160,21 @@ pub(crate) struct NativeCallOperation {
 }
 
 impl NativeCallOperation {
-    pub(crate) fn begin<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    pub(crate) fn begin<T: RunMode, G: Guest<Detcore<T>>>(
         guest: &G,
         call: Syscall,
     ) -> Result<Option<Self>, Error> {
         Self::begin_kind(guest, call, false)
     }
 
-    pub(crate) fn begin_background<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    pub(crate) fn begin_background<T: RunMode, G: Guest<Detcore<T>>>(
         guest: &G,
         call: Syscall,
     ) -> Result<Option<Self>, Error> {
         Self::begin_kind(guest, call, true)
     }
 
-    fn begin_kind<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    fn begin_kind<T: RunMode, G: Guest<Detcore<T>>>(
         guest: &G,
         call: Syscall,
         background: bool,

@@ -42,7 +42,7 @@ use std::sync::OnceLock;
 use reverie::Guest;
 
 use crate::Detcore;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 
 /// What a runtime refused since it was last asked: the signals whose new
 /// action it refused, bit `n - 1` for signal `n`, and whether it refused an
@@ -72,7 +72,7 @@ fn take() -> RefusedSignalControls {
 pub(crate) async fn report<G, T>(guest: &mut G)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let (actions, alternate_stack) = take();
     if actions == 0 && !alternate_stack {

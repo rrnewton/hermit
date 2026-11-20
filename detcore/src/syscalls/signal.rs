@@ -26,12 +26,12 @@ use tracing::info;
 
 use crate::Detcore;
 use crate::fd::FdType;
-use crate::record_or_replay::RecordOrReplay;
 use crate::resources::InGuestSleepSigalrm;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::resources::SigalrmSleepDisposition;
+use crate::run_mode::RunMode;
 use crate::scheduler::HostTimedSignalScope;
 use crate::scheduler::OwnProcessSignalInputs;
 use crate::scheduler::SiblingSignalState;
@@ -230,7 +230,7 @@ pub(super) async fn read_kernel_sigset<G, T>(
 ) -> Result<KernelSigset, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let validation = syscalls::RtSigprocmask::new()
         .with_how(-1)
@@ -264,7 +264,7 @@ where
 pub(crate) async fn sigkill_names_an_exited_leader<G, T>(guest: &mut G, tid: DetTid) -> bool
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     names_a_retired_exited_leader(guest, tid).await
 }
@@ -276,7 +276,7 @@ where
 async fn virtual_sigalrm_state<G, T>(guest: &mut G) -> Result<(bool, bool), Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let state = read_sigalrm_sleep_state(guest).await?;
     Ok((
@@ -290,7 +290,7 @@ where
 async fn read_sigalrm_sleep_state<G, T>(guest: &mut G) -> Result<InGuestSleepSigalrm, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     read_sleep_signal_state(guest, kernel_sigset_bit(libc::SIGALRM)).await
 }
@@ -306,7 +306,7 @@ async fn read_sleep_signal_state<G, T>(
 ) -> Result<InGuestSleepSigalrm, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let mut stack = guest.stack().await;
     let action = stack.reserve::<KernelSigaction>();
@@ -373,7 +373,7 @@ async fn remove_ignored_before_unignore<G, T>(
 ) -> Result<(), Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if !(1..=64).contains(&signum) || signum == libc::SIGKILL || signum == libc::SIGSTOP {
         return Ok(());
@@ -406,7 +406,7 @@ where
 pub(crate) async fn take_pending_signal<G, T>(guest: &mut G, signo: i32) -> Result<i64, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let mut stack = guest.stack().await;
     let set = stack.push(kernel_sigset_bit(signo));
@@ -448,7 +448,7 @@ where
 pub(crate) async fn claim_pending_sigchld<G, T>(guest: &mut G) -> Result<bool, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     match guest.inject(syscalls::Getpid::new()).await {
         Ok(_) => Ok(false),
@@ -506,7 +506,7 @@ pub(crate) fn take_claim_fault(fault: ClaimFault) -> bool {
 fn send_claim_fault_signal<G, T>(guest: &G, fault: ClaimFault)
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if take_claim_fault(fault)
         && !crate::syscalls::host_signal_send_refused(
@@ -554,7 +554,7 @@ fn is_restart_errno(errno: Errno) -> bool {
 pub(crate) async fn virtual_sigalrm_blocked<G, T>(guest: &mut G) -> Result<bool, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let mut stack = guest.stack().await;
     let mask = stack.reserve::<KernelSigset>();
@@ -582,7 +582,7 @@ async fn read_kernel_sigaction<G, T>(
 ) -> Result<KernelSigaction, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let validation = syscalls::RtSigaction::new()
         .with_signum(libc::SIGKILL)
@@ -669,7 +669,7 @@ fn sent_siginfo<T, G: Guest<Detcore<T>>>(
     signal: i32,
 ) -> Option<KernelSiginfo>
 where
-    T: RecordOrReplay,
+    T: RunMode,
 {
     if !crate::scheduler::discarded_at_send::records(guest.config()) {
         return None;
@@ -713,7 +713,7 @@ fn read_siginfo<T, G: Guest<Detcore<T>>>(
     info: AddrMut<libc::siginfo_t>,
 ) -> Option<[u8; 128]>
 where
-    T: RecordOrReplay,
+    T: RunMode,
 {
     info.as_raw().checked_add(128)?;
     if let Ok(bytes) = guest.memory().read_value(info.cast::<[u8; 128]>()) {
@@ -735,7 +735,7 @@ where
 /// https://github.com/rrnewton/hermit/pull/4351, P2-1).
 fn read_mapped_prefix<T, G: Guest<Detcore<T>>>(guest: &mut G, address: usize, len: usize) -> Vec<u8>
 where
-    T: RecordOrReplay,
+    T: RunMode,
 {
     const PAGE: usize = 4096;
     let mut bytes = Vec::with_capacity(len);
@@ -781,7 +781,7 @@ pub(crate) fn capture_signalfd_buffer<T, G: Guest<Detcore<T>>>(
     limit: usize,
 ) -> Vec<u8>
 where
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let total: usize = extents.iter().map(|(_, len)| *len).sum();
     let len = total.min(limit).min(SIGNALFD_CAPTURED);
@@ -809,7 +809,7 @@ fn restore_changed_bytes<T, G: Guest<Detcore<T>>>(
     info: AddrMut<libc::siginfo_t>,
     before: &[u8],
 ) where
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let now = read_mapped_prefix(guest, info.as_raw(), before.len());
     let before = &before[..now.len()];
@@ -875,7 +875,7 @@ async fn named_thread<G, T>(
 ) -> NamedThread
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let Some(process) = registered_process_of(guest, DetTid::from_raw(tid)).await else {
         return NamedThread::Gone;
@@ -997,7 +997,7 @@ fn self_sigkill_targets_current_task(
         && target_thread.is_none_or(|target| target == current_thread)
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Bind a supported in-guest emulated sleep to its guest dispositions and
     /// mask: SIGALRM's, and those of every signal a scheduler send can reach
     /// it with (`sleep_snapshot_signals`), so that such a send wakes it only
@@ -5588,7 +5588,7 @@ pub(crate) async fn sleep_signal<G, T>(
 ) -> Result<SleepSignal, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     // D50 reader 8 under the in-guest delivery gate (A5 step 3c.1c, design
     // 16.11): before the park and after a wake alike, the sleep ends exactly
@@ -6643,7 +6643,7 @@ enum RefusedSendSiginfo {
 /// cannot be read, is `Unverifiable`. 3c.0a's reserved-send path
 /// (`reserved_send_siginfo_errno`) keeps answering such a read EFAULT, a
 /// known residual.
-fn refused_send_siginfo<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+fn refused_send_siginfo<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &mut G,
     signal: i32,
     siginfo: ReservedSendSiginfo,
@@ -7875,7 +7875,7 @@ mod rt_sigsuspend_tests {
     /// stack pointer in `regs`.
     struct SuspendGuest {
         config: Config,
-        thread: ThreadState<()>,
+        thread: ThreadState<crate::SeededMode>,
         arena: Box<[u64; ARENA_WORDS]>,
         stack_pointer: Option<usize>,
         caller_mask: usize,
@@ -7916,10 +7916,10 @@ mod rt_sigsuspend_tests {
         fn memory(&self) -> Self::Memory {
             LocalMemory::new()
         }
-        fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
             &mut self.thread
         }
-        fn thread_state(&self) -> &ThreadState<()> {
+        fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
             &self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -7995,7 +7995,7 @@ mod rt_sigsuspend_tests {
         let mut caller_mask: Box<KernelSigset> = Box::new(unblocks_sigchld);
         let caller_address = &mut *caller_mask as *mut KernelSigset as usize;
         let mut guest = SuspendGuest {
-            thread: ThreadState::new(DetPid::from_raw(1), &config, ()),
+            thread: ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ()),
             config: config.clone(),
             arena: Box::new([u64::MAX; ARENA_WORDS]),
             stack_pointer: None,
@@ -8036,7 +8036,7 @@ mod rt_sigsuspend_tests {
             arena[slot] = original;
             let caller_address = &mut arena[slot] as *mut u64 as usize;
             let mut guest = SuspendGuest {
-                thread: ThreadState::new(DetPid::from_raw(1), &config, ()),
+                thread: ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ()),
                 config: config.clone(),
                 arena,
                 stack_pointer: None,
@@ -8088,7 +8088,7 @@ mod rt_sigsuspend_tests {
         ];
         for stack_pointer in rows {
             let mut guest = SuspendGuest {
-                thread: ThreadState::new(DetPid::from_raw(1), &config, ()),
+                thread: ThreadState::<crate::SeededMode>::new(DetPid::from_raw(1), &config, ()),
                 config: config.clone(),
                 arena: Box::new([u64::MAX; ARENA_WORDS]),
                 stack_pointer: Some(stack_pointer),
@@ -8161,7 +8161,7 @@ mod before_park_tests {
     struct SleeperGuest<'a> {
         state: &'a GlobalState,
         config: Config,
-        thread: ThreadState<()>,
+        thread: ThreadState<crate::SeededMode>,
         pid: Pid,
     }
 
@@ -8195,10 +8195,10 @@ mod before_park_tests {
         fn memory(&self) -> Self::Memory {
             panic!("the before-park check reads no guest memory")
         }
-        fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+        fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
             &mut self.thread
         }
-        fn thread_state(&self) -> &ThreadState<()> {
+        fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
             &self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -8432,7 +8432,7 @@ mod before_park_tests {
             let state = GlobalState::for_tests(&config);
             let mut guest = SleeperGuest {
                 state: &state,
-                thread: ThreadState::new(DetPid::from_raw(child), &config, ()),
+                thread: ThreadState::<crate::SeededMode>::new(DetPid::from_raw(child), &config, ()),
                 config,
                 pid: Pid::from_raw(child),
             };
@@ -8491,7 +8491,7 @@ mod before_park_tests {
             let global = GlobalState::for_tests(&config);
             let mut guest = SleeperGuest {
                 state: &global,
-                thread: ThreadState::new(DetPid::from_raw(child), &config, ()),
+                thread: ThreadState::<crate::SeededMode>::new(DetPid::from_raw(child), &config, ()),
                 config,
                 pid: Pid::from_raw(child),
             };
@@ -8561,7 +8561,7 @@ mod before_park_tests {
             let global = GlobalState::for_tests(&config);
             let mut guest = SleeperGuest {
                 state: &global,
-                thread: ThreadState::new(DetPid::from_raw(4242), &config, ()),
+                thread: ThreadState::<crate::SeededMode>::new(DetPid::from_raw(4242), &config, ()),
                 config,
                 pid: Pid::from_raw(4242),
             };
@@ -8648,7 +8648,7 @@ mod before_park_tests {
             let global = GlobalState::for_tests(&config);
             let mut guest = SleeperGuest {
                 state: &global,
-                thread: ThreadState::new(DetPid::from_raw(child), &config, ()),
+                thread: ThreadState::<crate::SeededMode>::new(DetPid::from_raw(child), &config, ()),
                 config,
                 pid: Pid::from_raw(child),
             };

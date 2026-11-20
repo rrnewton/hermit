@@ -1475,6 +1475,19 @@ mod tests {
             "replay-preemptions-from",
             &["--replay-preemptions-from=/tmp/r.json"],
         ),
+        ("choice-tape", &["--chaos", "--choice-tape=/tmp/t.bin"]),
+        (
+            "choice-controller",
+            &["--chaos", "--choice-controller=/tmp/c.sock"],
+        ),
+        (
+            "choice-record",
+            &[
+                "--chaos",
+                "--choice-tape=/tmp/t.bin",
+                "--choice-record=/tmp/c.jsonl",
+            ],
+        ),
         (
             "replay-schedule-from",
             &["--replay-schedule-from=/tmp/s.json"],

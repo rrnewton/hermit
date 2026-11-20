@@ -1,8 +1,10 @@
-// Copyright (c) Meta Platforms, Inc. and affiliates.
-// All rights reserved.
-//
-// This source code is licensed under the BSD-style license found in the
-// LICENSE file in the root directory of this source tree.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
 
 //! Authored Cargo build selections for the committed validation graph.
 //! Runtime consumers read the selection recorded in that graph. The generator
@@ -99,6 +101,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "chaos_stress_pmu_detection",
             "--test",
             "child_time_rpc",
+            "--test",
+            "choice_driver",
             "--test",
             "chown_virtual_root_identity",
             "--test",

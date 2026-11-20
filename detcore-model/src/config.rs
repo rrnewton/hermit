@@ -321,6 +321,7 @@ pub const MAX_CHAOS_TIMED_WAIT_SPREAD: f64 = 1000.0;
 
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
+#[clap(group(clap::ArgGroup::new("choice_source").args(["choice_tape", "choice_controller"])))]
 pub struct Config {
     /// Disable virtual/logical time. Note that virtual time is required for virtual metadata.
     #[clap(long = "no-virtualize-time", action = clap::ArgAction::SetFalse)]
@@ -1097,6 +1098,52 @@ pub struct Config {
     /// File to write the record of preemptions (in JSON).  Implies `--record-preemptions`.
     #[clap(long, value_name = "filepath")]
     pub record_preemptions_to: Option<PathBuf>,
+
+    /// Experimental: answer the chaos scheduler's choice points (timeslice lengths,
+    /// priority redraws, and new threads' starting priorities) from this byte
+    /// tape, one byte per choice in run order. Byte 0, or an exhausted tape, takes the default (seeded) choice, so
+    /// an empty tape is the ordinary `--chaos` run. A slice byte b picks the mean
+    /// slice times 2^((b-128)/16), rounded half up; a priority byte spreads 255
+    /// levels over the priority range. ptrace backend only.
+    #[serde(default)]
+    #[clap(
+        long,
+        value_name = "filepath",
+        requires = "chaos",
+        conflicts_with_all = [
+            "choice_controller",
+            "replay_preemptions_from",
+            "replay_schedule_from",
+            "chaos_target_races",
+        ]
+    )]
+    pub choice_tape: Option<PathBuf>,
+
+    /// Experimental: ask an external controller listening on this Unix stream
+    /// socket for each chaos choice point: one JSON line per request (with
+    /// `"schema":1`) and one per answer, `{"i":N,"v":V}`, `{"i":N,"default":true}`
+    /// or `{"i":N,"refuse":"reason"}`. A refusal stops the run as a policy refusal
+    /// (exit 122), naming the choice.
+    /// ptrace backend only.
+    #[serde(default)]
+    #[clap(
+        long,
+        value_name = "socket-path",
+        requires = "chaos",
+        conflicts_with_all = [
+            "replay_preemptions_from",
+            "replay_schedule_from",
+            "chaos_target_races",
+        ]
+    )]
+    pub choice_controller: Option<PathBuf>,
+
+    /// Experimental: write every choice request and the answer used to this file,
+    /// one JSON line each (`"schema":1`). Needs `--choice-tape` or
+    /// `--choice-controller`.
+    #[serde(default)]
+    #[clap(long, value_name = "filepath", requires = "choice_source")]
+    pub choice_record: Option<PathBuf>,
 
     /// JSON file to read recorded preemptions from.  When `--chaos` mode is activated, these
     /// recorded preemption points take the place of randomized scheduling decisions.
@@ -2186,6 +2233,13 @@ impl Config {
     pub fn with_backend(mut self, change: impl FnOnce(&mut BackendCapabilities)) -> Self {
         change(&mut self.backend);
         self
+    }
+
+    /// Whether a choice source (`--choice-tape` or `--choice-controller`)
+    /// answers this run's scheduling choices: the run goes through the
+    /// controller runner (`hermit-run-choices`) instead of the ordinary one.
+    pub fn has_choice_source(&self) -> bool {
+        self.choice_tape.is_some() || self.choice_controller.is_some()
     }
 
     /// Whether the epoch is the stable library default omitted by `Display`.
@@ -3792,7 +3846,10 @@ impl Default for Config {
 /// which has no effect without a PMU timer and reads back as false. So is
 /// [`Config::standard_stream_aliases`], added after this form froze, set only for KVM, which
 /// reads back as unset. So is [`Config::stacktrace_at_schedule_positions`], also added later,
-/// which reads back as false: the DBT runtime takes no stack traces. Every
+/// which reads back as false: the DBT runtime takes no stack traces. So are
+/// [`Config::choice_tape`], [`Config::choice_controller`] and
+/// [`Config::choice_record`], added after this form froze, which `hermit run`
+/// refuses on every backend but ptrace and which read back as unset. Every
 /// other field is serialized exactly as `serde_json::to_string(config)`
 /// serializes it.
 ///
@@ -4470,7 +4527,11 @@ mod legacy_backend_json {
     /// `allow_unresolved_restart_codes` came after it too: only the ptrace
     /// backend on aarch64 asks Detcore about restart codes, so it is never
     /// written and reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 68] = [
+    /// `choice_tape`, `choice_controller` and `choice_record` came after it
+    /// too. `hermit run` refuses the first two on every backend but ptrace,
+    /// and the third needs one of them, so they are never written and read as
+    /// unset.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 71] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4539,6 +4600,9 @@ mod legacy_backend_json {
         "chaos_instruction_offset",
         "untrap_passthrough_syscalls",
         "allow_unresolved_restart_codes",
+        "choice_tape",
+        "choice_controller",
+        "choice_record",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -4747,7 +4811,10 @@ mod legacy_backend_json {
                     | "access_trace_max_bytes"
                     | "standard_stream_aliases"
                     | "post_crash_timeslice"
-                    | "property_snapshot",
+                    | "property_snapshot"
+                    | "choice_tape"
+                    | "choice_controller"
+                    | "choice_record",
                 ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
@@ -5092,7 +5159,10 @@ mod legacy_backend_json {
                 | "watch_from"
                 | "chaos_instruction_offset"
                 | "untrap_passthrough_syscalls"
-                | "allow_unresolved_restart_codes" => Ok(()),
+                | "allow_unresolved_restart_codes"
+                | "choice_tape"
+                | "choice_controller"
+                | "choice_record" => Ok(()),
                 "replay_continue_fairly" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
@@ -6177,7 +6247,10 @@ mod tests {
                 | "watch_from"
                 | "chaos_instruction_offset"
                 | "untrap_passthrough_syscalls"
-                | "allow_unresolved_restart_codes" => {}
+                | "allow_unresolved_restart_codes"
+                | "choice_tape"
+                | "choice_controller"
+                | "choice_record" => {}
                 "replay_continue_fairly" => {}
                 other => expected.push(other.to_owned()),
             }
@@ -6220,14 +6293,15 @@ mod tests {
         // `property_snapshot`, `watch`, `watch_from`, `rewrite_exclusives_overlay`,
         // `chaos_instruction_offset`, `rewrite_exclusives_overlay_requested`,
         // `rewrite_exclusives_unmarked`, `untrap_passthrough_syscalls`,
-        // `allow_unresolved_restart_codes` and `strict_schedule_boundaries`
-        // none: fourteen more keys and sixty-seven fewer (lenient_replay joined
+        // `allow_unresolved_restart_codes`, `choice_tape`, `choice_controller`,
+        // `choice_record` and `strict_schedule_boundaries`
+        // none: fourteen more keys and seventy fewer (lenient_replay joined
         // them in dh-mvz7y, chaos_timed_wait_spread later, `autofs_roots` and
         // `notice_autofs_eloop` later still, then
-        // `ephemeral_port_range_override`, then `startup_unmonitored`), so
-        // fifty-three keys fewer than fields.
+        // `ephemeral_port_range_override`, then `startup_unmonitored`, then the
+        // three choice paths), so fifty-six keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 53);
+        assert_eq!(fields.len(), keys.len() + 56);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -7161,6 +7235,50 @@ mod tests {
                 .unwrap()
                 .allow_unresolved_restart_codes
         );
+    }
+
+    /// The choice driver's paths never enter the legacy form, whatever their
+    /// values: the legacy string keeps its bytes, and they read back as unset
+    /// from both the object and the array form.
+    #[test]
+    fn choice_sources_never_enter_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            chaos: true,
+            choice_tape: Some(PathBuf::from("/choices/tape")),
+            choice_record: Some(PathBuf::from("/choices/record.jsonl")),
+            ..off.clone()
+        };
+        let controlled = Config {
+            chaos: true,
+            choice_controller: Some(PathBuf::from("/choices/controller.sock")),
+            ..off.clone()
+        };
+        let chaos = Config {
+            chaos: true,
+            ..off.clone()
+        };
+        for config in [&on, &controlled] {
+            let json = to_legacy_backend_json(config).unwrap();
+            assert_eq!(json, to_legacy_backend_json(&chaos).unwrap());
+            assert!(!json.contains("choice_"), "{json}");
+            let values: Vec<serde_json::Value> = ordered_entries(&json)
+                .into_iter()
+                .map(|(_, value)| value)
+                .collect();
+            let array = serde_json::to_string(&values).unwrap();
+            for decoded in [
+                from_legacy_backend_json(&json).unwrap(),
+                from_legacy_backend_json(&array).unwrap(),
+            ] {
+                assert_eq!(decoded.choice_tape, None);
+                assert_eq!(decoded.choice_controller, None);
+                assert_eq!(decoded.choice_record, None);
+            }
+        }
     }
 
     /// `futex_wake_yields` never enters the legacy form, whatever its

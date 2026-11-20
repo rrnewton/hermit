@@ -78,7 +78,7 @@ fn thread_clock(tid: i32, which: i32) -> i32 {
 
 struct CpuClockGuest {
     config: Config,
-    thread: ThreadState<()>,
+    thread: ThreadState<crate::SeededMode>,
     requests: Mutex<Vec<&'static str>>,
     /// Whether the sibling has exited since the test began.
     sibling_exited: std::sync::atomic::AtomicBool,
@@ -190,10 +190,10 @@ impl Guest<Detcore> for CpuClockGuest {
     fn memory(&self) -> LocalMemory {
         LocalMemory::new()
     }
-    fn thread_state(&self) -> &ThreadState<()> {
+    fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
@@ -232,7 +232,7 @@ fn setup() -> (Detcore, CpuClockGuest, (LogicalTime, LogicalTime)) {
         ..Config::default()
     };
     let tool = <Detcore as Tool>::new(Pid::from_raw(PROCESS), &config);
-    let mut caller = ThreadState::new(DetPid::from_raw(CALLER), &config, ());
+    let mut caller = ThreadState::<crate::SeededMode>::new(DetPid::from_raw(CALLER), &config, ());
     caller.detpid = Some(DetPid::from_raw(PROCESS));
     caller.thread_logical_time.add_rcbs(1_000);
     caller.thread_logical_time.add_syscall_with_cost(30_000);

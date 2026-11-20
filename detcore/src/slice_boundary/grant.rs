@@ -177,7 +177,10 @@ impl Mailbox {
 /// not timer/callback integration: software identities remain expectations,
 /// and only a recorded PMU cause installs a precise PMU branch target. The
 /// configured maximum and existing logical deadline are never changed here.
-pub fn install<T>(thread: &mut ThreadState<T>, budget: Budget) -> anyhow::Result<()> {
+pub fn install<T: crate::RunMode>(
+    thread: &mut ThreadState<T>,
+    budget: Budget,
+) -> anyhow::Result<()> {
     if thread
         .slice_boundary
         .as_ref()
@@ -190,7 +193,10 @@ pub fn install<T>(thread: &mut ThreadState<T>, budget: Budget) -> anyhow::Result
     install_checked(thread, budget)
 }
 
-fn install_checked<T>(thread: &mut ThreadState<T>, budget: Budget) -> anyhow::Result<()> {
+fn install_checked<T: crate::RunMode>(
+    thread: &mut ThreadState<T>,
+    budget: Budget,
+) -> anyhow::Result<()> {
     let budget = Budget::try_from(Wire {
         stored_index: budget.stored_index,
         expected: budget.expected,
@@ -224,7 +230,10 @@ fn install_checked<T>(thread: &mut ThreadState<T>, budget: Budget) -> anyhow::Re
 
 /// A StartNewThread reply precedes its existing first reset. Keep the budget
 /// pending, without arming a timer which that reset would immediately erase.
-pub fn stage_start<T>(thread: &mut ThreadState<T>, budget: Budget) -> anyhow::Result<()> {
+pub fn stage_start<T: crate::RunMode>(
+    thread: &mut ThreadState<T>,
+    budget: Budget,
+) -> anyhow::Result<()> {
     let Some(observed) = &thread.slice_boundary else {
         bail!("slice-boundary protocol refusal: start grant has no authenticated owner");
     };
@@ -263,7 +272,7 @@ pub(crate) struct StartReset {
 /// Perform exactly the startup reset already required by the caller. Preserve
 /// its timer-disabled behavior and return evidence for installation after the
 /// unchanged deadline-cap call. This does not add a scheduler request.
-pub(crate) fn reset_start<T>(
+pub(crate) fn reset_start<T: crate::RunMode>(
     thread: &mut ThreadState<T>,
     cfg: &Config,
 ) -> anyhow::Result<StartReset> {
@@ -305,7 +314,7 @@ pub(crate) fn reset_start<T>(
 /// Install the start grant after consuming proof of the actual startup reset,
 /// and after its unchanged deadline-cap call. This never resets a slice or
 /// advances clocks itself. Missing, stale and repeated resets are refused.
-pub(crate) fn finish_start<T>(
+pub(crate) fn finish_start<T: crate::RunMode>(
     thread: &mut ThreadState<T>,
     reset: StartReset,
 ) -> anyhow::Result<()> {
@@ -415,7 +424,7 @@ pub(crate) mod tests {
     fn grant_is_guest_rcbs_not_turn_time_and_never_changes_deadline_or_maximum() {
         let cfg = Config::default();
         let tid = DetTid::from_raw(3);
-        let mut thread = ThreadState::new(tid, &cfg, ());
+        let mut thread = ThreadState::<crate::SeededMode>::new(tid, &cfg, ());
         thread.next_timeslice(&cfg);
         thread.slice_boundary = Some(Observations::new(&thread, 0));
         thread.committed_clock_value = 7;
@@ -460,7 +469,7 @@ pub(crate) mod tests {
                 ..Config::default()
             };
             for resets in [0, 1, 2] {
-                let mut thread = ThreadState::new(tid, &cfg, ());
+                let mut thread = ThreadState::<crate::SeededMode>::new(tid, &cfg, ());
                 thread.slice_boundary = Some(Observations::new(&thread, 0));
                 let mut hint = budget(tid, thread.mm_id, 19);
                 if !timers {
@@ -526,7 +535,7 @@ pub(crate) mod tests {
                 );
             }
             for wrong_lifetime in 0..3 {
-                let mut thread = ThreadState::new(tid, &cfg, ());
+                let mut thread = ThreadState::<crate::SeededMode>::new(tid, &cfg, ());
                 thread.slice_boundary = Some(Observations::new(&thread, 0));
                 let hint = budget(tid, thread.mm_id, 19);
                 stage_start(&mut thread, hint).unwrap();
@@ -547,7 +556,7 @@ pub(crate) mod tests {
     fn malformed_wire_and_wrong_owner_budget_are_refused_before_state_changes() {
         let cfg = Config::default();
         let tid = DetTid::from_raw(3);
-        let mut thread = ThreadState::new(tid, &cfg, ());
+        let mut thread = ThreadState::<crate::SeededMode>::new(tid, &cfg, ());
         thread.next_timeslice(&cfg);
         thread.slice_boundary = Some(Observations::new(&thread, 0));
         thread.committed_clock_value = 7;

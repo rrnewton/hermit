@@ -15,7 +15,7 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Sysno;
 
 use crate::Detcore;
-use crate::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::ResourceLimit;
 
@@ -168,7 +168,7 @@ fn validate_resource_limit_mutation(
 /// producer A5 step 3c refuses there by name. Nothing on any other backend,
 /// for another resource, or for another errno (EINVAL, for a soft limit above
 /// the hard one, comes first and arms nothing).
-fn warn_refused_cpu_limit<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+fn warn_refused_cpu_limit<G: Guest<Detcore<T>>, T: RunMode>(
     guest: &G,
     call: &str,
     resource: u32,
@@ -205,7 +205,7 @@ pub(crate) fn record_early_limit_read(
     }
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     /// Return one deterministic process resource limit through the legacy ABI.

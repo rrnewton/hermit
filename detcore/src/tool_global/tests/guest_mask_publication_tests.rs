@@ -165,7 +165,7 @@ struct Filed {
 /// mask each one publishes, and are granted at once.
 struct PublishingGuest {
     config: Config,
-    thread: ThreadState<()>,
+    thread: ThreadState<crate::SeededMode>,
     scheduler: Mutex<Scheduler>,
     /// The parked-signal site the backend reports, when it has one.
     site: Option<reverie::CallbackSignalSite>,
@@ -302,10 +302,10 @@ impl Guest<Detcore> for PublishingGuest {
     fn memory(&self) -> LocalMemory {
         LocalMemory::new()
     }
-    fn thread_state(&self) -> &ThreadState<()> {
+    fn thread_state(&self) -> &ThreadState<crate::SeededMode> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+    fn thread_state_mut(&mut self) -> &mut ThreadState<crate::SeededMode> {
         &mut self.thread
     }
     fn parked_signal_site(&self) -> Option<reverie::CallbackSignalSite> {
@@ -359,7 +359,7 @@ fn publishing_guest(gate: bool, parked: bool) -> PublishingGuest {
     };
     config.backend = reverie::BackendCapabilities::LITEINST_IN_GUEST;
     let detpid = DetPid::from_raw(THREAD.as_raw());
-    let mut thread = ThreadState::new(detpid, &config, ());
+    let mut thread = ThreadState::<crate::SeededMode>::new(detpid, &config, ());
     thread.detpid = Some(detpid);
     let mut scheduler = Scheduler::new(&config);
     scheduler.register_thread_for_test(THREAD);

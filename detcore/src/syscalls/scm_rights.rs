@@ -448,7 +448,7 @@ use crate::fd::InFlightOpenFile;
 use crate::fd::OpenFileHandle;
 use crate::fd::SentDescriptor;
 use crate::fd::TakenRights;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::syscalls::files::SocketRole;
 use crate::tool_local::Detcore;
 
@@ -1215,7 +1215,7 @@ pub(crate) fn both_ends_guest_made(
 }
 
 /// Runs `f` on the run's [`UnixConnections`].
-fn with_connections<T: RecordOrReplay, G: Guest<Detcore<T>>, R>(
+fn with_connections<T: RunMode, G: Guest<Detcore<T>>, R>(
     guest: &G,
     f: impl FnOnce(&mut UnixConnections) -> R,
 ) -> R {
@@ -1715,7 +1715,7 @@ enum ReceiptMode {
     Unrecorded(&'static str),
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// How this run handles received descriptors. Recorded only where the
     /// tool does not share the guest's descriptor table (it discovers them
     /// there), and with sequentialized threads (otherwise another thread could

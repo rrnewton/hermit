@@ -31065,7 +31065,8 @@ mod test {
         let higher_futex = FutexID::private(mm, 0x404200);
 
         let deliver = |reverse: bool| {
-            let mut first = ThreadState::<()>::new(first_owner, &Config::default(), ());
+            let mut first =
+                ThreadState::<crate::SeededMode>::new(first_owner, &Config::default(), ());
             let mut second = first.clone();
             second.dettid = second_owner;
             first.record_robust_list_head(Some(0x404100));

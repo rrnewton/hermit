@@ -148,7 +148,7 @@ use crate::procfs::fd_directory::TaskDirectoryKind;
 use crate::procfs_inode;
 use crate::procfs_inode::DirectoryInodes;
 use crate::procfs_inode::ProcfsDirectory;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::stat::DetStat;
 use crate::stat::StatxAttributes;
 use crate::tool_local::Detcore;
@@ -984,7 +984,7 @@ fn args_flag(args: &syscalls::SyscallArgs, index: usize) -> i32 {
     argument(args, index) as i32
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// Whether Detcore serves placeholder directories in this run: where the
     /// object it opens for one exists ([`PlaceholderObject`]: the container's
     /// own procfs, `DetConfig::container_procfs`, where the guest's procfs is
@@ -7154,7 +7154,7 @@ mod tests {
     /// placeholder, the identity alone decides.
     #[test]
     fn a_procfs_root_is_told_without_opening_anything() {
-        type Tool = Detcore<crate::record_or_replay::NoopTool>;
+        type Tool = Detcore<crate::SeededMode>;
         let proc = reverie::syscalls::linux_abi::PROC_SUPER_MAGIC as i64;
         let none = BTreeSet::new();
         assert!(Tool::on_placeholder_object((22, 1), Some(Ok(proc)), &none));

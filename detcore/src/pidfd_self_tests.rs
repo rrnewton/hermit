@@ -45,7 +45,7 @@ use crate::pidfd_self::PhysicalSpelling;
 use crate::pidfd_self::SentinelPreflight;
 use crate::pidfd_self::preflight;
 use crate::record_or_replay::NoopTool;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::syscall_hot_path_tests::UnusedStack;
 use crate::tool_global::GlobalRequest;
 use crate::tool_global::GlobalResponse;
@@ -81,9 +81,9 @@ enum Route {
 /// A thread that logs every call injected through it, and how, and answers
 /// each with the next scripted reply (success 0 when the script is empty). It
 /// answers the two RPCs a refusal sends and declares `spelling`.
-struct ScriptGuest<T: RecordOrReplay<ThreadState = ()>> {
+struct ScriptGuest<T: RunMode<RecordReplay: reverie::Tool<ThreadState = ()>>> {
     config: Config,
-    thread: ThreadState<()>,
+    thread: ThreadState<T>,
     spelling: PidfdSelfSpelling,
     replies: Mutex<VecDeque<Result<i64, Errno>>>,
     injected: Mutex<Vec<(Route, Sysno, SyscallArgs)>>,
@@ -91,13 +91,13 @@ struct ScriptGuest<T: RecordOrReplay<ThreadState = ()>> {
     _tool: std::marker::PhantomData<T>,
 }
 
-impl<T: RecordOrReplay<ThreadState = ()>> ScriptGuest<T> {
+impl<T: RunMode<RecordReplay: reverie::Tool<ThreadState = ()>>> ScriptGuest<T> {
     fn new(spelling: PidfdSelfSpelling) -> Self {
         Self::with_config(spelling, Config::default())
     }
 
     fn with_config(spelling: PidfdSelfSpelling, config: Config) -> Self {
-        let mut thread = ThreadState::new(DetPid::from_raw(TID), &config, ());
+        let mut thread = ThreadState::<T>::new(DetPid::from_raw(TID), &config, ());
         thread.detpid = Some(DetPid::from_raw(TID));
         Self {
             config,
@@ -131,7 +131,9 @@ impl<T: RecordOrReplay<ThreadState = ()>> ScriptGuest<T> {
 }
 
 #[reverie::tool]
-impl<T: RecordOrReplay<ThreadState = ()>> GlobalRPC<GlobalState> for ScriptGuest<T> {
+impl<T: RunMode<RecordReplay: reverie::Tool<ThreadState = ()>>> GlobalRPC<GlobalState>
+    for ScriptGuest<T>
+{
     async fn send_rpc(
         &self,
         message: <GlobalState as GlobalTool>::Request,
@@ -157,7 +159,9 @@ impl<T: RecordOrReplay<ThreadState = ()>> GlobalRPC<GlobalState> for ScriptGuest
 }
 
 #[reverie::tool]
-impl<T: RecordOrReplay<ThreadState = ()>> Guest<Detcore<T>> for ScriptGuest<T> {
+impl<T: RunMode<RecordReplay: reverie::Tool<ThreadState = ()>>> Guest<Detcore<T>>
+    for ScriptGuest<T>
+{
     type Memory = LocalMemory;
     type Stack = UnusedStack;
     fn pid(&self) -> Pid {
@@ -172,10 +176,10 @@ impl<T: RecordOrReplay<ThreadState = ()>> Guest<Detcore<T>> for ScriptGuest<T> {
     fn memory(&self) -> LocalMemory {
         LocalMemory::new()
     }
-    fn thread_state(&self) -> &ThreadState<()> {
+    fn thread_state(&self) -> &ThreadState<T> {
         &self.thread
     }
-    fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+    fn thread_state_mut(&mut self) -> &mut ThreadState<T> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
@@ -253,7 +257,9 @@ impl Tool for RecordingTool {
     }
 }
 
-fn detcore<T: RecordOrReplay<ThreadState = ()>>(config: &Config) -> Detcore<T> {
+fn detcore<T: RunMode<RecordReplay: reverie::Tool<ThreadState = ()>>>(
+    config: &Config,
+) -> Detcore<T> {
     <Detcore<T> as Tool>::new(Pid::from_raw(TID), config)
 }
 
@@ -356,16 +362,17 @@ fn the_adapter_respells_every_injection_route_of_the_guest_call() {
     let canonical = group.into_parts().1;
     let getpid = Syscall::from_raw(Sysno::getpid, SyscallArgs::new(0, 0, 0, 0, 0, 0));
     futures::executor::block_on(async {
-        let mut inner = ScriptGuest::<NoopTool>::new(PidfdSelfSpelling::Legacy).replying([
-            Ok(0),
-            Ok(0),
-            Err(Errno::ENOTRECOVERABLE),
-            Err(Errno::EINTR),
-            Err(Errno::ERESTARTSYS),
-            Ok(0),
-            Ok(0),
-            Ok(42),
-        ]);
+        let mut inner =
+            ScriptGuest::<crate::SeededMode>::new(PidfdSelfSpelling::Legacy).replying([
+                Ok(0),
+                Ok(0),
+                Err(Errno::ENOTRECOVERABLE),
+                Err(Errno::EINTR),
+                Err(Errno::ERESTARTSYS),
+                Ok(0),
+                Ok(0),
+                Ok(42),
+            ]);
         {
             let mut adapter = PhysicalSpelling::<_, Detcore>::new(&mut inner, respelled);
             assert_eq!(adapter.inject(group).await, Ok(0));
@@ -442,9 +449,10 @@ fn forwarding_records_the_canonical_call_and_injects_the_physical_one() {
     let pidfd = Sysno::pidfd_send_signal;
     futures::executor::block_on(async {
         RECORDED.lock().unwrap().clear();
-        let tool = detcore::<RecordingTool>(&Config::default());
-        let mut guest = ScriptGuest::<RecordingTool>::new(PidfdSelfSpelling::Legacy)
-            .replying([Err(Errno::EINTR), Ok(0)]);
+        let tool = detcore::<crate::SeededMode<RecordingTool>>(&Config::default());
+        let mut guest =
+            ScriptGuest::<crate::SeededMode<RecordingTool>>::new(PidfdSelfSpelling::Legacy)
+                .replying([Err(Errno::EINTR), Ok(0)]);
         guest.thread.pidfd_respelling = Some(respelled);
         assert_eq!(
             tool.record_or_replay_preserving_tool_errors(&mut guest, group)
@@ -461,15 +469,15 @@ fn forwarding_records_the_canonical_call_and_injects_the_physical_one() {
             ]
         );
 
-        let tool = detcore::<NoopTool>(&Config::default());
-        let mut guest = ScriptGuest::<NoopTool>::new(PidfdSelfSpelling::Legacy);
+        let tool = detcore::<crate::SeededMode<NoopTool>>(&Config::default());
+        let mut guest = ScriptGuest::<crate::SeededMode>::new(PidfdSelfSpelling::Legacy);
         guest.thread.pidfd_respelling = Some(respelled);
         tool.record_or_replay_preserving_tool_errors(&mut guest, group)
             .await
             .unwrap();
         assert_eq!(guest.injected(), vec![(Route::Inject, pidfd, physical)]);
 
-        let mut guest = ScriptGuest::<NoopTool>::new(PidfdSelfSpelling::Legacy);
+        let mut guest = ScriptGuest::<crate::SeededMode>::new(PidfdSelfSpelling::Legacy);
         tool.record_or_replay_preserving_tool_errors(&mut guest, group)
             .await
             .unwrap();
@@ -486,13 +494,13 @@ fn forwarding_records_the_canonical_call_and_injects_the_physical_one() {
 fn the_slot_is_restored_when_its_guard_or_future_is_dropped() {
     let group = pidfd_send_signal(register(GROUP), 0, 0, 0);
     let respelled = respelling(group);
-    let mut guest = ScriptGuest::<NoopTool>::new(PidfdSelfSpelling::Legacy);
+    let mut guest = ScriptGuest::<crate::SeededMode>::new(PidfdSelfSpelling::Legacy);
     assert_eq!(guest.thread.pidfd_respelling, None);
     {
-        let mut armed = ArmedRespelling::<NoopTool, _>::arm(&mut guest, Some(respelled));
+        let mut armed = ArmedRespelling::<crate::SeededMode, _>::arm(&mut guest, Some(respelled));
         assert_eq!(armed.thread_state().pidfd_respelling, Some(respelled));
         {
-            let inner = ArmedRespelling::<NoopTool, _>::arm(&mut *armed, None);
+            let inner = ArmedRespelling::<crate::SeededMode, _>::arm(&mut *armed, None);
             assert_eq!(inner.thread_state().pidfd_respelling, None);
         }
         assert_eq!(armed.thread_state().pidfd_respelling, Some(respelled));
@@ -500,7 +508,7 @@ fn the_slot_is_restored_when_its_guard_or_future_is_dropped() {
     assert_eq!(guest.thread.pidfd_respelling, None);
 
     let mut held = Box::pin(async {
-        let armed = ArmedRespelling::<NoopTool, _>::arm(&mut guest, Some(respelled));
+        let armed = ArmedRespelling::<crate::SeededMode, _>::arm(&mut guest, Some(respelled));
         futures::future::pending::<()>().await;
         drop(armed);
     });
@@ -512,7 +520,7 @@ fn the_slot_is_restored_when_its_guard_or_future_is_dropped() {
     drop(held);
     assert_eq!(guest.thread.pidfd_respelling, None);
 
-    let encode = |thread: &ThreadState<()>| {
+    let encode = |thread: &ThreadState<crate::SeededMode>| {
         bincode::serde::encode_to_vec(thread, bincode::config::standard()).unwrap()
     };
     let empty = encode(&guest.thread);
@@ -526,7 +534,10 @@ fn refusing(
     spelling: PidfdSelfSpelling,
     panic: bool,
     exit: bool,
-) -> (Detcore<NoopTool>, ScriptGuest<NoopTool>) {
+) -> (
+    Detcore<crate::SeededMode>,
+    ScriptGuest<crate::SeededMode<NoopTool>>,
+) {
     let config = Config {
         sequentialize_threads: false,
         panic_on_unsupported_syscalls: panic,
@@ -535,14 +546,14 @@ fn refusing(
         ..Config::default()
     };
     (
-        detcore::<NoopTool>(&config),
+        detcore::<crate::SeededMode<NoopTool>>(&config),
         ScriptGuest::with_config(spelling, config),
     )
 }
 
 async fn send(
-    tool: &Detcore<NoopTool>,
-    guest: &mut ScriptGuest<NoopTool>,
+    tool: &Detcore<crate::SeededMode>,
+    guest: &mut ScriptGuest<crate::SeededMode<NoopTool>>,
     pidfd: i32,
     signal: i32,
     flags: u32,

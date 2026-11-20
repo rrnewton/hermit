@@ -9,5 +9,6 @@ publish = false
 
 [dependencies]
 detcore = { package = "hermit-detcore", version = "0.5.7", path = "../detcore" }
+hermit-run-choices = { version = "0.5.7", path = "../hermit-run-choices" }
 reverie-core = { workspace = true }
 reverie-ptrace = { workspace = true }

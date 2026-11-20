@@ -34,8 +34,8 @@ use crate::types::DetPid;
 /// A thread of a KVM-like run: the guest's procfs is not the kernel's
 /// (`provides_process_signal_control`), Detcore serves `/proc` on a
 /// placeholder, and the thread's process is known.
-fn kvm_thread() -> InjectGuest<NoopTool> {
-    let mut guest = InjectGuest::<NoopTool>::new(Err(Errno::EACCES));
+fn kvm_thread() -> InjectGuest<crate::SeededMode<NoopTool>> {
+    let mut guest = InjectGuest::<crate::SeededMode>::new(Err(Errno::EACCES));
     guest.config = Config {
         directory_placeholder: Some(std::path::PathBuf::from("/placeholder")),
         ..Config::default()
@@ -47,8 +47,8 @@ fn kvm_thread() -> InjectGuest<NoopTool> {
 }
 
 /// A Detcore tool of a run at `level`.
-fn detcore_at(level: ProcLevel) -> Detcore<NoopTool> {
-    <Detcore<NoopTool> as Tool>::new(
+fn detcore_at(level: ProcLevel) -> Detcore<crate::SeededMode> {
+    <Detcore<crate::SeededMode> as Tool>::new(
         Pid::from_raw(4242),
         &Config {
             proc_level: level,

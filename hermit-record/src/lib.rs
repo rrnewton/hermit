@@ -9,7 +9,7 @@
 //! Hermit's ptrace recording tool, [`Recorder`], and the one place its
 //! Detcore instantiation is rooted.
 //!
-//! `detcore::Detcore<Recorder>` drives `reverie_ptrace`'s `TracedTask`, and
+//! `detcore::Detcore<detcore::SeededMode<Recorder>>` drives `reverie_ptrace`'s `TracedTask`, and
 //! that instantiation is large. Compiled inside the `hermit` library it shared
 //! one LLVM codegen unit with every other backend's instantiation; in its own
 //! crate it builds in a separate rustc process, beside the others. The entry
@@ -33,7 +33,7 @@ use hermit_record_format::syscall_args::vectored_offset;
 pub use recorder::Recorder;
 use reverie::process::Command;
 
-/// The recording tracer: `detcore::Detcore<Recorder>` under `reverie_ptrace`.
+/// The recording tracer: `detcore::Detcore<detcore::SeededMode<Recorder>>` under `reverie_ptrace`.
 pub type Tracer = reverie_ptrace::Tracer<detcore::GlobalState>;
 
 /// The future [`spawn_tracer`] returns.
@@ -50,9 +50,11 @@ pub type SpawnTracer = Pin<Box<dyn Future<Output = Result<Tracer, reverie::Error
 pub fn spawn_tracer(command: Command, config: detcore::Config) -> SpawnTracer {
     Box::pin(async move {
         detcore::admit_chosen_input_stream(&config, reverie::ToolStreamRole::BinaryRecord);
-        reverie_ptrace::TracerBuilder::<detcore::Detcore<Recorder>>::new(command)
-            .config(config)
-            .spawn()
-            .await
+        reverie_ptrace::TracerBuilder::<detcore::Detcore<detcore::SeededMode<Recorder>>>::new(
+            command,
+        )
+        .config(config)
+        .spawn()
+        .await
     })
 }

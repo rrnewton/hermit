@@ -7,6 +7,17 @@ branches from 0.5.0.
 
 ## Unreleased
 
+- Experimental: `hermit run --chaos` can take its timeslice and priority
+  draws from an external search tool. `--choice-tape FILE` answers each chaos
+  choice point (timeslice lengths, priority redraws, and new threads' and
+  processes' starting priorities) from a byte tape, where byte 0 or the end
+  of the tape keeps the seeded choice. `--choice-controller SOCKET`
+  asks a controller over a Unix socket, one JSON line each way.
+  `--choice-record FILE` writes every request and answer as JSON lines
+  (`"schema":1`). The same answers give the same run. A controller's refusal
+  stops the run as a policy refusal (exit 122). ptrace backend only; the
+  other backends refuse the options. See "Choice points for an external
+  controller" in docs/USER_GUIDE.md.
 - `hermit run --no-pin-threads` keeps a run with a timeslice unpinned: Linux
   places the tracer and guest threads and may migrate them, and no CPU is
   reserved. It is for measuring whether a run stays deterministic unpinned.

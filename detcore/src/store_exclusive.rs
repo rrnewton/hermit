@@ -1576,10 +1576,10 @@ mod runtime {
     use super::model::was_executable;
     use crate::Config;
     use crate::Detcore;
-    use crate::RecordOrReplay;
     use crate::aarch64_lse::elf::FilePlan;
     use crate::procmaps::MMapPath;
     use crate::procmaps::MemoryMap;
+    use crate::run_mode::RunMode;
     use crate::types::MmId;
 
     /// Whether this run reads its guests through host procfs: only where a
@@ -2782,7 +2782,7 @@ mod runtime {
     async fn report_pairs<G, T>(guest: &mut G, range: Option<(u64, u64)>, trigger: Trigger)
     where
         G: Guest<Detcore<T>>,
-        T: RecordOrReplay,
+        T: RunMode,
     {
         let dettid = guest.thread_state().dettid;
         debug!(
@@ -3001,7 +3001,7 @@ mod runtime {
     async fn send<G, T>(guest: &mut G, report: Report)
     where
         G: Guest<Detcore<T>>,
-        T: RecordOrReplay,
+        T: RunMode,
     {
         let answer = guest
             .send_rpc(crate::tool_global::store_exclusive_request(report))
@@ -3017,7 +3017,7 @@ mod runtime {
     pub(crate) async fn report_after_exec<G, T>(guest: &mut G)
     where
         G: Guest<Detcore<T>>,
-        T: RecordOrReplay,
+        T: RunMode,
     {
         if counts_store_exclusives(guest.config()) && guest.is_root_process() {
             let root = guest.tid().as_raw();
@@ -3040,7 +3040,7 @@ mod runtime {
     ) -> Option<(Range, Trigger)>
     where
         G: Guest<Detcore<T>>,
-        T: RecordOrReplay,
+        T: RunMode,
     {
         if !reads_guest_tasks(guest.config()) {
             return None;
@@ -3186,7 +3186,7 @@ mod runtime {
     pub(crate) async fn report_new_mapping<G, T>(guest: &mut G, (range, trigger): (Range, Trigger))
     where
         G: Guest<Detcore<T>>,
-        T: RecordOrReplay,
+        T: RunMode,
     {
         report_pairs(guest, Some(range), trigger).await;
     }

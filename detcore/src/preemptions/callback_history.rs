@@ -113,7 +113,7 @@ impl Token {
     }
 }
 
-pub(crate) fn begin<T>(
+pub(crate) fn begin<T: crate::RunMode>(
     thread: &mut ThreadState<T>,
     callback: Option<Callback>,
 ) -> anyhow::Result<Option<Token>> {
@@ -126,7 +126,10 @@ pub(crate) fn begin<T>(
     }))
 }
 
-pub(crate) fn pre<T>(thread: &mut ThreadState<T>, token: &mut Option<Token>) -> anyhow::Result<()> {
+pub(crate) fn pre<T: crate::RunMode>(
+    thread: &mut ThreadState<T>,
+    token: &mut Option<Token>,
+) -> anyhow::Result<()> {
     let mut boundary = token.as_mut().and_then(|token| token.boundary.take());
     let result = callbacks::pre(thread, &mut boundary);
     if let Some(token) = token {
@@ -135,7 +138,10 @@ pub(crate) fn pre<T>(thread: &mut ThreadState<T>, token: &mut Option<Token>) -> 
     result
 }
 
-pub(crate) fn post<T>(thread: &mut ThreadState<T>, token: &Option<Token>) -> anyhow::Result<()> {
+pub(crate) fn post<T: crate::RunMode>(
+    thread: &mut ThreadState<T>,
+    token: &Option<Token>,
+) -> anyhow::Result<()> {
     callbacks::post(
         thread,
         token.as_ref().and_then(|token| token.boundary.clone()),
@@ -295,7 +301,7 @@ impl State {
         self.active = true;
     }
 
-    pub fn origin<T>(
+    pub fn origin<T: crate::RunMode>(
         &self,
         thread: &ThreadState<T>,
         token: &Option<Token>,
@@ -313,7 +319,7 @@ impl State {
 
     /// The actual coordinates of a check-in at `site` of the callback `token`
     /// owns, or `None` when the check-in has no callback identity.
-    pub(crate) fn observed<T>(
+    pub(crate) fn observed<T: crate::RunMode>(
         &self,
         thread: &ThreadState<T>,
         token: Option<&Token>,
@@ -329,7 +335,7 @@ impl State {
         })
     }
 
-    pub fn refresh<T>(&self, thread: &ThreadState<T>, origin: &Origin) -> Origin {
+    pub fn refresh<T: crate::RunMode>(&self, thread: &ThreadState<T>, origin: &Origin) -> Origin {
         Origin {
             callback: origin.callback,
             site: origin.site,
@@ -497,8 +503,8 @@ mod tests {
     use crate::config::Config;
     use crate::types::DetTid;
 
-    fn thread() -> ThreadState<()> {
-        ThreadState::new(DetTid::from_raw(3), &Config::default(), ())
+    fn thread() -> ThreadState<crate::SeededMode> {
+        ThreadState::<crate::SeededMode>::new(DetTid::from_raw(3), &Config::default(), ())
     }
     fn origin() -> Origin {
         Origin {
@@ -763,7 +769,7 @@ mod tests {
                 ..Startup::default()
             },
             Box::new(crate::tool_global::GlobalResponse::StartNewThread(
-                None, None,
+                None, None, None,
             )),
         );
         let bytes = bincode::serde::encode_to_vec(&response, bincode::config::standard()).unwrap();

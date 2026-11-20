@@ -392,7 +392,7 @@ fn project_captured_reply(
 pub(crate) fn capture<G, T>(guest: &G, target: &MapsTarget) -> Result<Vec<u8>, Error>
 where
     G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
+    T: RunMode,
 {
     let fail = |reason| {
         Error::Tool(anyhow::anyhow!(

@@ -155,7 +155,7 @@ use super::procfs_levels::looked_up;
 use super::rendered_procfs::legacy_times_error;
 use super::rendered_procfs::read_guest_string;
 use crate::procfs::BoundTask;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::syscalls::helpers::report_refusal_reason;
 use crate::syscalls::namespace::decimal_fd;
 use crate::tool_local::Detcore;
@@ -706,7 +706,7 @@ fn respelled_call(sysno: Sysno, values: [usize; 6], path: usize) -> (Sysno, [usi
     }
 }
 
-impl<T: RecordOrReplay> Detcore<T> {
+impl<T: RunMode> Detcore<T> {
     /// The answer, where Detcore must give it, to a call that looks up
     /// another guest process's `cmdline`, descriptor link, `fdinfo` or
     /// descriptor directory ([`named_task_file`]) on a backend whose

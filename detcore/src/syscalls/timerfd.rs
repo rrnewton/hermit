@@ -72,7 +72,7 @@ use crate::fd::FdType;
 use crate::fd::FdinfoFacts;
 use crate::fd::LinuxTimerfd;
 use crate::fd::VirtualTimerfd;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 use crate::syscalls::helpers::PollProbe;
 use crate::syscalls::helpers::poll_deadline_for;
 use crate::tool_global::thread_observe_time;
@@ -139,7 +139,7 @@ pub(crate) fn models_are_shared(backend: &reverie::BackendCapabilities) -> bool 
 /// [`models_are_shared`]).
 pub(crate) fn enabled<T, G>(guest: &G) -> bool
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let config = guest.config();
@@ -156,7 +156,7 @@ where
 /// follow host time there, so the run ends by name instead.
 pub(crate) fn refuse_unshared_model<T, G>(guest: &G)
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let config = guest.config();
@@ -183,7 +183,7 @@ pub(crate) fn refuse(what: std::fmt::Arguments<'_>) -> ! {
 /// Whether `fd` names a timerfd in this process's descriptor table.
 pub(crate) fn is_timerfd<T, G>(guest: &G, fd: RawFd) -> bool
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     guest
@@ -195,7 +195,7 @@ where
 /// Whether this process holds a timerfd on virtual time.
 pub(crate) fn has_virtual_timerfds<T, G>(guest: &G) -> bool
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     enabled(guest) && !guest.thread_state().virtual_timerfds().is_empty()
@@ -206,7 +206,7 @@ where
 /// descriptors may include and which the host would never make readable.
 pub(crate) fn refuse_host_wait<T, G>(guest: &G, call: &str)
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if has_virtual_timerfds(guest) {
@@ -234,7 +234,7 @@ const MAX_SCANNED_DESCRIPTORS: usize = 1 << 16;
 /// refusal was due, never in a wrong result.
 fn call_may_name_timerfd<T, G>(guest: &G, call: Syscall) -> bool
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let names = |fds: &mut dyn Iterator<Item = RawFd>| {
@@ -322,7 +322,7 @@ where
 /// time, and the call may name it (`call_may_name_timerfd`).
 pub(crate) fn refuse_host_wait_for<T, G>(guest: &G, call: Syscall)
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if has_virtual_timerfds(guest)
@@ -341,7 +341,7 @@ where
 /// readiness wait, or a read of a timerfd.
 pub(crate) fn observes_timerfds<T, G>(guest: &G, call: Syscall) -> bool
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     match call {
@@ -380,7 +380,7 @@ fn itimerspec(remaining_ns: u64, interval_ns: u64) -> libc::itimerspec {
 /// `clock_gettime` would return now. Timerfd deadlines live on it.
 pub(crate) async fn timerfd_now<T, G>(guest: &mut G) -> LogicalTime
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let raw = thread_observe_time(guest).await;
@@ -395,7 +395,7 @@ where
 /// Call it in the thread's turn, before a probe that `observes_timerfds`.
 pub(crate) async fn publish_expired<T, G>(guest: &mut G) -> Option<LogicalTime>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     publish_expired_in(guest, None).await
@@ -421,7 +421,7 @@ pub(crate) struct Scratch {
 /// the guest runs no code between staging and publication.
 pub(crate) fn holds_armed_virtual_timerfd<T, G>(guest: &G) -> bool
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     enabled(guest)
@@ -445,7 +445,7 @@ pub(crate) fn reserve_scratch<S: Stack>(stack: &mut S) -> Scratch {
 /// stack is committed releases it before `publish_expired` when this holds.
 pub(crate) fn may_publish<T, G>(guest: &G, call: Syscall) -> bool
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     enabled(guest)
@@ -464,7 +464,7 @@ pub(crate) async fn publish_expired_in<T, G>(
     scratch: Option<Scratch>,
 ) -> Option<LogicalTime>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if !holds_armed_virtual_timerfd(guest) {
@@ -506,7 +506,7 @@ pub(crate) fn poll_deadline_with<T, G>(
     next_timerfd: Option<LogicalTime>,
 ) -> Option<LogicalTime>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let deadline = match (timeout, next_timerfd) {
@@ -524,7 +524,7 @@ pub(crate) async fn publish_before_probe<T, G>(
     timeout: Option<LogicalTime>,
 ) -> Option<LogicalTime>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if !observes_timerfds(guest, call) {
@@ -560,7 +560,7 @@ async fn inject_bounded<T, G, S>(
     fd: RawFd,
 ) -> i64
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
     S: SyscallInfo + Copy,
 {
@@ -581,7 +581,7 @@ where
 /// the start of this publication, refuses the run.
 async fn make_readable<T, G>(guest: &mut G, fd: RawFd, scratch: Option<Scratch>)
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let (setting, pollfd, poll_probe, _guard) = match scratch {
@@ -704,7 +704,7 @@ pub(crate) async fn settime<T, G>(
     call: syscalls::TimerfdSettime,
 ) -> Result<Option<i64>, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let fd = call.fd();
@@ -786,7 +786,7 @@ pub(crate) async fn gettime<T, G>(
     call: syscalls::TimerfdGettime,
 ) -> Result<Option<i64>, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let fd = call.fd();
@@ -817,7 +817,7 @@ where
 /// replace.
 fn take_unread<T, G>(guest: &mut G, fd: RawFd) -> Option<u64>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     let detfd = guest
@@ -862,7 +862,7 @@ pub(crate) fn finish_read<T, G>(
     result: Result<i64, Error>,
 ) -> Result<i64, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if !enabled(guest) || !matches!(result, Ok(8)) {
@@ -888,7 +888,7 @@ pub(crate) fn finish_readv<T, G>(
     result: Result<i64, Error>,
 ) -> Result<i64, Error>
 where
-    T: RecordOrReplay,
+    T: RunMode,
     G: Guest<Detcore<T>>,
 {
     if !enabled(guest) || !matches!(result, Ok(8)) {

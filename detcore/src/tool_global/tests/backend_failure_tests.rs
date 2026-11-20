@@ -85,7 +85,11 @@ impl GlobalRPC<GlobalState> for CleanupRpc<'_> {
     }
 }
 
-async fn consume_thread(state: &GlobalState, tool: &Detcore, thread: crate::ThreadState<()>) {
+async fn consume_thread(
+    state: &GlobalState,
+    tool: &Detcore,
+    thread: crate::ThreadState<crate::SeededMode>,
+) {
     let rpc = CleanupRpc {
         state,
         tid: thread.dettid,

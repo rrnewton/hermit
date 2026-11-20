@@ -321,7 +321,7 @@ fn mapped_file(maps: &[u8], address: u64) -> Option<MappedFile> {
     })
 }
 
-impl<T: crate::record_or_replay::RecordOrReplay> crate::Detcore<T> {
+impl<T: crate::run_mode::RunMode> crate::Detcore<T> {
     /// Report the files the kernel opened for the exec this image came from
     /// to the global state's host-input records ([`HostInputRecord::exec`]),
     /// each with its path in the process's root, its identity now, at the

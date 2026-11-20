@@ -41,9 +41,9 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 
 use crate::Detcore;
-use crate::record_or_replay::RecordOrReplay;
+use crate::run_mode::RunMode;
 
-pub(crate) fn capability<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) fn capability<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &G,
 ) -> Option<(ReservedInputControl, InputTaskId)> {
     if !matches!(
@@ -60,14 +60,14 @@ pub(crate) fn capability<T: RecordOrReplay, G: Guest<Detcore<T>>>(
 
 /// Invalidate before any existing scheduling request can release execution.
 /// No clock, request, event, mask or wire field is introduced by this hook.
-pub(crate) fn invalidate<T: RecordOrReplay, G: Guest<Detcore<T>>>(guest: &G) {
+pub(crate) fn invalidate<T: RunMode, G: Guest<Detcore<T>>>(guest: &G) {
     if let Some((control, task)) = capability(guest) {
         control.invalidate_operation(task);
     }
 }
 
 /// Called only after the existing scheduler reply actually admitted the task.
-pub(crate) fn granted<T: RecordOrReplay, G: Guest<Detcore<T>>>(guest: &G, kind: InputGrantKind) {
+pub(crate) fn granted<T: RunMode, G: Guest<Detcore<T>>>(guest: &G, kind: InputGrantKind) {
     if let Some((control, task)) = capability(guest) {
         control.grant(task, kind).unwrap_or_else(|error| {
             crate::scheduler::exit_on_scheduler_refusal(&format!(
@@ -79,7 +79,7 @@ pub(crate) fn granted<T: RecordOrReplay, G: Guest<Detcore<T>>>(guest: &G, kind: 
 
 /// Publish an identified run-wide producer before its native/model effect.
 /// This changes only future staging availability, never the guest operation.
-pub(crate) fn expose_global<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) fn expose_global<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &G,
     cause: &'static str,
 ) -> Result<(), reverie::Error> {
@@ -94,7 +94,7 @@ pub(crate) fn expose_global<T: RecordOrReplay, G: Guest<Detcore<T>>>(
     Ok(())
 }
 
-pub(crate) fn expose_local<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) fn expose_local<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &G,
     cause: &'static str,
 ) -> Result<(), reverie::Error> {
@@ -114,7 +114,7 @@ pub(crate) fn expose_local<T: RecordOrReplay, G: Guest<Detcore<T>>>(
 
 /// A known direct registration does not poison ordinary disjoint references.
 /// Unknown extent and native address aliases cannot certify disjointness.
-pub(crate) fn expose_local_overlap<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) fn expose_local_overlap<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &G,
     address: u64,
     length: u64,
@@ -137,7 +137,7 @@ pub(crate) fn expose_local_overlap<T: RecordOrReplay, G: Guest<Detcore<T>>>(
 
 /// Freeze the actual group before an await can publish its retirement. The
 /// registry owns the intent, including late retained members, after return.
-pub(crate) fn freeze_group<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) fn freeze_group<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &G,
 ) -> Result<(), reverie::Error> {
     let Some((control, task)) = capability(guest) else {
@@ -161,7 +161,7 @@ pub(crate) fn freeze_group<T: RecordOrReplay, G: Guest<Detcore<T>>>(
     Ok(())
 }
 
-pub(crate) fn before_exit_group<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) fn before_exit_group<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &G,
 ) -> Result<(), reverie::Error> {
     let Some((control, task)) = capability(guest) else {
@@ -181,7 +181,7 @@ pub(crate) fn before_exit_group<T: RecordOrReplay, G: Guest<Detcore<T>>>(
 /// Called at the actual native send, after existing no-effect/refusal routing.
 /// The boolean is supplied only by that route's existing completion authority
 /// or affirmative no-effect proof. An attempted reservation is not authority.
-pub(crate) fn before_signal_send<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) fn before_signal_send<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &G,
     signal: i32,
     terminal_covered: bool,
@@ -192,7 +192,7 @@ pub(crate) fn before_signal_send<T: RecordOrReplay, G: Guest<Detcore<T>>>(
     Ok(())
 }
 
-pub(crate) fn after_fatal_commit<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) fn after_fatal_commit<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &G,
     observation: crate::syscalls::FatalDeliveryObservation,
     retired_others: bool,
@@ -221,7 +221,7 @@ pub(crate) struct BackgroundAccess {
 }
 
 impl BackgroundAccess {
-    pub(crate) fn acquire<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    pub(crate) fn acquire<T: RunMode, G: Guest<Detcore<T>>>(
         guest: &G,
         call: Syscall,
     ) -> Result<Option<Self>, reverie::Error> {
@@ -302,7 +302,7 @@ impl BackgroundAccess {
 /// Register every physical original/fallback clone before constructing its
 /// native future. Original pointer input remains original pointer input: a
 /// read made for planning cannot certify the kernel's later mutable read.
-pub(crate) async fn inject_original_clone<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) async fn inject_original_clone<T: RunMode, G: Guest<Detcore<T>>>(
     guest: &mut G,
     call: Syscall,
 ) -> Result<i64, reverie::syscalls::Errno> {

@@ -1,0 +1,13 @@
+[package]
+name = "hermit-run-choices"
+description = "Hermit's ptrace run with a choice source: the root of Detcore's controlled-mode ptrace instantiation, kept apart from the ordinary runner."
+version = "0.5.7"
+edition = "2024"
+license = "BSD-3-Clause"
+repository = "https://github.com/facebookexperimental/hermit"
+publish = false
+
+[dependencies]
+detcore = { package = "hermit-detcore", version = "0.5.7", path = "../detcore" }
+reverie-core = { workspace = true }
+reverie-ptrace = { workspace = true }
