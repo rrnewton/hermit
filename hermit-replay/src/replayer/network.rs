@@ -28,12 +28,13 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
-use super::Replayer;
+use super::ReplayerWithHost;
 use crate::event::InterruptedPoll;
 use crate::event::PollEvent;
 use crate::event::PpollEvent;
 use crate::event::SelectEvent;
 use crate::event::fd_set_bytes;
+use crate::host::RecordHost;
 
 fn replay_pollfds<M: MemoryAccess>(
     memory: &mut M,
@@ -263,7 +264,7 @@ fn diverged(context: &str) -> ! {
     std::process::exit(REPLAY_DESYNC_EXIT);
 }
 
-impl Replayer {
+impl<H: RecordHost> ReplayerWithHost<H> {
     #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_epoll_wait<G: Guest<Self>>(
         &self,

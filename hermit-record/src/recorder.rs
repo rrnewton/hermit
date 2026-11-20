@@ -17,11 +17,11 @@ use std::fs as stdfs;
 use std::io;
 use std::io::Read;
 use std::io::Write;
+use std::marker::PhantomData;
 use std::os::fd::AsRawFd;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -73,6 +73,10 @@ use crate::event_stream::ChildEventStreamIds;
 use crate::event_stream::DebugEvent;
 use crate::event_stream::EventStreamId;
 use crate::event_stream::EventWriter;
+use crate::host::DescriptorAccess;
+use crate::host::DescriptorKind;
+use crate::host::PtraceHost;
+use crate::host::RecordHost;
 
 const MAX_EXEC_DEPENDENCY_DEPTH: usize = 5;
 
@@ -87,6 +91,13 @@ pub struct RecorderThreadState {
     child_stream_ids: ChildEventStreamIds,
     pending_exec: Option<PreparedExec>,
     bootstrapped: bool,
+    /// Minted only for a fresh root state (init with no parent) and
+    /// consumed once at `handle_thread_start`: whether root output
+    /// capture is still owed for this state. Inherited and restored
+    /// states carry `false` (or an already-consumed `false`), so they
+    /// preserve the root endpoints they inherited and never recapture.
+    #[serde(default)]
+    fresh_root_capture: bool,
     /// The physical output endpoints the root guest inherited, which every
     /// thread inherits from the thread that created it (`ContainerOutputs`).
     outputs: ContainerOutputs,
@@ -118,16 +129,30 @@ struct OutputDescriptions {
 }
 
 impl OutputDescriptions {
-    fn capture(pid: Pid) -> Self {
+    fn empty(pid: Pid) -> Self {
         Self {
-            stdout: Mutex::new(duplicate_regular_output(pid, libc::STDOUT_FILENO)),
-            stderr: Mutex::new(duplicate_regular_output(pid, libc::STDERR_FILENO)),
+            stdout: Mutex::new(None),
+            stderr: Mutex::new(None),
             threads: Mutex::new(std::collections::BTreeSet::from([pid.as_raw()])),
         }
     }
 
+    fn capture<H: RecordHost, G>(access: &DescriptorAccess<'_, H, G>) -> Self {
+        Self {
+            stdout: Mutex::new(duplicate_regular_output::<H, G>(
+                access,
+                libc::STDOUT_FILENO,
+            )),
+            stderr: Mutex::new(duplicate_regular_output::<H, G>(
+                access,
+                libc::STDERR_FILENO,
+            )),
+            threads: Mutex::new(std::collections::BTreeSet::from([access.pid().as_raw()])),
+        }
+    }
+
     /// Whether `candidate` is the root guest's `output_fd` description.
-    fn matches(&self, output_fd: libc::c_int, candidate: &OwnedFd) -> bool {
+    fn matches<H: RecordHost>(&self, output_fd: libc::c_int, candidate: &OwnedFd) -> bool {
         let output = match output_fd {
             libc::STDOUT_FILENO => &self.stdout,
             libc::STDERR_FILENO => &self.stderr,
@@ -137,17 +162,18 @@ impl OutputDescriptions {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         output.as_ref().is_some_and(|target| {
-            crate::fd::same_open_file_description(candidate.as_raw_fd(), target.as_raw_fd())
+            H::same_open_file_description(candidate.as_raw_fd(), target.as_raw_fd())
                 .unwrap_or(false)
         })
     }
 
     /// Drops a duplicate once no guest thread holds its description, so the
     /// recorder does not keep a description alive (a lock on it, say) after
-    /// the guest closed it. `caller` has just changed its descriptor table;
-    /// the description stays while `caller` or any other live guest thread
-    /// still holds it, as one process's table says nothing of another's.
-    fn release_unreferenced(&self, caller: Pid) {
+    /// the guest closed it. The access's process has just changed its
+    /// descriptor table; the description stays while it or any other live
+    /// guest thread still holds it, as one process's table says nothing of
+    /// another's.
+    fn release_unreferenced<H: RecordHost, G>(&self, access: &DescriptorAccess<'_, H, G>) {
         for output in [&self.stdout, &self.stderr] {
             let mut output = output
                 .lock()
@@ -155,18 +181,21 @@ impl OutputDescriptions {
             let Some(target) = output.as_ref() else {
                 continue;
             };
-            if guest_has_open_file_description(caller, target) {
+            if guest_has_open_file_description::<H, G>(access, target) {
                 continue;
             }
             let mut threads = self
                 .threads
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            threads.retain(|thread| Path::new(&format!("/proc/{thread}")).exists());
-            if !threads
-                .iter()
-                .any(|thread| guest_has_open_file_description(Pid::from_raw(*thread), target))
-            {
+            threads.retain(|thread| H::guest_task_exists(access, Pid::from_raw(*thread)));
+            if !threads.iter().any(|thread| {
+                let thread = Pid::from_raw(*thread);
+                guest_has_open_file_description::<H, ()>(
+                    &DescriptorAccess::task(access.storage(), thread, thread),
+                    target,
+                )
+            }) {
                 output.take();
             }
         }
@@ -191,7 +220,7 @@ struct ContainerOutputs {
 impl ContainerOutputs {
     /// Whether `metadata` names the root guest's stdout, and whether it names
     /// its stderr.
-    fn matching(&self, metadata: &std::fs::Metadata) -> (bool, bool) {
+    fn matching(&self, metadata: &reverie::DescriptorMetadata) -> (bool, bool) {
         (
             self.stdout
                 .is_some_and(|identity| identity.matches(metadata)),
@@ -323,27 +352,12 @@ fn exec_request_is_live_executable(request: &ExecRequest) -> bool {
     )
 }
 
-fn same_guest_open_file_description(
-    pid: Pid,
+fn same_guest_open_file_description<H: RecordHost, G>(
+    access: &DescriptorAccess<'_, H, G>,
     left: libc::c_int,
     right: libc::c_int,
 ) -> io::Result<bool> {
-    const KCMP_FILE: libc::c_int = 0;
-    let comparison = unsafe {
-        libc::syscall(
-            libc::SYS_kcmp,
-            pid.as_raw(),
-            pid.as_raw(),
-            KCMP_FILE,
-            left,
-            right,
-        )
-    };
-    if comparison == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(comparison == 0)
-    }
+    H::guest_fds_share_description(access, left, right)
 }
 
 #[derive(
@@ -387,63 +401,74 @@ fn require_mkdir_probe_closed(result: Result<i64, Errno>) -> Result<(), Errno> {
 }
 
 impl OutputIdentity {
-    fn for_fd(pid: Pid, fd: i32) -> Option<Self> {
-        let metadata = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())).ok()?;
+    fn for_fd<H: RecordHost, G>(access: &DescriptorAccess<'_, H, G>, fd: i32) -> Option<Self> {
+        let metadata = H::fd_metadata(access, fd).ok().flatten()?;
         Some(Self {
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            device: metadata.device,
+            inode: metadata.inode,
         })
     }
 
-    fn matches(&self, metadata: &std::fs::Metadata) -> bool {
-        self.device == metadata.dev() && self.inode == metadata.ino()
+    fn matches(&self, metadata: &reverie::DescriptorMetadata) -> bool {
+        self.device == metadata.device && self.inode == metadata.inode
     }
 }
 
-fn duplicate_regular_output(pid: Pid, fd: libc::c_int) -> Option<std::os::fd::OwnedFd> {
-    let metadata = std::fs::metadata(format!("/proc/{}/fd/{fd}", pid.as_raw())).ok()?;
+fn duplicate_regular_output<H: RecordHost, G>(
+    access: &DescriptorAccess<'_, H, G>,
+    fd: libc::c_int,
+) -> Option<std::os::fd::OwnedFd> {
+    let metadata = H::fd_metadata(access, fd).ok().flatten()?;
     metadata
-        .file_type()
         .is_file()
-        .then(|| crate::fd::duplicate_guest_fd(pid, fd).ok())
+        .then(|| H::duplicate_guest_fd(access, access.pid(), fd).ok())
         .flatten()
 }
-fn guest_has_open_file_description(pid: Pid, target: &std::os::fd::OwnedFd) -> bool {
-    let entries = match std::fs::read_dir(format!("/proc/{}/fd", pid.as_raw())) {
-        Ok(entries) => entries,
-        Err(_) => return true,
-    };
+fn guest_has_open_file_description<H: RecordHost, G>(
+    access: &DescriptorAccess<'_, H, G>,
+    target: &std::os::fd::OwnedFd,
+) -> bool {
     let mut compared = false;
     let mut saw_any = false;
-    for entry in entries.flatten() {
-        let Some(fd) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<libc::c_int>().ok())
-        else {
-            continue;
-        };
+    let mut found = false;
+    let listed = H::visit_descriptor_numbers(access, &mut |fd| {
         saw_any = true;
-        let Ok(candidate) = crate::fd::duplicate_guest_fd(pid, fd) else {
-            continue;
+        let Ok(candidate) = H::duplicate_guest_fd(access, access.pid(), fd) else {
+            return true;
         };
-        match crate::fd::same_open_file_description(candidate.as_raw_fd(), target.as_raw_fd()) {
-            Ok(true) => return true,
-            Ok(false) => compared = true,
-            Err(error) => tracing::debug!(
-                %error,
-                fd,
-                "could not compare guest fd while releasing captured output"
-            ),
+        match H::same_open_file_description(candidate.as_raw_fd(), target.as_raw_fd()) {
+            Ok(true) => {
+                found = true;
+                false
+            }
+            Ok(false) => {
+                compared = true;
+                true
+            }
+            Err(error) => {
+                tracing::debug!(
+                    %error,
+                    fd,
+                    "could not compare guest fd while releasing captured output"
+                );
+                true
+            }
         }
+    });
+    if listed.is_err() {
+        return true;
     }
-    saw_any && !compared
+    found || (saw_any && !compared)
 }
 
 /// A Reverie tool that records syscalls. Note that only syscalls that cannot be
 /// made deterministic are forwarded to this tool.
 #[derive(Serialize, Deserialize)]
-pub struct Recorder {
+pub struct RecorderWithHost<H: RecordHost> {
+    /// The backend host this recorder queries for descriptor state and
+    /// descriptor duplication ([`RecordHost`]); stateless, never stored.
+    #[serde(skip)]
+    _host: PhantomData<H>,
     // TODO: We'll need to keep track of file descriptors here in order to
     // determine if a file descriptor should be fully recorded or simply cached
     // with a reflink. We can use `fstatfs` to figure out if the target file
@@ -453,25 +478,33 @@ pub struct Recorder {
     // Keep track of the data directory. Each thread uses this path to open its
     // event stream.
     data: PathBuf,
-    /// This process's descriptors 1 and 2 when it was created. Only the root
-    /// guest's are the container's output endpoints, so only the root thread
-    /// takes them (`RecorderThreadState::outputs`).
-    stdout: Option<OutputIdentity>,
-    stderr: Option<OutputIdentity>,
+    /// The host's installed descriptor provider for this run,
+    /// installed at `handle_thread_start` before output capture.
+    #[serde(skip)]
+    init: H::InitStorage,
+    /// This process's host pid from construction, naming the table
+    /// eager root capture reads (hosts with
+    /// `CAPTURE_AT_CONSTRUCTION`).
+    root_pid: libc::pid_t,
 }
 
-impl Default for Recorder {
+/// The recorder on the ptrace backend's host; what `hermit record`
+/// instantiates today.
+pub type Recorder = RecorderWithHost<PtraceHost>;
+
+impl<H: RecordHost> Default for RecorderWithHost<H> {
     fn default() -> Self {
         Self {
+            _host: PhantomData,
             data: PathBuf::new(),
-            stdout: None,
-            stderr: None,
+            init: H::InitStorage::default(),
+            root_pid: 0,
         }
     }
 }
 
 #[reverie::tool]
-impl Tool for Recorder {
+impl<H: RecordHost> Tool for RecorderWithHost<H> {
     type GlobalState = detcore::GlobalState;
     type ThreadState = RecorderThreadState;
 
@@ -481,10 +514,40 @@ impl Tool for Recorder {
 
     fn new(pid: Pid, cfg: &<Self::GlobalState as GlobalTool>::Config) -> Self {
         Self {
+            _host: PhantomData,
             data: cfg.replay_data.as_ref().unwrap().clone(),
-            stdout: OutputIdentity::for_fd(pid, libc::STDOUT_FILENO),
-            stderr: OutputIdentity::for_fd(pid, libc::STDERR_FILENO),
+            init: H::InitStorage::default(),
+            root_pid: pid.as_raw(),
         }
+    }
+
+    /// First pre-execution guest boundary: install the run's
+    /// descriptor provider, then capture the root endpoints only
+    /// into a fresh root state (consuming its one-use flag), before
+    /// any descriptor-mutating injection or recorded write.
+    /// Descendant and restored states keep the endpoints they
+    /// inherited and never recapture.
+    async fn handle_thread_start<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
+        H::install(&self.init, guest.descriptor_provider());
+        if !H::CAPTURE_AT_CONSTRUCTION && guest.thread_state().fresh_root_capture {
+            let table = guest.tid();
+            let stdout = OutputIdentity::for_fd::<H, G>(
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
+                libc::STDOUT_FILENO,
+            );
+            let stderr = OutputIdentity::for_fd::<H, G>(
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
+                libc::STDERR_FILENO,
+            );
+            let descriptions = std::sync::Arc::new(OutputDescriptions::capture::<H, G>(
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
+            ));
+            let state = guest.thread_state_mut();
+            state.outputs = ContainerOutputs { stdout, stderr };
+            state.output_descriptions = descriptions;
+            state.fresh_root_capture = false;
+        }
+        Ok(())
     }
 
     fn init_thread_state(
@@ -509,16 +572,28 @@ impl Tool for Recorder {
             pending_exec: None,
             interrupted_poll: None,
             bootstrapped: parent.is_some_and(|(_, state)| state.bootstrapped),
+            fresh_root_capture: parent.is_none() && !H::CAPTURE_AT_CONSTRUCTION,
             outputs: match parent {
-                None => ContainerOutputs {
-                    stdout: self.stdout,
-                    stderr: self.stderr,
-                },
+                None if H::CAPTURE_AT_CONSTRUCTION => {
+                    let root = Pid::from_raw(self.root_pid);
+                    let access = DescriptorAccess::<H, ()>::task(&self.init, root, root);
+                    ContainerOutputs {
+                        stdout: OutputIdentity::for_fd::<H, ()>(&access, libc::STDOUT_FILENO),
+                        stderr: OutputIdentity::for_fd::<H, ()>(&access, libc::STDERR_FILENO),
+                    }
+                }
+                None => ContainerOutputs::default(),
                 Some((_, state)) => state.outputs,
             },
             output_descriptions: match parent {
+                None if H::CAPTURE_AT_CONSTRUCTION => {
+                    let root = Pid::from_raw(self.root_pid);
+                    std::sync::Arc::new(OutputDescriptions::capture::<H, ()>(
+                        &DescriptorAccess::task(&self.init, root, root),
+                    ))
+                }
                 None => {
-                    std::sync::Arc::new(OutputDescriptions::capture(Pid::from_raw(child.as_raw())))
+                    std::sync::Arc::new(OutputDescriptions::empty(Pid::from_raw(child.as_raw())))
                 }
                 Some((_, state)) => {
                     state
@@ -816,11 +891,13 @@ impl Tool for Recorder {
             None => Ok(()),
         };
         guest.thread_state_mut().bootstrapped = true;
-        guest
-            .thread_state()
-            .output_descriptions
-            .clone()
-            .release_unreferenced(guest.pid());
+        let table = guest.tid();
+        let descriptions = guest.thread_state().output_descriptions.clone();
+        descriptions.release_unreferenced::<H, G>(&DescriptorAccess::guest_bound(
+            &self.init,
+            &mut *guest,
+            table,
+        ));
         result
     }
 
@@ -836,7 +913,7 @@ impl Tool for Recorder {
     }
 }
 
-impl Recorder {
+impl<H: RecordHost> RecorderWithHost<H> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#662): Audit recorded physical-open classification.
     async fn handle_open<G: Guest<Self>>(
@@ -845,15 +922,21 @@ impl Recorder {
         syscall: Syscall,
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
+        let table = guest.tid();
         let materialize = result
             .ok()
             .and_then(|fd| {
-                std::fs::metadata(format!("/proc/{}/fd/{fd}", guest.tid().as_raw())).ok()
+                H::fd_metadata(
+                    &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
+                    fd as libc::c_int,
+                )
+                .ok()
+                .flatten()
             })
             .map_or(OpenMaterialization::None, |metadata| {
-                if metadata.file_type().is_dir() {
+                if metadata.is_dir() {
                     OpenMaterialization::Directory
-                } else if metadata.file_type().is_file() {
+                } else if metadata.is_file() {
                     OpenMaterialization::RegularFile
                 } else {
                     OpenMaterialization::None
@@ -960,41 +1043,48 @@ impl Recorder {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#662): Audit guest FD replay classification.
-    fn fd_replay_kind(&self, pid: Pid, fd: libc::c_int) -> ReplayFdKind {
-        let path = format!("/proc/{}/fd/{fd}", pid.as_raw());
-        if std::fs::read_link(&path)
-            .ok()
-            .is_some_and(|target| target == std::path::Path::new("anon_inode:[eventfd]"))
+    async fn fd_replay_kind<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        pid: Pid,
+        fd: libc::c_int,
+    ) -> ReplayFdKind {
+        match H::classify_fd(
+            &mut DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
+            fd,
+        )
+        .await
         {
-            return ReplayFdKind::Eventfd;
-        }
-
-        if std::fs::metadata(path)
-            .ok()
-            .is_some_and(|metadata| metadata.file_type().is_file())
-        {
-            ReplayFdKind::RegularFile
-        } else {
-            ReplayFdKind::None
+            DescriptorKind::Eventfd => ReplayFdKind::Eventfd,
+            DescriptorKind::RegularFile => ReplayFdKind::RegularFile,
+            DescriptorKind::Signalfd | DescriptorKind::Other => ReplayFdKind::None,
         }
     }
 
-    fn epoll_requires_replay_kernel_side_effect(&self, pid: Pid, fd: libc::c_int) -> bool {
-        let Ok(fdinfo) = std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", pid.as_raw()))
+    async fn epoll_requires_replay_kernel_side_effect<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        pid: Pid,
+        fd: libc::c_int,
+    ) -> bool {
+        let Ok(Some(fdinfo)) = H::fdinfo_text(
+            &mut DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
+            fd,
+        )
+        .await
         else {
             return false;
         };
-        let targets = fdinfo.lines().filter_map(|line| {
+        let mut saw_target = false;
+        for target in fdinfo.lines().filter_map(|line| {
             line.strip_prefix("tfd:")?
                 .split_whitespace()
                 .next()?
                 .parse::<libc::c_int>()
                 .ok()
-        });
-        let mut saw_target = false;
-        for target in targets {
+        }) {
             saw_target = true;
-            if self.fd_replay_kind(pid, target) == ReplayFdKind::None {
+            if self.fd_replay_kind(guest, pid, target).await == ReplayFdKind::None {
                 return false;
             }
         }
@@ -1011,7 +1101,7 @@ impl Recorder {
         guest
             .thread_state()
             .output_descriptions
-            .matches(output_fd, candidate)
+            .matches::<H>(output_fd, candidate)
     }
 
     async fn handle_fd_table_mutation<G: Guest<Self>>(
@@ -1020,11 +1110,13 @@ impl Recorder {
         syscall: Syscall,
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
-        guest
-            .thread_state()
-            .output_descriptions
-            .clone()
-            .release_unreferenced(guest.pid());
+        let table = guest.tid();
+        let descriptions = guest.thread_state().output_descriptions.clone();
+        descriptions.release_unreferenced::<H, G>(&DescriptorAccess::guest_bound(
+            &self.init,
+            &mut *guest,
+            table,
+        ));
         self.record_event(guest, result.map(SyscallEvent::Return));
         result
     }
@@ -1263,30 +1355,41 @@ impl Recorder {
             Err(error) => return Err(io::Error::from_raw_os_error(error.into_raw())),
         };
 
+        let pid = guest.pid();
         let mut candidate_fds = Vec::new();
-        for entry in std::fs::read_dir(format!("/proc/{}/fd", guest.pid().as_raw()))? {
-            let entry = entry?;
-            let Some(fd) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<libc::c_int>().ok())
-            else {
-                continue;
-            };
-            let metadata = match std::fs::metadata(entry.path()) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
-            };
-            if metadata.dev() == target_identity.device && metadata.ino() == target_identity.inode {
-                candidate_fds.push(fd);
-            }
+        let mut scan_error: Option<io::Error> = None;
+        let listed = {
+            let access = DescriptorAccess::guest_bound(&self.init, &mut *guest, pid);
+            H::visit_descriptor_numbers(&access, |fd| match H::fd_metadata(&access, fd) {
+                Ok(Some(metadata))
+                    if metadata.device == target_identity.device
+                        && metadata.inode == target_identity.inode =>
+                {
+                    candidate_fds.push(fd);
+                    true
+                }
+                Ok(_) => true,
+                Err(error) => {
+                    scan_error = Some(error);
+                    false
+                }
+            })
+        };
+        listed?;
+        if let Some(error) = scan_error {
+            return Err(error);
         }
         candidate_fds.sort_unstable();
 
         let mut aliases = Vec::new();
         for fd in candidate_fds {
-            if fd != target_fd && !same_guest_open_file_description(guest.pid(), target_fd, fd)? {
+            if fd != target_fd
+                && !same_guest_open_file_description::<H, G>(
+                    &DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
+                    target_fd,
+                    fd,
+                )?
+            {
                 continue;
             }
             let descriptor_flags = guest
@@ -1658,6 +1761,7 @@ mod finish_tests {
             child_stream_ids: ChildEventStreamIds::default(),
             pending_exec: None,
             bootstrapped: true,
+            fresh_root_capture: false,
             outputs: ContainerOutputs::default(),
             output_descriptions: Default::default(),
             interrupted_poll: None,

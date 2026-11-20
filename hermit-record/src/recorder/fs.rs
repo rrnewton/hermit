@@ -9,8 +9,6 @@
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::FileExt;
-use std::os::unix::fs::FileTypeExt;
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 
 use reverie::Errno;
@@ -37,7 +35,7 @@ use reverie::syscalls::family::StatFamily;
 use reverie::syscalls::family::WriteFamily;
 use reverie::syscalls::ioctl;
 
-use super::Recorder;
+use super::RecorderWithHost;
 use crate::event::FileCloneEvent;
 use crate::event::FileCloneImage;
 use crate::event::FileExtent;
@@ -50,6 +48,9 @@ use crate::event::SyscallEvent;
 use crate::event::WriteEvent;
 use crate::event::deterministic_ioctl_error;
 use crate::event::xattr_query_output;
+use crate::host::DescriptorAccess;
+use crate::host::DescriptorKind;
+use crate::host::RecordHost;
 use crate::vectored_offset;
 
 /// Read the first `length` output bytes of a vectored read from the guest's
@@ -94,11 +95,8 @@ fn read_iovec_output<M: MemoryAccess>(
     Ok(buf)
 }
 
-fn consumed_sigpipe_count(pid: libc::pid_t, fd: libc::c_int, bytes: &[u8]) -> u64 {
-    let path = format!("/proc/{pid}/fd/{fd}");
-    if !std::fs::read_link(path)
-        .is_ok_and(|target| target == std::path::Path::new("anon_inode:[signalfd]"))
-    {
+fn consumed_sigpipe_count(is_signalfd: bool, bytes: &[u8]) -> u64 {
+    if !is_signalfd {
         return 0;
     }
 
@@ -157,7 +155,7 @@ fn uses_append_offset(status_flags: libc::c_int, write_flags: libc::c_int) -> bo
 
 #[cfg(test)]
 fn shares_open_file_description(left: libc::c_int, right: libc::c_int) -> bool {
-    match crate::fd::same_open_file_description(left, right) {
+    match crate::host::PtraceHost::same_open_file_description(left, right) {
         Ok(shared) => shared,
         Err(error) => {
             tracing::debug!(
@@ -171,18 +169,18 @@ fn shares_open_file_description(left: libc::c_int, right: libc::c_int) -> bool {
     }
 }
 
-fn output_file_offset(
-    pid: libc::pid_t,
+fn output_file_offset<H: RecordHost, G>(
+    access: &DescriptorAccess<'_, H, G>,
     fd: libc::c_int,
     placement: WritePlacement,
-    metadata: &std::fs::Metadata,
+    metadata: &reverie::DescriptorMetadata,
     count: i64,
 ) -> Option<i64> {
-    if !metadata.file_type().is_file() {
+    if !metadata.is_file() {
         return None;
     }
 
-    let fdinfo = std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{fd}")).ok()?;
+    let fdinfo = H::fdinfo_text_at(access, fd).ok().flatten()?;
     let position = fdinfo
         .lines()
         .find_map(|line| line.strip_prefix("pos:\t"))
@@ -197,7 +195,7 @@ fn output_file_offset(
         _ => 0,
     };
     if uses_append_offset(status_flags, write_flags) {
-        return i64::try_from(metadata.len()).ok()?.checked_sub(count);
+        return i64::try_from(metadata.len).ok()?.checked_sub(count);
     }
 
     match placement {
@@ -364,33 +362,32 @@ fn recorder_sendfile(
 /// copied by the recorder when its file-size limit is the guest's
 /// (`copy_under_the_guests_limit`); anything else fails with EFAULT, as
 /// Linux's call does, but without the copy Linux would have made.
-async fn copy_at_offset<G: Guest<Recorder>>(
+async fn copy_at_offset<H: RecordHost, G: Guest<RecorderWithHost<H>>>(
+    init: &H::InitStorage,
     guest: &mut G,
     pid: reverie::Pid,
     task: reverie::Pid,
     syscall: Sendfile,
     position: libc::loff_t,
 ) -> Result<Result<i64, Errno>, Errno> {
-    // SAFETY: kcmp only compares two of the task's descriptors.
-    let order = unsafe {
-        libc::syscall(
-            libc::SYS_kcmp,
-            task.as_raw(),
-            task.as_raw(),
-            0, // KCMP_FILE
-            libc::c_long::from(syscall.in_fd()),
-            libc::c_long::from(syscall.out_fd()),
-        )
+    let (descriptions, input, output_file) = {
+        let access = DescriptorAccess::guest_bound(init, &mut *guest, task);
+        let order = match H::guest_fds_share_description(&access, syscall.in_fd(), syscall.out_fd())
+        {
+            Ok(true) => 0,
+            Ok(false) => 1,
+            Err(_) => -1,
+        };
+        let input_file = H::fd_metadata(&access, syscall.in_fd()).ok().flatten();
+        let output_file = H::fd_metadata(&access, syscall.out_fd()).ok().flatten();
+        let same_file = input_file
+            .as_ref()
+            .zip(output_file.as_ref())
+            .map(|(input, output)| (input.device, input.inode) == (output.device, output.inode));
+        let descriptions = Descriptions::of(order, same_file);
+        let input = H::duplicate_guest_thread_fd(&access, pid, task, syscall.in_fd()).ok();
+        (descriptions, input, output_file)
     };
-    let metadata =
-        |fd: libc::c_int| std::fs::metadata(format!("/proc/{}/fd/{fd}", task.as_raw())).ok();
-    let (input_file, output_file) = (metadata(syscall.in_fd()), metadata(syscall.out_fd()));
-    let same_file = input_file
-        .as_ref()
-        .zip(output_file.as_ref())
-        .map(|(input, output)| (input.dev(), input.ino()) == (output.dev(), output.ino()));
-    let descriptions = Descriptions::of(order, same_file);
-    let input = crate::fd::duplicate_guest_thread_fd(pid, task, syscall.in_fd()).ok();
     if descriptions == Descriptions::Distinct
         && let Some(input) = &input
     {
@@ -410,12 +407,16 @@ async fn copy_at_offset<G: Guest<Recorder>>(
     // output: the call runs in the recorder's process, where SIGPIPE cannot
     // arise for a regular file and the file-size limit is the recorder's.
     let pair = input
-        .filter(|_| {
-            output_file
-                .as_ref()
-                .is_some_and(|output| output.file_type().is_file())
-        })
-        .zip(crate::fd::duplicate_guest_thread_fd(pid, task, syscall.out_fd()).ok());
+        .filter(|_| output_file.as_ref().is_some_and(|output| output.is_file()))
+        .zip(
+            H::duplicate_guest_thread_fd(
+                &DescriptorAccess::guest_bound(init, &mut *guest, task),
+                pid,
+                task,
+                syscall.out_fd(),
+            )
+            .ok(),
+        );
     if let Some((input, output)) = &pair
         && recorder_copy_fits(pid, output, syscall.count()).unwrap_or(false)
     {
@@ -453,7 +454,7 @@ async fn copy_at_offset<G: Guest<Recorder>>(
 /// guest's own SIGXFSZ, with the native signal information, and refuses the
 /// write (EFBIG). Different limits cannot be copied this way: EFAULT without
 /// the copy.
-async fn copy_under_the_guests_limit<G: Guest<Recorder>>(
+async fn copy_under_the_guests_limit<H: RecordHost, G: Guest<RecorderWithHost<H>>>(
     guest: &mut G,
     pid: reverie::Pid,
     syscall: Sendfile,
@@ -511,20 +512,22 @@ enum SendfileStart {
 /// Callers handle either error by falling back to read and write, which record
 /// their bytes. `offset` is the guest's offset argument, if it passed one,
 /// with the value it held if readable.
-fn sendfile_source(
+fn sendfile_source<H: RecordHost, G>(
+    access: &DescriptorAccess<'_, H, G>,
     pid: reverie::Pid,
     task: reverie::Pid,
     syscall: Sendfile,
     offset: Option<Option<i64>>,
 ) -> Result<Option<(std::fs::File, SendfileStart)>, Errno> {
-    let metadata = |fd: libc::c_int| std::fs::metadata(format!("/proc/{}/fd/{fd}", task.as_raw()));
-    let (Ok(input), Ok(output)) = (metadata(syscall.in_fd()), metadata(syscall.out_fd())) else {
+    let metadata = |fd: libc::c_int| H::fd_metadata(access, fd).ok().flatten();
+    let (Some(input), Some(output)) = (metadata(syscall.in_fd()), metadata(syscall.out_fd()))
+    else {
         return Ok(None);
     };
-    let same_file = output.file_type().is_file()
-        && input.file_type().is_file()
-        && (input.dev(), input.ino()) == (output.dev(), output.ino());
-    let file = crate::fd::duplicate_guest_thread_fd(pid, task, syscall.in_fd())
+    let same_file = output.is_file()
+        && input.is_file()
+        && (input.device, input.inode) == (output.device, output.inode);
+    let file = H::duplicate_guest_thread_fd(access, pid, task, syscall.in_fd())
         .map(std::fs::File::from)
         .map_err(|error| match error.raw_os_error() {
             Some(libc::EBADF) => Errno::EBADF,
@@ -768,14 +771,15 @@ fn capture_clone_snapshot(
     spool_clone_snapshot(source, source_offset, length, data)
 }
 
-fn private_clone_snapshot(
+fn private_clone_snapshot<H: RecordHost, G>(
+    access: &DescriptorAccess<'_, H, G>,
     pid: reverie::Pid,
     destination_fd: libc::c_int,
     source: &std::fs::File,
     source_offset: u64,
     length: u64,
 ) -> std::io::Result<std::fs::File> {
-    let destination = std::fs::read_link(format!("/proc/{}/fd/{destination_fd}", pid.as_raw()))?;
+    let destination = H::fd_link(access, destination_fd)?;
     let relative = destination.strip_prefix("/").map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -820,7 +824,7 @@ fn private_clone_snapshot(
     Ok(private)
 }
 
-impl Recorder {
+impl<H: RecordHost> RecorderWithHost<H> {
     /// Records the vectored read family (`readv`/`preadv`/`preadv2`). Writes only
     /// need their return count (see `handle_write_family`), but vectored reads
     /// scatter output across guest `iovec` buffers, so we capture the exact
@@ -835,21 +839,37 @@ impl Recorder {
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
 
-        self.record_event(
-            guest,
-            result.and_then(|length| {
-                let bytes = read_iovec_output(&guest.memory(), iov_addr, iovcnt, length as usize)?;
-                Ok(SyscallEvent::ReadvV2(ReadEvent {
-                    consumed_sigpipe_count: consumed_sigpipe_count(
-                        guest.pid().as_raw(),
-                        fd,
-                        &bytes,
-                    ),
-                    replay_fd_kind: self.fd_replay_kind(guest.pid(), fd),
-                    bytes,
-                }))
-            }),
-        );
+        let event = match result {
+            Ok(length) => {
+                match read_iovec_output(&guest.memory(), iov_addr, iovcnt, length as usize) {
+                    Ok(bytes) => {
+                        let pid = guest.pid();
+                        let kind = H::classify_fd(
+                            &mut DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
+                            fd,
+                        )
+                        .await;
+                        Ok(SyscallEvent::ReadvV2(ReadEvent {
+                            consumed_sigpipe_count: consumed_sigpipe_count(
+                                kind == DescriptorKind::Signalfd,
+                                &bytes,
+                            ),
+                            replay_fd_kind: match kind {
+                                DescriptorKind::Eventfd => ReplayFdKind::Eventfd,
+                                DescriptorKind::RegularFile => ReplayFdKind::RegularFile,
+                                DescriptorKind::Signalfd | DescriptorKind::Other => {
+                                    ReplayFdKind::None
+                                }
+                            },
+                            bytes,
+                        }))
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        self.record_event(guest, event);
 
         result
     }
@@ -861,27 +881,48 @@ impl Recorder {
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
 
-        self.record_event(
-            guest,
-            result.and_then(|length| {
+        let event = match result {
+            Ok(length) => {
                 let mut buf = vec![0; length as usize];
                 // A read that transfers nothing never touches the buffer,
                 // which may then be NULL.
-                if !buf.is_empty() {
-                    let addr = syscall.buf().ok_or(Errno::EFAULT)?;
-                    guest.memory().read_exact(addr, &mut buf)?;
+                let copied = if buf.is_empty() {
+                    Ok(())
+                } else {
+                    syscall
+                        .buf()
+                        .ok_or(Errno::EFAULT)
+                        .and_then(|addr| guest.memory().read_exact(addr, &mut buf))
+                };
+                match copied {
+                    Ok(()) => {
+                        let pid = guest.pid();
+                        let kind = H::classify_fd(
+                            &mut DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
+                            syscall.fd(),
+                        )
+                        .await;
+                        Ok(SyscallEvent::ReadV2(ReadEvent {
+                            consumed_sigpipe_count: consumed_sigpipe_count(
+                                kind == DescriptorKind::Signalfd,
+                                &buf,
+                            ),
+                            bytes: buf,
+                            replay_fd_kind: match kind {
+                                DescriptorKind::Eventfd => ReplayFdKind::Eventfd,
+                                DescriptorKind::RegularFile => ReplayFdKind::RegularFile,
+                                DescriptorKind::Signalfd | DescriptorKind::Other => {
+                                    ReplayFdKind::None
+                                }
+                            },
+                        }))
+                    }
+                    Err(error) => Err(error),
                 }
-                Ok(SyscallEvent::ReadV2(ReadEvent {
-                    consumed_sigpipe_count: consumed_sigpipe_count(
-                        guest.pid().as_raw(),
-                        syscall.fd(),
-                        &buf,
-                    ),
-                    bytes: buf,
-                    replay_fd_kind: self.fd_replay_kind(guest.pid(), syscall.fd()),
-                }))
-            }),
-        );
+            }
+            Err(error) => Err(error),
+        };
+        self.record_event(guest, event);
 
         result
     }
@@ -917,14 +958,16 @@ impl Recorder {
     ) -> Result<i64, Errno> {
         let result = guest.inject(Syscall::from(syscall)).await;
         let pid = guest.pid();
-        let event = self.write_event(
-            &*guest,
-            pid,
-            pid,
-            syscall.fd(),
-            WritePlacement::of(syscall),
-            result,
-        );
+        let event = self
+            .write_event(
+                guest,
+                pid,
+                pid,
+                syscall.fd(),
+                WritePlacement::of(syscall),
+                result,
+            )
+            .await;
         self.record_event(guest, Ok(SyscallEvent::WriteV2(event)));
 
         result
@@ -979,7 +1022,13 @@ impl Recorder {
         // gives.
         let offset_fault =
             matches!(offset, Some(Some(_))) && permissions.is_some_and(|(_, writable)| !writable);
-        let source = match sendfile_source(pid, task, syscall, offset) {
+        let source = match sendfile_source::<H, G>(
+            &DescriptorAccess::guest_bound(&self.init, &mut *guest, task),
+            pid,
+            task,
+            syscall,
+            offset,
+        ) {
             Ok(source) => source,
             Err(error) => {
                 self.record_event(guest, Err(error));
@@ -988,7 +1037,7 @@ impl Recorder {
         };
         let result = match (offset_fault, offset.flatten()) {
             (true, Some(position)) => {
-                match copy_at_offset(guest, pid, task, syscall, position).await {
+                match copy_at_offset(&self.init, guest, pid, task, syscall, position).await {
                     Ok(result) => result,
                     Err(error) => {
                         self.record_event(guest, Err(error));
@@ -998,14 +1047,16 @@ impl Recorder {
             }
             _ => guest.inject(Syscall::Sendfile(syscall)).await,
         };
-        let write = self.write_event(
-            &*guest,
-            pid,
-            task,
-            syscall.out_fd(),
-            WritePlacement::Position,
-            result,
-        );
+        let write = self
+            .write_event(
+                guest,
+                pid,
+                task,
+                syscall.out_fd(),
+                WritePlacement::Position,
+                result,
+            )
+            .await;
         let bytes = match (result, source) {
             (Ok(count), Some((file, start))) if count > 0 => {
                 let start = match start {
@@ -1058,21 +1109,34 @@ impl Recorder {
     /// task `task` of process `pid`, placed as `placement`: the captured
     /// output it reaches, the regular-file offset replay writes at, and the
     /// SIGPIPE the kernel generated.
-    fn write_event<G: Guest<Self>>(
+    async fn write_event<G: Guest<Self>>(
         &self,
-        guest: &G,
+        guest: &mut G,
         pid: reverie::Pid,
         task: reverie::Pid,
         fd: libc::c_int,
         placement: WritePlacement,
         result: Result<i64, Errno>,
     ) -> WriteEvent {
-        let metadata = std::fs::metadata(format!("/proc/{}/fd/{fd}", task.as_raw())).ok();
+        let metadata = H::fd_metadata(
+            &DescriptorAccess::guest_bound(&self.init, &mut *guest, task),
+            fd,
+        )
+        .ok()
+        .flatten();
         let outputs = guest.thread_state().outputs;
         let (output_fd, shares_output_ofd) = metadata.as_ref().map_or((None, false), |metadata| {
             let (stdout_matches, stderr_matches) = outputs.matching(metadata);
-            let candidate = (metadata.file_type().is_file() && (stdout_matches || stderr_matches))
-                .then(|| crate::fd::duplicate_guest_thread_fd(pid, task, fd).ok())
+            let candidate = (metadata.is_file() && (stdout_matches || stderr_matches))
+                .then(|| {
+                    H::duplicate_guest_thread_fd(
+                        &DescriptorAccess::guest_bound(&self.init, &mut *guest, task),
+                        pid,
+                        task,
+                        fd,
+                    )
+                    .ok()
+                })
                 .flatten();
             let stdout_shares = stdout_matches
                 && candidate.as_ref().is_some_and(|candidate| {
@@ -1096,20 +1160,22 @@ impl Recorder {
             }
         });
         let file_offset = match (result, metadata.as_ref()) {
-            (Ok(count), Some(metadata)) => {
-                output_file_offset(task.as_raw(), fd, placement, metadata, count)
-            }
+            (Ok(count), Some(metadata)) => output_file_offset::<H, G>(
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, task),
+                fd,
+                placement,
+                metadata,
+                count,
+            ),
             _ => None,
         };
         let output_offset = output_fd.and(file_offset);
         let advances_output_offset =
             output_offset.is_some() && shares_output_ofd && write_advances_output_offset(placement);
         let generated_sigpipe = result == Err(Errno::EPIPE)
-            && metadata.is_some_and(|metadata| {
-                metadata.file_type().is_fifo() || metadata.file_type().is_socket()
-            });
+            && metadata.is_some_and(|metadata| metadata.is_fifo() || metadata.is_socket());
         let replay_fd_kind = if result.is_ok() && output_fd.is_none() {
-            self.fd_replay_kind(task, fd)
+            self.fd_replay_kind(guest, task, fd).await
         } else {
             ReplayFdKind::None
         };
@@ -1137,12 +1203,15 @@ impl Recorder {
         syscall: Ftruncate,
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
-        let metadata = std::fs::metadata(format!(
-            "/proc/{}/fd/{}",
-            guest.pid().as_raw(),
-            syscall.fd()
-        ))
-        .ok();
+        let metadata = {
+            let pid = guest.pid();
+            H::fd_metadata(
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
+                syscall.fd(),
+            )
+            .ok()
+            .flatten()
+        };
         let outputs = guest.thread_state().outputs;
         let output_fd = if result.is_ok() {
             metadata
@@ -1162,7 +1231,7 @@ impl Recorder {
                 output_fd,
                 length: syscall.length(),
                 replay_regular_file: result.is_ok()
-                    && metadata.is_some_and(|metadata| metadata.file_type().is_file()),
+                    && metadata.is_some_and(|metadata| metadata.is_file()),
             })),
         );
         result
@@ -1273,10 +1342,17 @@ impl Recorder {
                     }
                     _ => unreachable!(),
                 };
-            let source = std::fs::File::from(
-                crate::fd::duplicate_guest_fd(guest.pid(), source_fd)
+            let source = {
+                let pid = guest.pid();
+                std::fs::File::from(
+                    H::duplicate_guest_fd(
+                        &DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
+                        pid,
+                        source_fd,
+                    )
                     .expect("failed to duplicate clone source descriptor"),
-            );
+                )
+            };
             let source_length = source
                 .metadata()
                 .expect("failed to stat clone source descriptor")
@@ -1286,8 +1362,10 @@ impl Recorder {
                     .checked_sub(source_offset)
                     .expect("successful clone source offset exceeds file length")
             });
-            let private = private_clone_snapshot(
-                guest.pid(),
+            let clone_pid = guest.pid();
+            let private = private_clone_snapshot::<H, G>(
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, clone_pid),
+                clone_pid,
                 syscall.fd(),
                 &source,
                 source_offset,
@@ -1296,12 +1374,17 @@ impl Recorder {
             .unwrap_or_else(|error| panic!("failed to make private clone snapshot: {error}"));
             let image = capture_clone_snapshot(&private, 0, replacement_length, &self.data)
                 .unwrap_or_else(|error| panic!("failed to snapshot private clone: {error}"));
-            let destination_path = format!("/proc/{}/fd/{}", guest.pid().as_raw(), syscall.fd());
-            let length = std::fs::metadata(&destination_path)
-                .unwrap_or_else(|error| {
-                    panic!("failed to stat cloned destination {destination_path}: {error}")
-                })
-                .len();
+            let length = {
+                let pid = guest.pid();
+                H::fd_metadata(
+                    &DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
+                    syscall.fd(),
+                )
+                .ok()
+                .flatten()
+            }
+            .unwrap_or_else(|| panic!("failed to stat cloned destination fd {}", syscall.fd()))
+            .len;
             self.record_event(
                 guest,
                 Ok(SyscallEvent::FileClone(FileCloneEvent {

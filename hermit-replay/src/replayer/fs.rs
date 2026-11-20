@@ -43,11 +43,13 @@ use reverie::syscalls::family::WriteFamily;
 use reverie::syscalls::ioctl;
 
 use super::ReplayOutputs;
-use super::Replayer;
+use super::ReplayerWithHost;
 use crate::event::FileCloneImage;
 use crate::event::ReplayFdKind;
 use crate::event::deterministic_ioctl_error;
 use crate::event::xattr_query_output;
+use crate::host::DescriptorAccess;
+use crate::host::RecordHost;
 use crate::vectored_offset;
 
 #[repr(C)]
@@ -615,7 +617,7 @@ fn finish_kernel_side_effect(
     Ok(result)
 }
 
-async fn inject_kernel_side_effect<G: Guest<Replayer>>(
+async fn inject_kernel_side_effect<H: RecordHost, G: Guest<ReplayerWithHost<H>>>(
     guest: &mut G,
     fd: libc::c_int,
     syscall: Syscall,
@@ -650,7 +652,7 @@ async fn inject_kernel_side_effect<G: Guest<Replayer>>(
     finish_kernel_side_effect(fd, result, restored)
 }
 
-impl Replayer {
+impl<H: RecordHost> ReplayerWithHost<H> {
     /// Moves the position of the replay-root file `fd` names in the table of
     /// task `task` of process `pid` past `length` bytes a recorded read took.
     fn advance_regular_file_position(
@@ -663,8 +665,13 @@ impl Replayer {
         if !self.fd_is_in_replay_root(task, fd) {
             return;
         }
-        let duplicate = crate::fd::duplicate_guest_thread_fd(pid, task, fd)
-            .unwrap_or_else(|error| panic!("failed to duplicate replay file for read: {error}"));
+        let duplicate = H::duplicate_guest_thread_fd(
+            &DescriptorAccess::<H, ()>::task(&self.init, task, task),
+            pid,
+            task,
+            fd,
+        )
+        .unwrap_or_else(|error| panic!("failed to duplicate replay file for read: {error}"));
         let offset = libc::off_t::try_from(length).expect("recorded read length exceeds off_t");
         // SAFETY: duplicate is an owned descriptor and the recorded read succeeded.
         let result = unsafe { libc::lseek(duplicate.as_raw_fd(), offset, libc::SEEK_CUR) };
@@ -728,7 +735,13 @@ impl Replayer {
                 "recorded regular-file write used negative offset {offset}"
             ))
         })?;
-        let duplicate = crate::fd::duplicate_guest_thread_fd(pid, task, fd).map_err(Error::Io)?;
+        let duplicate = H::duplicate_guest_thread_fd(
+            &DescriptorAccess::<H, ()>::task(&self.init, task, task),
+            pid,
+            task,
+            fd,
+        )
+        .map_err(Error::Io)?;
         let file = std::fs::File::from(duplicate);
         file.write_all_at(bytes, offset_u64).map_err(Error::Io)?;
 
@@ -965,7 +978,7 @@ impl ReplayOutputs {
     }
 }
 
-impl Replayer {
+impl<H: RecordHost> ReplayerWithHost<H> {
     async fn replay_output<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1161,8 +1174,15 @@ impl Replayer {
                 && event.output_fd.is_none()
                 && self.fd_is_in_replay_root(guest.pid(), syscall.fd())
             {
-                let duplicate =
-                    crate::fd::duplicate_guest_fd(guest.pid(), syscall.fd()).map_err(Error::Io)?;
+                let duplicate = {
+                    let pid = guest.pid();
+                    H::duplicate_guest_fd(
+                        &DescriptorAccess::guest_bound(&self.init, &mut *guest, pid),
+                        pid,
+                        syscall.fd(),
+                    )
+                    .map_err(Error::Io)?
+                };
                 let file = std::fs::File::from(duplicate);
                 let length = u64::try_from(event.length).map_err(|_| {
                     Error::Tool(anyhow::anyhow!(

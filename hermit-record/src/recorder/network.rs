@@ -37,7 +37,7 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
-use super::Recorder;
+use super::RecorderWithHost;
 use crate::event::AcceptEvent;
 use crate::event::EpollWaitEvent;
 use crate::event::InterruptedPoll;
@@ -48,6 +48,8 @@ use crate::event::SelectEvent;
 use crate::event::SockOptEvent;
 use crate::event::SyscallEvent;
 use crate::event::fd_set_bytes;
+use crate::host::DescriptorAccess;
+use crate::host::RecordHost;
 
 fn read_bytes<M: MemoryAccess>(
     memory: &M,
@@ -521,7 +523,7 @@ fn capture_select_event<M: MemoryAccess>(
     }
 }
 
-impl Recorder {
+impl<H: RecordHost> RecorderWithHost<H> {
     #[cfg(target_arch = "x86_64")]
     pub(super) async fn handle_epoll_wait<G: Guest<Self>>(
         &self,
@@ -581,20 +583,35 @@ impl Recorder {
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
 
-        let event = result.and_then(|ret| {
-            let updated = ret as usize;
-            let mut bytes = vec![0; updated * std::mem::size_of::<libc::epoll_event>()];
-            if !bytes.is_empty() {
-                let address = events.and_then(Addr::<u8>::from_raw).ok_or(Errno::EFAULT)?;
-                guest.memory().read_exact(address, &mut bytes)?;
+        let event = match result {
+            Ok(ret) => {
+                let updated = ret as usize;
+                let mut bytes = vec![0; updated * std::mem::size_of::<libc::epoll_event>()];
+                let copied = if bytes.is_empty() {
+                    Ok(())
+                } else {
+                    events
+                        .and_then(Addr::<u8>::from_raw)
+                        .ok_or(Errno::EFAULT)
+                        .and_then(|address| guest.memory().read_exact(address, &mut bytes))
+                };
+                match copied {
+                    Ok(()) => {
+                        let pid = guest.pid();
+                        let replay_kernel_side_effect = self
+                            .epoll_requires_replay_kernel_side_effect(guest, pid, epfd)
+                            .await;
+                        Ok(SyscallEvent::EpollWait(EpollWaitEvent {
+                            events: bytes,
+                            updated,
+                            replay_kernel_side_effect,
+                        }))
+                    }
+                    Err(error) => Err(error),
+                }
             }
-            Ok(SyscallEvent::EpollWait(EpollWaitEvent {
-                events: bytes,
-                updated,
-                replay_kernel_side_effect: self
-                    .epoll_requires_replay_kernel_side_effect(guest.pid(), epfd),
-            }))
-        });
+            Err(error) => Err(error),
+        };
 
         self.record_event(guest, event);
         result
@@ -766,11 +783,17 @@ impl Recorder {
         // The socket is in the accepting thread's table, which is not the
         // leader's when the thread was cloned without CLONE_FILES.
         let pid = guest.pid();
-        let peer = crate::fd::duplicate_guest_thread_fd(pid, guest.tid(), accepted_fd(fd))
-            .and_then(|socket| accepted_peer_address(socket.as_fd()))
-            .unwrap_or_else(|error| {
-                panic!("accept4 returned fd {fd}, but its peer address could not be read: {error}")
-            });
+        let table = guest.tid();
+        let peer = H::duplicate_guest_thread_fd(
+            &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
+            pid,
+            table,
+            accepted_fd(fd),
+        )
+        .and_then(|socket| accepted_peer_address(socket.as_fd()))
+        .unwrap_or_else(|error| {
+            panic!("accept4 returned fd {fd}, but its peer address could not be read: {error}")
+        });
         let copy_out = match peer {
             Some((address, kernel_len)) => copy_peer_address_out(
                 &mut guest.memory(),

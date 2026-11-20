@@ -11,9 +11,10 @@ use reverie::Guest;
 use reverie::syscalls::Getrandom;
 use reverie::syscalls::MemoryAccess;
 
-use super::Replayer;
+use super::ReplayerWithHost;
+use crate::host::RecordHost;
 
-impl Replayer {
+impl<H: RecordHost> ReplayerWithHost<H> {
     pub(super) async fn handle_getrandom<G: Guest<Self>>(
         &self,
         guest: &mut G,

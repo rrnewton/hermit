@@ -10,13 +10,15 @@
 //! recording tool (the `hermit-record` crate) and the `hermit` library use:
 //! the recorded events and their stream, the recording's file names, the
 //! directory-relative path helpers, guest file-descriptor helpers, ELF
-//! interpreter discovery and shebang parsing. Nothing here is generic over a
-//! backend or a tool, and nothing here models Linux syscall semantics.
+//! interpreter discovery and shebang parsing. Nothing here models Linux
+//! syscall semantics; the one backend seam is the host-effects trait in
+//! [`host`].
 
 pub mod consts;
 pub mod event;
 pub mod event_stream;
 pub mod fd;
+pub mod host;
 pub mod interp;
 pub mod record_replay_path;
 pub mod script;

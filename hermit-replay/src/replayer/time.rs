@@ -15,9 +15,10 @@ use reverie::syscalls::MemoryAccess;
 #[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Time;
 
-use super::Replayer;
+use super::ReplayerWithHost;
+use crate::host::RecordHost;
 
-impl Replayer {
+impl<H: RecordHost> ReplayerWithHost<H> {
     pub(super) async fn handle_clock_gettime<G: Guest<Self>>(
         &self,
         guest: &mut G,

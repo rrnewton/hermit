@@ -24,12 +24,14 @@ use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Mmap;
 
-use super::Recorder;
+use super::RecorderWithHost;
 use crate::event::MadviseEvent;
 use crate::event::MadviseRefill;
 use crate::event::MmapEvent;
 use crate::event::SharedMapping;
 use crate::event::SyscallEvent;
+use crate::host::DescriptorAccess;
+use crate::host::RecordHost;
 
 const PAGE_SIZE: usize = 4096;
 // Added in Linux 6.13 and not yet exposed by the pinned libc crate.
@@ -242,34 +244,44 @@ enum Sharing {
 /// `offset`, shares: for a regular file, the file and the descriptor's access
 /// mode. `/proc/<tid>` shows that thread's own descriptor table, which is not
 /// the leader's for a thread cloned without `CLONE_FILES`.
-fn shared_mapping(flags: MapFlags, tid: i32, fd: i32, offset: i64) -> io::Result<Option<Sharing>> {
-    shared_mapping_with(flags, tid, fd, offset, |path| std::fs::read_to_string(path))
+fn shared_mapping<H: RecordHost, G>(
+    access: &DescriptorAccess<'_, H, G>,
+    flags: MapFlags,
+    fd: i32,
+    offset: i64,
+) -> io::Result<Option<Sharing>> {
+    shared_mapping_with(
+        flags,
+        offset,
+        || {
+            let snapshot = H::descriptor_snapshot(access, fd)?;
+            Ok(MappedFileFacts {
+                mode: snapshot.metadata.mode,
+                rdev: snapshot.metadata.rdev,
+                device: snapshot.metadata.device,
+                inode: snapshot.metadata.inode,
+                fs_type: snapshot.fs_type,
+                target: snapshot.target,
+            })
+        },
+        || H::fdinfo_text_at(access, fd)?.ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT)),
+    )
 }
 
 fn shared_mapping_with(
     flags: MapFlags,
-    tid: i32,
-    fd: i32,
     offset: i64,
-    read_fdinfo: impl FnOnce(&str) -> io::Result<String>,
+    facts: impl FnOnce() -> io::Result<MappedFileFacts>,
+    read_fdinfo: impl FnOnce() -> io::Result<String>,
 ) -> io::Result<Option<Sharing>> {
     if !flags.contains(MapFlags::MAP_SHARED) {
         return Ok(None);
     }
-    let path = format!("/proc/{tid}/fd/{fd}");
-    let metadata = std::fs::metadata(&path)?;
-    let file = MappedFileFacts {
-        mode: metadata.mode(),
-        rdev: metadata.rdev(),
-        device: metadata.dev(),
-        inode: metadata.ino(),
-        fs_type: file_system_type(&path)?,
-        target: std::fs::read_link(&path)?,
-    };
+    let file = facts()?;
     let offset = u64::try_from(offset)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
     let read_access = move || {
-        let fdinfo = read_fdinfo(&format!("/proc/{tid}/fdinfo/{fd}"))?;
+        let fdinfo = read_fdinfo()?;
         descriptor_access(&fdinfo).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -305,6 +317,7 @@ fn shared_mapping_with(
 }
 
 /// The `statfs` magic of the file system that holds the file `path` names.
+#[cfg(test)]
 fn file_system_type(path: &str) -> io::Result<i64> {
     let path = std::ffi::CString::new(path).expect("a /proc path holds no NUL");
     // SAFETY: `statfs` is plain old data, valid when zeroed.
@@ -471,7 +484,7 @@ fn descriptor_access(fdinfo: &str) -> Option<i32> {
     Some(i32::from_str_radix(flags, 8).ok()? & libc::O_ACCMODE)
 }
 
-impl Recorder {
+impl<H: RecordHost> RecorderWithHost<H> {
     pub(super) async fn handle_mmap<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -486,12 +499,15 @@ impl Recorder {
         let len = syscall.len();
         // Read before the call: the descriptor names the same file then, and a
         // sibling thread could not have closed it, as the call holds the turn.
-        let shared = shared_mapping(
-            syscall.flags(),
-            guest.tid().as_raw(),
-            syscall.fd(),
-            syscall.offset(),
-        );
+        let shared = {
+            let tid = guest.tid();
+            shared_mapping::<H, G>(
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
+                syscall.flags(),
+                syscall.fd(),
+                syscall.offset(),
+            )
+        };
 
         // Do the injection. We need to record the pointer the mapping is at and
         // all of the bytes contained in the mapping. This is very inefficient
@@ -642,17 +658,161 @@ impl Recorder {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use reverie::Pid;
+    use reverie::Tool;
+
     use super::*;
+    use crate::host::DescriptorKind;
+
+    /// A host whose snapshot read fails with a non-ENOENT error:
+    /// the adapter must surface that error, not translate it to the
+    /// missing-descriptor one (B9 regression).
+    struct FailingSnapshotHost;
+
+    impl RecordHost for FailingSnapshotHost {
+        type InitStorage = ();
+
+        const CAPTURE_AT_CONSTRUCTION: bool = false;
+
+        fn install(
+            _storage: &Self::InitStorage,
+            _provider: Option<std::sync::Arc<dyn reverie::DescriptorProvider>>,
+        ) {
+        }
+
+        fn installed(_storage: &Self::InitStorage) -> Option<&dyn reverie::DescriptorProvider> {
+            None
+        }
+
+        async fn classify_fd<G: Guest<T>, T: Tool>(
+            _access: &mut DescriptorAccess<'_, Self, G>,
+            _fd: i32,
+        ) -> DescriptorKind {
+            unreachable!("snapshot test")
+        }
+
+        async fn fd_is_eventfd<G: Guest<T>, T: Tool>(
+            _access: &mut DescriptorAccess<'_, Self, G>,
+            _fd: i32,
+        ) -> bool {
+            unreachable!("snapshot test")
+        }
+
+        async fn fdinfo_text<G: Guest<T>, T: Tool>(
+            _access: &mut DescriptorAccess<'_, Self, G>,
+            _fd: i32,
+        ) -> io::Result<Option<String>> {
+            unreachable!("snapshot test")
+        }
+
+        fn fd_link<G>(access: &DescriptorAccess<'_, Self, G>, fd: i32) -> io::Result<PathBuf> {
+            let _ = (access, fd);
+            unreachable!("snapshot test")
+        }
+
+        fn fdinfo_text_at<G>(
+            _access: &DescriptorAccess<'_, Self, G>,
+            _fd: i32,
+        ) -> io::Result<Option<String>> {
+            unreachable!("snapshot test")
+        }
+
+        fn fd_metadata<G>(
+            _access: &DescriptorAccess<'_, Self, G>,
+            _fd: i32,
+        ) -> io::Result<Option<reverie::DescriptorMetadata>> {
+            unreachable!("snapshot test")
+        }
+
+        fn descriptor_snapshot<G>(
+            _access: &DescriptorAccess<'_, Self, G>,
+            _fd: i32,
+        ) -> io::Result<crate::host::DescriptorSnapshot> {
+            Err(io::Error::from_raw_os_error(libc::EACCES))
+        }
+
+        fn duplicate_guest_fd<G>(
+            _access: &DescriptorAccess<'_, Self, G>,
+            _pid: Pid,
+            _fd: i32,
+        ) -> io::Result<OwnedFd> {
+            unreachable!("snapshot test")
+        }
+
+        fn duplicate_guest_thread_fd<G>(
+            _access: &DescriptorAccess<'_, Self, G>,
+            _pid: Pid,
+            _tid: Pid,
+            _fd: i32,
+        ) -> io::Result<OwnedFd> {
+            unreachable!("snapshot test")
+        }
+
+        fn same_open_file_description(_left: i32, _right: i32) -> io::Result<bool> {
+            unreachable!("snapshot test")
+        }
+
+        fn guest_fds_share_description<G>(
+            _access: &DescriptorAccess<'_, Self, G>,
+            _left: i32,
+            _right: i32,
+        ) -> io::Result<bool> {
+            unreachable!("snapshot test")
+        }
+
+        fn visit_descriptor_numbers<G, F: FnMut(i32) -> bool>(
+            _access: &DescriptorAccess<'_, Self, G>,
+            _visit: F,
+        ) -> io::Result<()> {
+            unreachable!("snapshot test")
+        }
+
+        fn guest_task_exists<G>(_access: &DescriptorAccess<'_, Self, G>, _pid: Pid) -> bool {
+            unreachable!("snapshot test")
+        }
+    }
+
+    #[test]
+    fn shared_mapping_preserves_snapshot_error() {
+        let pid = Pid::from_raw(std::process::id() as i32);
+        let error = shared_mapping::<FailingSnapshotHost, ()>(
+            &DescriptorAccess::task(&(), pid, pid),
+            MapFlags::MAP_SHARED,
+            0,
+            0,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+    }
+
+    fn own_facts(fd: i32) -> io::Result<MappedFileFacts> {
+        let tid = std::process::id() as i32;
+        let path = format!("/proc/{tid}/fd/{fd}");
+        let metadata = std::fs::metadata(&path)?;
+        Ok(MappedFileFacts {
+            mode: metadata.mode(),
+            rdev: metadata.rdev(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            fs_type: file_system_type(&path)?,
+            target: std::fs::read_link(&path)?,
+        })
+    }
 
     fn failed_fdinfo_capture(file: &std::fs::File) -> io::Result<Option<Sharing>> {
-        let tid = std::process::id() as i32;
         let fd = file.as_raw_fd();
         let mut read_attempted = false;
-        let capture = shared_mapping_with(MapFlags::MAP_SHARED, tid, fd, 0, |path| {
-            assert_eq!(path, format!("/proc/{tid}/fdinfo/{fd}"));
-            read_attempted = true;
-            Err(io::Error::from_raw_os_error(libc::EMFILE))
-        });
+        let capture = shared_mapping_with(
+            MapFlags::MAP_SHARED,
+            0,
+            || own_facts(fd),
+            || {
+                read_attempted = true;
+                Err(io::Error::from_raw_os_error(libc::EMFILE))
+            },
+        );
         assert!(read_attempted, "metadata must succeed before fdinfo fails");
         assert_eq!(
             capture.as_ref().unwrap_err().raw_os_error(),
@@ -684,9 +844,12 @@ mod tests {
 
     #[test]
     fn private_mmaps_do_not_read_shared_file_identity() {
-        let capture = shared_mapping_with(MapFlags::MAP_PRIVATE, -1, -1, 0, |_| {
-            panic!("a private mapping must not read fdinfo")
-        });
+        let capture = shared_mapping_with(
+            MapFlags::MAP_PRIVATE,
+            0,
+            || panic!("a private mapping must not read shared file identity"),
+            || panic!("a private mapping must not read fdinfo"),
+        );
         assert_eq!(
             captured_mmap_result(Ok(0x1000), capture),
             Ok((0x1000, None))
@@ -707,7 +870,13 @@ mod tests {
             MapFlags::MAP_SHARED,
             MapFlags::from_bits_retain(libc::MAP_SHARED_VALIDATE),
         ] {
-            let capture = shared_mapping(flags, std::process::id() as i32, file.as_raw_fd(), 4096);
+            let pid = reverie::Pid::from_raw(std::process::id() as i32);
+            let capture = shared_mapping::<crate::host::PtraceHost, ()>(
+                &DescriptorAccess::task(&(), pid, pid),
+                flags,
+                file.as_raw_fd(),
+                4096,
+            );
             assert_eq!(
                 captured_mmap_result(Ok(0x1000), capture),
                 Ok((0x1000, Some(Sharing::File(expected))))
@@ -727,10 +896,9 @@ mod tests {
         let capture = |offset| {
             shared_mapping_with(
                 MapFlags::MAP_SHARED,
-                tid,
-                zero.as_raw_fd(),
                 offset,
-                |path| std::fs::read_to_string(path),
+                || own_facts(zero.as_raw_fd()),
+                || std::fs::read_to_string(format!("/proc/{tid}/fdinfo/{}", zero.as_raw_fd())),
             )
             .unwrap()
         };
@@ -924,7 +1092,7 @@ mod tests {
     /// no identity could make replay share what Linux shared.
     #[test]
     fn shared_mappings_of_other_files_refuse_replay() {
-        let tid = std::process::id() as i32;
+        let _tid = std::process::id() as i32;
         let null = std::fs::File::open("/dev/null").unwrap();
         // SAFETY: eventfd has no memory-safety preconditions; the result is
         // checked and owned below.
@@ -940,9 +1108,12 @@ mod tests {
             (socket.as_raw_fd(), "a file of type 140000"),
             (status.as_raw_fd(), "a file on procfs"),
         ] {
-            let capture = shared_mapping_with(MapFlags::MAP_SHARED, tid, fd, 0, |_| {
-                panic!("a mapping replay refuses must not read fdinfo")
-            });
+            let capture = shared_mapping_with(
+                MapFlags::MAP_SHARED,
+                0,
+                || own_facts(fd),
+                || panic!("a mapping replay refuses must not read fdinfo"),
+            );
             match captured_mmap_result(Ok(0x1000), capture) {
                 Ok((0x1000, Some(Sharing::Refused(reason)))) => assert!(
                     reason.starts_with("a MAP_SHARED mapping of ") && reason.contains(what),
@@ -955,17 +1126,22 @@ mod tests {
 
     #[test]
     fn shared_mmap_capture_reports_missing_identity_and_invalid_access() {
-        let tid = std::process::id() as i32;
-        let missing = shared_mapping_with(MapFlags::MAP_SHARED, tid, -1, 0, |_| {
-            panic!("a missing descriptor must fail before fdinfo is read")
-        });
+        let _tid = std::process::id() as i32;
+        let missing = shared_mapping_with(
+            MapFlags::MAP_SHARED,
+            0,
+            || own_facts(-1),
+            || panic!("a missing descriptor must fail before fdinfo is read"),
+        );
         assert_eq!(missing.unwrap_err().raw_os_error(), Some(libc::ENOENT));
         let file = tempfile::tempfile().unwrap();
         for fdinfo in ["pos:\t0\n", "flags:\tinvalid\n"] {
-            let capture =
-                shared_mapping_with(MapFlags::MAP_SHARED, tid, file.as_raw_fd(), 0, |_| {
-                    Ok(fdinfo.to_owned())
-                });
+            let capture = shared_mapping_with(
+                MapFlags::MAP_SHARED,
+                0,
+                || own_facts(file.as_raw_fd()),
+                || Ok(fdinfo.to_owned()),
+            );
             assert_eq!(capture.unwrap_err().kind(), io::ErrorKind::InvalidData);
         }
     }
