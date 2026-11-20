@@ -71,6 +71,7 @@ pub(crate) use signal::SleepCheck;
 #[cfg(test)]
 pub(crate) use signal::SleepSignal;
 pub(crate) use signal::claim_still_pending;
+pub(crate) use signal::ppoll_is_pause;
 /// An emulated sleep's own check, for the in-guest delivery gate's tests (A5
 /// step 3c.1c).
 #[cfg(test)]

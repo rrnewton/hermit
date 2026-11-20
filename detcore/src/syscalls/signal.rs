@@ -1195,60 +1195,65 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Pause,
     ) -> Result<i64, Error> {
         if guest.config().sequentialize_threads {
-            // `pause` has no deadline: it returns only when a signal is delivered.
-            // `LogicalTime::INDEFINITE` records that, and the scheduler refuses to
-            // fast-forward virtual time onto it (see `step2d_handle_empty_queue`),
-            // so the `Normal` arm below stays unreachable.
-            loop {
-                // A signal that already ended the call before it parked: one sent
-                // while this thread was stopped short of filing the request, as
-                // when its timeslice ended in the syscall's prehook.
-                if sleep_signal(guest, SleepCheck::BeforePark, true).await? == SleepSignal::Pending
-                {
-                    return Err(Errno::ERESTARTNOHAND.into());
-                }
-                let mut req = Self::sleep_request_abs(guest, LogicalTime::INDEFINITE).await;
-                req.fyi(crate::resources::PAUSE_FYI);
-                req.in_guest_sleep_sigalrm = self.in_guest_sleep_sigalrm_snapshot(guest).await;
-                match crate::tool_global::parked_wait_request(
-                    guest,
-                    req,
-                    crate::scheduler::parked::ParkedWaitPolicy::PauseNoHandlerRestart,
-                )
-                .await
-                {
-                    ResumeStatus::InGuestFatalAlarm => {
-                        self.stage_in_guest_fatal_alarm(guest).await;
-                        return Err(Errno::EINTR.into());
-                    }
-                    // A pause never asks for `NothingElseCanRun`.
-                    ResumeStatus::Normal | ResumeStatus::NothingElseCanRun => {
-                        panic!(
-                            "Internal violation: pause should never return from the scheduler except by interruption!"
-                        )
-                    }
-                    ResumeStatus::Signaled(signals) => {
-                        match sleep_signal(guest, SleepCheck::AfterWake(signals), true).await? {
-                            SleepSignal::Pending | SleepSignal::Claimed => {
-                                return Err(Errno::ERESTARTNOHAND.into());
-                            }
-                            SleepSignal::Held => return Err(Errno::EINTR.into()),
-                            SleepSignal::None => {
-                                info!(
-                                    "[dtid {}] pause woken for a signal no longer pending for it; waiting again",
-                                    guest.thread_state().dettid
-                                );
-                            }
-                        }
-                    }
-                }
-            }
+            self.wait_as_pause(guest).await
         } else {
             info!(
                 "[dtid {}] Running without scheduler, so letting pause call through...",
                 guest.thread_state().dettid
             );
             Ok(guest.inject(call).await?)
+        }
+    }
+
+    /// `pause` under the scheduler, also for a call that is `pause` by another
+    /// name ([`ppoll_is_pause`]).
+    pub(crate) async fn wait_as_pause<G: Guest<Self>>(&self, guest: &mut G) -> Result<i64, Error> {
+        // `pause` has no deadline: it returns only when a signal is delivered.
+        // `LogicalTime::INDEFINITE` records that, and the scheduler refuses to
+        // fast-forward virtual time onto it (see `step2d_handle_empty_queue`),
+        // so the `Normal` arm below stays unreachable.
+        loop {
+            // A signal that already ended the call before it parked: one sent
+            // while this thread was stopped short of filing the request, as
+            // when its timeslice ended in the syscall's prehook.
+            if sleep_signal(guest, SleepCheck::BeforePark, true).await? == SleepSignal::Pending {
+                return Err(Errno::ERESTARTNOHAND.into());
+            }
+            let mut req = Self::sleep_request_abs(guest, LogicalTime::INDEFINITE).await;
+            req.fyi(crate::resources::PAUSE_FYI);
+            req.in_guest_sleep_sigalrm = self.in_guest_sleep_sigalrm_snapshot(guest).await;
+            match crate::tool_global::parked_wait_request(
+                guest,
+                req,
+                crate::scheduler::parked::ParkedWaitPolicy::PauseNoHandlerRestart,
+            )
+            .await
+            {
+                ResumeStatus::InGuestFatalAlarm => {
+                    self.stage_in_guest_fatal_alarm(guest).await;
+                    return Err(Errno::EINTR.into());
+                }
+                // A pause never asks for `NothingElseCanRun`.
+                ResumeStatus::Normal | ResumeStatus::NothingElseCanRun => {
+                    panic!(
+                        "Internal violation: pause should never return from the scheduler except by interruption!"
+                    )
+                }
+                ResumeStatus::Signaled(signals) => {
+                    match sleep_signal(guest, SleepCheck::AfterWake(signals), true).await? {
+                        SleepSignal::Pending | SleepSignal::Claimed => {
+                            return Err(Errno::ERESTARTNOHAND.into());
+                        }
+                        SleepSignal::Held => return Err(Errno::EINTR.into()),
+                        SleepSignal::None => {
+                            info!(
+                                "[dtid {}] pause woken for a signal no longer pending for it; waiting again",
+                                guest.thread_state().dettid
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -5514,6 +5519,28 @@ pub(crate) enum SleepSignal {
     Claimed,
 }
 
+/// Whether `call` is `pause` by another name, as aarch64's libc spells
+/// `pause` (it has no `pause` syscall): a `ppoll` with no descriptors, no
+/// pollfd array, no timeout and no temporary mask.
+///
+/// Linux sleeps in it exactly as in `pause` (`sys_pause`, kernel/signal.c)
+/// until a signal is pending, and then returns `-ERESTARTNOHAND`. `sys_ppoll`
+/// (fs/select.c) leaves `to` NULL without a timeout and installs no mask
+/// without one (`set_user_sigmask` ignores the size then); `do_sys_poll`
+/// copies no pollfd for an `nfds` of 0 (an `unsigned int`, so only the low
+/// 32 bits count); and `do_poll`, with nothing to poll and no end time, finds
+/// no event and sleeps in `poll_schedule_timeout` until `signal_pending`,
+/// when it returns `-ERESTARTNOHAND`. Nothing is written back. A pollfd
+/// array is left out even with no descriptors: `do_sys_poll` checks its
+/// zero-length write-back range only after the wait, and an address outside
+/// user space fails the call with EFAULT there.
+pub(crate) fn ppoll_is_pause(call: &syscalls::Ppoll) -> bool {
+    call.nfds() as u32 == 0
+        && call.fds().is_none()
+        && call.timeout().is_none()
+        && call.sigmask().is_none()
+}
+
 /// Decides, in this thread's own turn, whether a signal ends an emulated
 /// `pause` or `nanosleep` (<https://github.com/rrnewton/hermit/issues/3982>).
 ///
@@ -7128,6 +7155,26 @@ fn held_wake_ends_sleep(
 
 #[cfg(test)]
 mod tests {
+    /// A `ppoll` is `pause` by another name only with no descriptors (the low
+    /// 32 bits of `nfds`, Linux's `unsigned int`), no pollfd array, no timeout
+    /// and no temporary mask.
+    #[test]
+    fn a_ppoll_is_pause_only_with_nothing_to_poll_no_timeout_and_no_mask() {
+        let pause = syscalls::Ppoll::new();
+        assert!(ppoll_is_pause(&pause));
+        assert!(ppoll_is_pause(&pause.with_nfds(1 << 32)));
+        // The size of a mask that is not there is never read.
+        assert!(ppoll_is_pause(&pause.with_sigsetsize(3)));
+        for other in [
+            pause.with_nfds(1),
+            pause.with_fds(AddrMut::from_raw(0x1000)),
+            pause.with_timeout(AddrMut::from_raw(0x1000)),
+            pause.with_sigmask(Addr::from_raw(0x1000)),
+        ] {
+            assert!(!ppoll_is_pause(&other), "{other:?}");
+        }
+    }
+
     /// A first probe's not-run report restarts the call; any other result,
     /// errno or value, passes through unchanged.
     #[test]

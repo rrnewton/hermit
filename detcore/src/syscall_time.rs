@@ -6,7 +6,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
+
+use crate::syscalls::ppoll_is_pause;
 
 const CLOCK_NS: u64 = 10_000;
 const GETTIMEOFDAY_NS: u64 = 2_000;
@@ -163,6 +167,16 @@ pub(crate) fn cost_ns(sysno: Sysno) -> u64 {
     }
 }
 
+/// The cost of `call`: that of its number ([`cost_ns`]), but a `ppoll` that is
+/// `pause` by another name ([`ppoll_is_pause`]) costs what `pause` does, a
+/// sleep's cost.
+pub(crate) fn call_cost_ns(call: &Syscall) -> u64 {
+    match call {
+        Syscall::Ppoll(ppoll) if ppoll_is_pause(ppoll) => SYNC_NS,
+        _ => cost_ns(call.number()),
+    }
+}
+
 /// The cost of a syscall whose number the pinned table cannot name. It is
 /// answered without running (a fixed `ENOSYS`, or a strict run's refusal),
 /// so it charges the same nonzero fallback as any other cheap refusal:
@@ -245,6 +259,10 @@ pub(crate) fn observes_virtual_time(sysno: Sysno) -> bool {
 #[cfg(test)]
 mod tests {
     use detcore_model::time::DetTime;
+    use reverie::syscalls::Addr;
+    use reverie::syscalls::AddrMut;
+    use reverie::syscalls::Getpid;
+    use reverie::syscalls::Ppoll;
 
     use super::*;
 
@@ -260,6 +278,33 @@ mod tests {
         assert_eq!(cost_ns(Sysno::openat), 25_000);
         assert_eq!(cost_ns(Sysno::socket), 50_000);
         assert_eq!(cost_ns(Sysno::clone), 250_000);
+    }
+
+    /// A `ppoll` that is `pause` by another name costs a sleep, as `pause`
+    /// does where the table has it; every other `ppoll` keeps its number's
+    /// cost.
+    #[test]
+    fn a_ppoll_that_is_pause_costs_what_pause_does() {
+        let pause = Ppoll::new();
+        assert_eq!(call_cost_ns(&Syscall::Ppoll(pause)), SYNC_NS);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(call_cost_ns(&Syscall::Ppoll(pause)), cost_ns(Sysno::pause));
+        for other in [
+            pause.with_nfds(1),
+            pause.with_fds(AddrMut::from_raw(0x1000)),
+            pause.with_timeout(AddrMut::from_raw(0x1000)),
+            pause.with_sigmask(Addr::from_raw(0x1000)),
+        ] {
+            assert_eq!(
+                call_cost_ns(&Syscall::Ppoll(other)),
+                cost_ns(Sysno::ppoll),
+                "{other:?}"
+            );
+        }
+        assert_eq!(
+            call_cost_ns(&Syscall::Getpid(Getpid::new())),
+            cost_ns(Sysno::getpid)
+        );
     }
 
     #[test]
