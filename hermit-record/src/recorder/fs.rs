@@ -16,7 +16,6 @@ use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
-use reverie::syscalls::Close;
 use reverie::syscalls::Fallocate;
 use reverie::syscalls::Ftruncate;
 use reverie::syscalls::Getcwd;
@@ -25,7 +24,6 @@ use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
 use reverie::syscalls::Ioctl;
 use reverie::syscalls::MemoryAccess;
-use reverie::syscalls::Openat;
 use reverie::syscalls::Pread64;
 use reverie::syscalls::Read;
 use reverie::syscalls::ReadAddr;
@@ -1253,6 +1251,22 @@ impl<H: RecordHost> RecorderWithHost<H> {
     ) -> Result<i64, Errno> {
         let (pid, task) = (guest.pid(), guest.tid());
         let result = guest.inject(syscall).await;
+        // Extent effects are required facts: a failed descriptor
+        // classification must refuse the recording by name rather
+        // than encode an unclassified fallocate whose captured-
+        // output effect replay would silently omit.
+        if result.is_ok() {
+            let _ = H::fd_metadata(
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, task),
+                syscall.fd(),
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "could not classify the recorded fallocate target without \
+                     changing its meaning: descriptor facts failed: {error}"
+                )
+            });
+        }
         // The descriptor classification a write through it gets:
         // captured output, shared-backing regular file, or neither.
         let write = self
@@ -1294,51 +1308,59 @@ impl<H: RecordHost> RecorderWithHost<H> {
     }
 
     /// The identity of the file `syscall` just truncated, named
-    /// through a guest `O_PATH` probe whose descriptor is classified
-    /// and closed before returning. Identity here is required, not
-    /// best-effort: any failure refuses the recording by name
-    /// rather than recording a truncate replay cannot route.
+    /// with a guest `newfstatat` (flags 0, so a final symlink is
+    /// followed exactly as `truncate` follows it) whose stat
+    /// buffer lives on a guest stack slot this probe reserves:
+    /// no guest descriptor is allocated, so a full descriptor
+    /// table records exactly as Linux ran. Identity here is
+    /// required, not best-effort: any failure refuses the
+    /// recording by name rather than recording a truncate replay
+    /// cannot route.
     async fn truncated_file_identity<G: Guest<Self>>(
         &self,
         guest: &mut G,
         syscall: Truncate,
     ) -> (u64, u64) {
-        let probe = Openat::new()
-            .with_dirfd(libc::AT_FDCWD)
-            .with_path(syscall.path())
-            .with_flags(
-                reverie::syscalls::OFlag::O_PATH
-                    | reverie::syscalls::OFlag::O_NOFOLLOW
-                    | reverie::syscalls::OFlag::O_CLOEXEC,
-            );
-        let descriptor = guest
-            .inject_with_retry(probe)
-            .await
-            .unwrap_or_else(|error| {
-                panic!("could not name the recorded truncate target without changing its meaning: open probe failed: {error:?}")
-            });
-        let descriptor = descriptor as libc::c_int;
-        let tid = guest.tid();
-        let identity = H::fd_metadata(
-            &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
-            descriptor,
-        )
-        .unwrap_or_else(|error| {
-            panic!("could not name the recorded truncate target without changing its meaning: descriptor facts failed: {error}")
-        })
-        .filter(|metadata| metadata.is_file())
-        .map(|metadata| (metadata.device, metadata.inode));
-        let closed = guest
-            .inject_with_retry(Close::new().with_fd(descriptor))
+        use reverie::Stack as _;
+        use reverie::syscalls::Newfstatat;
+
+        let mut stack = guest.stack().await;
+        let statbuf = stack.reserve::<libc::stat>();
+        let _guard = stack.commit().unwrap_or_else(|error| {
+            panic!(
+                "could not name the recorded truncate target without changing \
+                 its meaning: could not reserve a guest stat buffer: {error:?}"
+            )
+        });
+        let result = guest
+            .inject_with_retry(
+                Newfstatat::new()
+                    .with_dirfd(libc::AT_FDCWD)
+                    .with_path(syscall.path())
+                    .with_stat(Some(reverie::syscalls::StatPtr(statbuf)))
+                    .with_flags(reverie::syscalls::AtFlags::empty()),
+            )
             .await;
-        assert_eq!(
-            closed,
-            Ok(0),
-            "could not close the truncate identity probe descriptor without changing guest state"
-        );
-        identity.unwrap_or_else(|| {
-            panic!("could not name the recorded truncate target without changing its meaning: target is not a regular file")
-        })
+        let stat = match result {
+            Ok(_) => statbuf.read(&guest.memory()).unwrap_or_else(|error| {
+                panic!(
+                    "could not name the recorded truncate target without changing \
+                     its meaning: could not read its stat: {error:?}"
+                )
+            }),
+            Err(error) => panic!(
+                "could not name the recorded truncate target without changing \
+                 its meaning: stat probe failed: {error:?}"
+            ),
+        };
+        drop(_guard);
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            panic!(
+                "could not name the recorded truncate target without changing \
+                 its meaning: target is not a regular file"
+            );
+        }
+        (stat.st_dev, stat.st_ino)
     }
 
     pub(super) async fn handle_stat_family<G: Guest<Self>>(

@@ -393,6 +393,76 @@ fn record_replay_flocks_a_self_created_file_opened_by_relative_path() {
     );
 }
 
+/// The two flock regressions above under `--write-output-files`:
+/// `record start --verify` replays with the rr-like default, which
+/// answers flocks from the log and never reaches the pending-open
+/// materialization path those tests pin. These explicit
+/// record + flag-on replay runs keep their original assertions on
+/// the path that materializes and locks for real.
+#[test]
+fn record_replay_flocks_with_output_files() {
+    let _guard = hermit_record_lock();
+    for (scenario, script, mount) in [
+        (
+            "tmpfs flock with output files",
+            "mkdir -p locks && flock locks/l -c 'echo locked'",
+            true,
+        ),
+        (
+            "relative-path flock with output files",
+            "printf x > 9 && exec 9<>9 && flock -n 9 && echo locked && rm 9",
+            false,
+        ),
+    ] {
+        let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+        let mountpoint = tempfile::tempdir().expect("failed to create guest workdir");
+        let run = |subcommand: &[&str], what: &str| {
+            let mut command = Command::new("timeout");
+            command
+                .args(["--kill-after=5s", "45s"])
+                .arg(env!("CARGO_BIN_EXE_hermit"))
+                .args(subcommand.iter().copied())
+                .arg(format!("--data-dir={}", data_dir.path().display()))
+                .arg(format!("--workdir={}", mountpoint.path().display()));
+            if mount && subcommand[0] == "record" {
+                command.arg(format!(
+                    "--mount=type=tmpfs,target={}",
+                    mountpoint.path().display()
+                ));
+            }
+            if subcommand[0] == "record" {
+                command.args(["--", "/bin/sh", "-c", script]);
+            }
+            command_output(command, what)
+        };
+        let recorded = run(
+            &["record", "start", "--record-timeout=30"],
+            "record flock flag-on scenario",
+        );
+        assert!(
+            String::from_utf8_lossy(&recorded.stdout).contains("locked\n"),
+            "{scenario}: recording failed"
+        );
+        let replayed = run(
+            &["replay", "--autopilot", "--write-output-files"],
+            "replay flock flag-on scenario",
+        );
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&replayed.stdout),
+            String::from_utf8_lossy(&replayed.stderr)
+        );
+        assert!(
+            !combined.contains("cannot replay flock side effects"),
+            "{scenario}: flag-on replay panicked on the flock target:\n{combined}"
+        );
+        assert!(
+            combined.contains("locked\n"),
+            "{scenario}: flag-on replay did not take its lock:\n{combined}"
+        );
+    }
+}
+
 /// A fifo the guest creates and then flocks (the JVM perf-data file
 /// pattern behind dh-gg5uv): the recorder marks a fifo open with no
 /// materialization. Replay must put a real descriptor for that fifo
@@ -4729,7 +4799,7 @@ fn record_forked_child_writes_into_a_redirected_stdout_pipe() {
 /// distinction is witnessed by the flock injection counts in
 /// flock_exclusion.rs (0 by default, every mirror with the flag).
 #[test]
-fn replay_write_output_files_reapplies_regular_file_writes() {
+fn replay_output_policies_keep_writes_inside_the_disposable_root() {
     let _guard = hermit_record_lock();
     let data_dir = tempfile::tempdir().expect("failed to create recording directory");
     let work = tempfile::tempdir().expect("failed to create guest working directory");
@@ -4737,7 +4807,7 @@ fn replay_write_output_files_reapplies_regular_file_writes() {
     let run = |subcommand: &[&str], what: &str| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
         command
-            .arg("--log=off")
+            .arg("--log=debug")
             .args(subcommand)
             .arg("--data-dir")
             .arg(data_dir.path())
@@ -4757,10 +4827,18 @@ fn replay_write_output_files_reapplies_regular_file_writes() {
 
     fs::remove_file(&output_path).unwrap();
     let replayed = run(&["replay", "--autopilot"], "replay default");
+    // The witness needs the debug log; rerun both modes with it below.
     assert_eq!(replayed.stdout, recorded.stdout);
     assert!(
         !output_path.exists(),
         "default replay materialized the guest's output file"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&replayed.stderr)
+            .matches("reapplied replay-root regular-file write")
+            .count(),
+        0,
+        "default replay applied a replay-root write"
     );
 
     let replayed = run(
@@ -4771,6 +4849,13 @@ fn replay_write_output_files_reapplies_regular_file_writes() {
     assert!(
         !output_path.exists(),
         "flag-on replay wrote outside its disposable root"
+    );
+    assert!(
+        String::from_utf8_lossy(&replayed.stderr)
+            .matches("reapplied replay-root regular-file write")
+            .count()
+            >= 1,
+        "flag-on replay applied no replay-root write"
     );
 }
 

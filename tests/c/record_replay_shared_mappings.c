@@ -395,10 +395,11 @@ static void read_only_truncate_advice(void) {
  * into the first file. */
 static int sibling_close_fd = -1;
 static volatile int sibling_closed;
+static volatile long sibling_close_result = -1;
 
 static int sibling_close_worker(void* unused) {
   (void)unused;
-  syscall(SYS_close, (long)sibling_close_fd);
+  sibling_close_result = syscall(SYS_close, (long)sibling_close_fd);
   sibling_closed = 1;
   syscall(SYS_exit, 0);
   return 0;
@@ -431,18 +432,19 @@ static void independent_open(void) {
   while (!sibling_closed) {
     sched_yield();
   }
+  check(sibling_close_result == 0, "the sibling thread's close");
   int fourth = open(path, O_RDWR);
   check(fourth >= 0, "open the same file after the sibling close");
   if (fourth < 0) return;
   check(pwrite(fourth, "sibcls", 6, 0) == 6, "pwrite after the sibling close");
   printf("independent-open: after sibling close view sees %.6s\n", view);
-  check(close(fourth) == 0, "close the fourth open");
 
-  /* The binding follows a dup alias past the opener's close. */
-  int alias = dup(first);
-  check(alias >= 0, "dup the mapped descriptor");
+  /* The binding follows a dup alias of a descriptor that was
+   * never itself mapped, past its source's close. */
+  int alias = dup(fourth);
+  check(alias >= 0, "dup the independent descriptor");
   if (alias < 0) return;
-  check(close(first) == 0, "close the mapped descriptor");
+  check(close(fourth) == 0, "close the dup source");
   check(pwrite(alias, "dupdup", 6, 0) == 6, "pwrite through the dup alias");
   printf("independent-open: dup alias view sees %.6s\n", view);
 
@@ -459,6 +461,7 @@ static void independent_open(void) {
   check(pwrite(alias, "forked", 6, 0) == 6, "pwrite after the child's close");
   printf("independent-open: after fork close view sees %.6s\n", view);
   check(close(alias) == 0, "close the alias");
+  check(close(first) == 0, "close the mapped descriptor");
 
   /* With every descriptor of the file closed, a fresh open of
    * another file (whose replay placeholder may recycle a freed

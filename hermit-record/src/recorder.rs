@@ -1843,191 +1843,312 @@ mod dispatch_agreement_tests {
             .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()))
     }
 
-    /// Removes `//` and `/* */` comments, preserving newlines so
-    /// line-based arm scanning still aligns. String and char
-    /// literals are kept (their contents cannot name a dispatch
-    /// arm in these windows, but a `//` inside one must not eat
-    /// the rest of the line).
-    fn strip_comments(text: &str) -> String {
-        let mut out = String::with_capacity(text.len());
-        let mut chars = text.chars().peekable();
-        let mut in_string = false;
-        let mut escaped = false;
-        while let Some(c) = chars.next() {
-            if in_string {
-                out.push(c);
-                if escaped {
-                    escaped = false;
-                } else if c == '\\' {
-                    escaped = true;
-                } else if c == '"' {
-                    in_string = false;
+    /// One lexed token of a dispatch source: comments removed,
+    /// string/char literals blanked to a single placeholder so
+    /// braces inside them cannot move structure.
+    fn lex_dispatch(text: &str) -> Vec<String> {
+        let bytes = text.as_bytes();
+        let mut tokens = Vec::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if c.is_whitespace() {
+                i += 1;
+                continue;
+            }
+            // Line comment.
+            if c == '/' && bytes.get(i + 1) == Some(&b'/') {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
                 }
                 continue;
             }
-            match c {
-                '"' => {
-                    in_string = true;
-                    out.push(c);
-                }
-                '/' if chars.peek() == Some(&'/') => {
-                    for c in chars.by_ref() {
-                        if c == '\n' {
-                            out.push(c);
-                            break;
-                        }
+            // Block comment (nested, as Rust allows).
+            if c == '/' && bytes.get(i + 1) == Some(&b'*') {
+                let mut depth = 1usize;
+                i += 2;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
                     }
                 }
-                '/' if chars.peek() == Some(&'*') => {
-                    chars.next();
-                    let mut previous_star = false;
-                    for c in chars.by_ref() {
-                        if c == '\n' {
-                            out.push(c);
-                        }
-                        if previous_star && c == '/' {
-                            break;
-                        }
-                        previous_star = c == '*';
-                    }
-                }
-                _ => out.push(c),
+                assert!(depth == 0, "unterminated block comment in dispatch source");
+                continue;
             }
+            // Raw string r#"..."# (any hash count).
+            if c == 'r' && (bytes.get(i + 1) == Some(&b'"') || bytes.get(i + 1) == Some(&b'#')) {
+                let hashes = bytes[i + 1..].iter().take_while(|b| **b == b'#').count();
+                if bytes.get(i + 1 + hashes) == Some(&b'"') {
+                    let closer: Vec<u8> = std::iter::once(b'"')
+                        .chain(std::iter::repeat_n(b'#', hashes))
+                        .collect();
+                    let start = i + 1 + hashes + 1;
+                    let mut j = start;
+                    let mut closed = false;
+                    while j + closer.len() <= bytes.len() {
+                        if bytes[j..j + closer.len()] == closer[..] {
+                            closed = true;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    assert!(closed, "unterminated raw string in dispatch source");
+                    tokens.push(text[start - 1 - hashes..j + closer.len()].to_owned());
+                    i = j + closer.len();
+                    continue;
+                }
+            }
+            // String or char literal.
+            if c == '"' || c == '\'' {
+                // A lifetime ('a) is an identifier-like token, not
+                // a char literal: keep it as punctuation + ident.
+                if c == '\''
+                    && bytes
+                        .get(i + 1)
+                        .is_some_and(|b| (*b as char).is_ascii_alphabetic() || *b == b'_')
+                    && bytes.get(i + 2) != Some(&b'\'')
+                {
+                    tokens.push("'".to_owned());
+                    i += 1;
+                    continue;
+                }
+                let quote = bytes[i];
+                let literal_start = i;
+                i += 1;
+                let mut closed = false;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == quote {
+                        closed = true;
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                assert!(closed, "unterminated literal in dispatch source");
+                tokens.push(text[literal_start..i].to_owned());
+                continue;
+            }
+            if c.is_ascii_alphabetic() || c == '_' {
+                let start = i;
+                while i < bytes.len()
+                    && ((bytes[i] as char).is_ascii_alphanumeric() || bytes[i] == b'_')
+                {
+                    i += 1;
+                }
+                tokens.push(text[start..i].to_owned());
+                continue;
+            }
+            if c.is_ascii_digit() {
+                let start = i;
+                while i < bytes.len()
+                    && ((bytes[i] as char).is_ascii_alphanumeric() || bytes[i] == b'_')
+                {
+                    i += 1;
+                }
+                tokens.push(text[start..i].to_owned());
+                continue;
+            }
+            // Two-character operators the parser distinguishes.
+            if c == '=' && bytes.get(i + 1) == Some(&b'>') {
+                tokens.push("=>".to_owned());
+                i += 2;
+                continue;
+            }
+            if c == ':' && bytes.get(i + 1) == Some(&b':') {
+                tokens.push("::".to_owned());
+                i += 2;
+                continue;
+            }
+            tokens.push(c.to_string());
+            i += 1;
         }
-        out
+        tokens
     }
 
-    /// The typed variants and raw sysnos one dispatch match names
-    /// in arms the compiler would actually build: comments are
-    /// stripped first, and an arm disabled by `#[cfg(any())]` or
-    /// `#[cfg(false)]` does not count (Astra B6: both used to count).
-    /// Evaluates the cfg predicates dispatch arms actually use
-    /// for the architecture this test binary was built for.
-    /// Unknown bare flags count as active: the guard's job is to
-    /// catch arms this build cannot contain, not to model every
-    /// cfg in the tree.
-    fn cfg_active(predicate: &str) -> bool {
-        fn eval(predicate: &str) -> bool {
-            let predicate = predicate.trim();
-            for (name, want_any) in [("all", false), ("any", true)] {
-                if let Some(inner) = predicate
-                    .strip_prefix(&format!("{name}("))
-                    .and_then(|inner| inner.strip_suffix(')'))
-                {
-                    let parts = split_cfg_args(inner);
-                    return if want_any {
-                        parts.iter().any(|part| eval(part))
-                    } else {
-                        parts.iter().all(|part| eval(part))
-                    };
-                }
-            }
-            if let Some(inner) = predicate
-                .strip_prefix("not(")
-                .and_then(|inner| inner.strip_suffix(')'))
-            {
-                return !eval(inner);
-            }
-            if let Some(value) = predicate
-                .strip_prefix("target_arch")
-                .and_then(|rest| rest.trim().strip_prefix('='))
-            {
-                return value.trim().trim_matches('"') == std::env::consts::ARCH;
-            }
-            if let Some(value) = predicate
-                .strip_prefix("target_os")
-                .and_then(|rest| rest.trim().strip_prefix('='))
-            {
-                return value.trim().trim_matches('"') == std::env::consts::OS;
-            }
-            !matches!(predicate, "false")
-        }
-        fn split_cfg_args(inner: &str) -> Vec<&str> {
-            let mut parts = Vec::new();
-            let mut depth = 0usize;
-            let mut start = 0usize;
-            for (index, c) in inner.char_indices() {
-                match c {
-                    '(' => depth += 1,
-                    ')' => depth = depth.saturating_sub(1),
-                    ',' if depth == 0 => {
-                        parts.push(&inner[start..index]);
-                        start = index + 1;
+    /// Evaluates one cfg predicate token list for this build.
+    /// Unknown or malformed predicates fail the guard by name:
+    /// assumed coverage is exactly what this test exists to deny.
+    fn cfg_tokens_active(tokens: &[String]) -> bool {
+        fn eval(tokens: &[String]) -> bool {
+            assert!(!tokens.is_empty(), "malformed cfg predicate");
+            if tokens[0] == "all" || tokens[0] == "any" {
+                assert!(
+                    tokens.get(1).is_some_and(|t| t == "(")
+                        && tokens.last().is_some_and(|t| t == ")"),
+                    "malformed cfg({}) predicate",
+                    tokens[0]
+                );
+                let inner = &tokens[2..tokens.len() - 1];
+                let mut parts: Vec<&[String]> = Vec::new();
+                let mut depth = 0usize;
+                let mut start = 0usize;
+                for (index, token) in inner.iter().enumerate() {
+                    match token.as_str() {
+                        "(" | "[" | "{" => depth += 1,
+                        ")" | "]" | "}" => depth = depth.saturating_sub(1),
+                        "," if depth == 0 => {
+                            parts.push(&inner[start..index]);
+                            start = index + 1;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
+                if start < inner.len() {
+                    parts.push(&inner[start..]);
+                }
+                return if tokens[0] == "any" {
+                    parts.iter().any(|part| eval(part))
+                } else {
+                    parts.iter().all(|part| eval(part))
+                };
             }
-            if start < inner.len() {
-                parts.push(&inner[start..]);
+            if tokens[0] == "not" {
+                assert!(
+                    tokens.get(1).is_some_and(|t| t == "(")
+                        && tokens.last().is_some_and(|t| t == ")"),
+                    "malformed cfg(not) predicate"
+                );
+                return !eval(&tokens[2..tokens.len() - 1]);
             }
-            parts
+            if tokens.len() == 3 && tokens[1] == "=" {
+                let value = tokens[2].trim_matches('"');
+                return match tokens[0].as_str() {
+                    "target_arch" => value == std::env::consts::ARCH,
+                    "target_os" => value == std::env::consts::OS,
+                    other => panic!("unsupported cfg key {other} in dispatch guard"),
+                };
+            }
+            if tokens.len() == 1 {
+                return match tokens[0].as_str() {
+                    "true" | "test" => true,
+                    "false" => false,
+                    other => panic!("unsupported cfg predicate {other} in dispatch guard"),
+                };
+            }
+            panic!("malformed cfg predicate in dispatch guard: {tokens:?}");
         }
-        eval(predicate)
+        eval(tokens)
     }
 
     /// The typed variants and raw sysnos named by arm *patterns*
-    /// of the dispatch match that this build compiles: only
-    /// pattern headers at the match's own brace depth count, so a
-    /// token elsewhere (a matches! mention, an arm body) or under
-    /// an inactive cfg is not coverage (round-2 finding 6).
+    /// of the dispatch match that this build compiles. Patterns
+    /// are the token groups at the match's own depth up to each
+    /// arm's structural arrow; attributes accumulate and conjoin;
+    /// anything the restricted parser cannot prove (unknown cfg,
+    /// cfg_attr, a macro in pattern position, unbalanced groups)
+    /// fails by name instead of approximating coverage.
     fn dispatch_tokens(source_text: &str) -> BTreeSet<String> {
-        let stripped = strip_comments(source_text);
-        let start = stripped
-            .find("async fn handle_syscall_event")
+        let tokens = lex_dispatch(source_text);
+        let start = tokens
+            .windows(4)
+            .position(|window| {
+                window == ["fn", "handle_syscall_event", "(", ")"]
+                    || window[0..2] == ["fn", "handle_syscall_event"]
+            })
             .expect("dispatch fn");
-        let rest = &stripped[start..];
-        let end = rest
-            .find("async fn handle_post_exec")
-            .expect("dispatch end");
-        let window = &rest[..end];
-        let match_start = window.find("match syscall").expect("dispatch match");
-        let lines: Vec<&str> = window[match_start..].lines().collect();
-        // Arm patterns share one indent; bodies sit deeper. Only
-        // pattern lines at that indent (and their `|` continuations)
-        // count, and only up to each arm's `=>`.
-        let indent_of = |line: &str| line.len() - line.trim_start().len();
-        let arm_indent = lines
-            .iter()
-            .find(|line| line.trim_start().starts_with("Syscall::"))
-            .map(|line| indent_of(line))
-            .expect("first dispatch arm");
+        let match_at = tokens[start..]
+            .windows(2)
+            .position(|window| window == ["match", "syscall"])
+            .map(|at| start + at)
+            .expect("dispatch match");
         let mut out = BTreeSet::new();
+        let mut depth = 0isize;
+        let mut in_match = false;
         let mut arm_active = true;
         let mut in_header = true;
-        for line in &lines {
-            let trimmed = line.trim_start();
-            if indent_of(line) == arm_indent && trimmed.starts_with("#[cfg(") {
-                let predicate = trimmed
-                    .strip_prefix("#[cfg(")
-                    .and_then(|rest| rest.strip_suffix(")]"))
-                    .unwrap_or_default();
-                arm_active = cfg_active(predicate);
+        let mut i = match_at;
+        while i < tokens.len() {
+            let token = &tokens[i];
+            if in_match && depth == 1 && token == "#" {
+                // Attribute group: #[cfg(...)] / #[cfg_attr(...)].
+                assert!(
+                    tokens.get(i + 1).is_some_and(|t| t == "["),
+                    "malformed attribute in dispatch guard"
+                );
+                let mut j = i + 2;
+                let mut bracket_depth = 1usize;
+                let mut group: Vec<String> = Vec::new();
+                while j < tokens.len() && bracket_depth > 0 {
+                    match tokens[j].as_str() {
+                        "[" => bracket_depth += 1,
+                        "]" => bracket_depth -= 1,
+                        _ => {}
+                    }
+                    if bracket_depth > 0 {
+                        group.push(tokens[j].clone());
+                    }
+                    j += 1;
+                }
+                assert!(bracket_depth == 0, "unbalanced attribute in dispatch guard");
+                if group.first().is_some_and(|t| t == "cfg") {
+                    assert!(
+                        group.get(1).is_some_and(|t| t == "(")
+                            && group.last().is_some_and(|t| t == ")"),
+                        "malformed cfg attribute in dispatch guard"
+                    );
+                    arm_active &= cfg_tokens_active(&group[2..group.len() - 1]);
+                } else if group.first().is_some_and(|t| t == "cfg_attr") {
+                    panic!("unsupported cfg_attr in dispatch guard: {group:?}");
+                }
                 in_header = true;
+                i = j;
                 continue;
             }
-            let at_arm_line = indent_of(line) == arm_indent
-                && (trimmed.starts_with("Syscall::")
-                    || trimmed.starts_with('|')
-                    || trimmed.starts_with("unsupported"));
-            if at_arm_line && !in_header {
-                // A new arm begins where the previous body ended.
-                in_header = true;
-                arm_active = true;
-            }
-            if in_header && arm_active && indent_of(line) <= arm_indent + 4 {
-                for token in
-                    line.split(|c: char| !(c.is_ascii_alphanumeric() || c == ':' || c == '_'))
-                {
-                    if let Some(variant) = token.strip_prefix("Syscall::") {
+            if in_match && depth == 1 && in_header {
+                if token == "=>" || token == "if" {
+                    // The pattern ends here; a guard expression
+                    // (which may contain macros) is not membership.
+                    in_header = false;
+                } else if arm_active {
+                    if token == "Syscall"
+                        && tokens.get(i + 1).is_some_and(|t| t == "::")
+                        && let Some(variant) = tokens.get(i + 2)
+                    {
                         out.insert(format!("variant:{variant}"));
-                    } else if let Some(sysno) = token.strip_prefix("Sysno::") {
+                    }
+                    if token == "Sysno"
+                        && tokens.get(i + 1).is_some_and(|t| t == "::")
+                        && let Some(sysno) = tokens.get(i + 2)
+                    {
                         out.insert(format!("sysno:{sysno}"));
+                    }
+                    if tokens.get(i + 1).is_some_and(|t| t == "!") {
+                        panic!("unsupported macro {token}! in dispatch pattern");
                     }
                 }
             }
-            if in_header && line.contains("=>") {
-                in_header = false;
+            match token.as_str() {
+                "{" => {
+                    depth += 1;
+                    in_match = true;
+                }
+                "}" => {
+                    depth -= 1;
+                    if in_match && depth == 0 {
+                        break;
+                    }
+                    if in_match && depth == 1 {
+                        in_header = true;
+                        arm_active = true;
+                    }
+                }
+                "," if in_match && depth == 1 && !in_header => {
+                    in_header = true;
+                    arm_active = true;
+                }
+                _ => {}
             }
+            i += 1;
         }
         out
     }

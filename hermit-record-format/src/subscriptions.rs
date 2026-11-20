@@ -174,3 +174,121 @@ pub fn record_and_replay() -> Subscription {
 
     subscription
 }
+
+/// Forwarded-but-unsubscribed census (6805): syscalls Detcore
+/// forwards to the record/replay tools or runs natively without a
+/// subscription, each with why leaving it live is safe under the
+/// rr-like replay default. The guard test below enforces that
+/// this census and the subscription stay disjoint and that every
+/// entry keeps its reason; subscribing an entry here without
+/// removing it (or naming a new forwarded call nowhere) fails
+/// there. A forwarded call that touches filesystem or
+/// kernel-object state later live calls read does not belong
+/// here: it belongs in the subscription.
+pub const FORWARDED_UNSUBSCRIBED: &[(Sysno, &str)] = &[
+    (
+        Sysno::set_tid_address,
+        "stores a guest-memory pointer; no state later calls read",
+    ),
+    (
+        Sysno::socketpair,
+        "Detcore creates the real sockets in both modes; contents flow through subscribed calls",
+    ),
+    (
+        Sysno::pipe2,
+        "Detcore creates the real pipe in both modes; contents flow through subscribed calls",
+    ),
+    (
+        Sysno::eventfd2,
+        "Detcore creates the real eventfd in both modes; counter flow is subscribed",
+    ),
+    (
+        Sysno::memfd_create,
+        "Detcore creates the real memfd in both modes; its mappings and writes are subscribed",
+    ),
+    (
+        Sysno::inotify_init1,
+        "Detcore creates the real instance in both modes; watches and reads are subscribed",
+    ),
+    (
+        Sysno::sendmmsg,
+        "live on real sockets whose shutdown/option/epoll state replay maintains in both modes",
+    ),
+    (
+        Sysno::recvmmsg,
+        "live on real sockets whose shutdown/option/epoll state replay maintains in both modes",
+    ),
+    (
+        Sysno::epoll_create1,
+        "Detcore creates the real epoll instance in both modes; ctl/wait state is replayed",
+    ),
+    (
+        Sysno::signalfd4,
+        "Detcore creates the real signalfd in both modes; its reads are subscribed",
+    ),
+    (
+        Sysno::timerfd_create,
+        "Detcore creates the real timerfd in both modes; its reads are subscribed",
+    ),
+    (
+        Sysno::timerfd_settime,
+        "timer state Detcore virtualizes deterministically in both modes",
+    ),
+    (
+        Sysno::timerfd_gettime,
+        "timer state Detcore virtualizes deterministically in both modes",
+    ),
+    (
+        Sysno::userfaultfd,
+        "Detcore refuses or determinizes userfaultfd creation itself in both modes",
+    ),
+    (
+        Sysno::pidfd_open,
+        "subscribed through its raw Other dispatch in both tools; listed in the agreement census",
+    ),
+    (
+        Sysno::madvise,
+        "advisory page state only; mapping effects Detcore models are subscribed separately",
+    ),
+    (
+        Sysno::munmap,
+        "guest address-space state Detcore models; no replay file object is named",
+    ),
+    (
+        Sysno::mremap,
+        "guest address-space state Detcore models; shared views resolve by recorded identity",
+    ),
+    (
+        Sysno::msync,
+        "writeback timing only; shared bytes are served from the backing in both modes",
+    ),
+    (
+        Sysno::sync,
+        "writeback timing only; no guest-visible result",
+    ),
+    (
+        Sysno::set_robust_list,
+        "guest-memory pointer registration Detcore models; futex traffic is subscribed",
+    ),
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forwarded_census_is_disjoint_and_reasoned() {
+        let subscribed: std::collections::BTreeSet<Sysno> =
+            record_and_replay().iter_syscalls().collect();
+        for (sysno, reason) in FORWARDED_UNSUBSCRIBED {
+            assert!(
+                !subscribed.contains(sysno),
+                "{sysno:?} is both subscribed and in the forwarded census"
+            );
+            assert!(
+                reason.len() > 20,
+                "{sysno:?} census entry carries no real reason"
+            );
+        }
+    }
+}

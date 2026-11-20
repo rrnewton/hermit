@@ -137,7 +137,6 @@ pub struct ReplayMaterializationScope {
     identity: ReplayFileIdentity,
     _root: OwnedFd,
     pending_at_start: Vec<PendingPlaceholderKey>,
-    bindings_at_start: Vec<mmap::PlaceholderBindingKey>,
 }
 
 /// The identity under which one pending placeholder entry is remembered,
@@ -190,7 +189,6 @@ impl ReplayMaterializationScope {
             identity,
             _root: root,
             pending_at_start,
-            bindings_at_start: mmap::binding_keys(),
         })
     }
 }
@@ -216,10 +214,10 @@ impl Drop for ReplayMaterializationScope {
                         .contains(&pending_placeholder_key(pending))
                 });
         }
-        // Placeholder bindings created during this scope die with
-        // it on the same terms, so a later run cannot resolve a
-        // recycled descriptor number through a stale row.
-        mmap::retain_bindings(&self.bindings_at_start);
+        // This run's placeholder descriptions die with its scope,
+        // keyed by its root, so a later run cannot resolve a
+        // recycled descriptor through stale state.
+        mmap::clear_file_state_for_root((self.identity.device, self.identity.inode));
         replay_roots()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -690,13 +688,6 @@ fn remember_pending_placeholder_open(pending: PendingPlaceholderOpen) {
 /// table is not the calling thread's when it was made without
 /// `CLONE_FILES`, so pending entries are judged against the calling
 /// thread (`guest.tid()`), not the leader.
-/// The thread group owning `tid`'s descriptor table, for binding
-/// accounting; the thread's own id when its status is unreadable
-/// (the same fallback the binding registration took).
-fn tgid_of(tid: Pid) -> libc::pid_t {
-    guest_tgid_ppid(tid).map_or(tid.as_raw(), |(tgid, _)| tgid)
-}
-
 fn guest_tgid_ppid(tid: Pid) -> Option<(libc::pid_t, libc::pid_t)> {
     let status = std::fs::read_to_string(format!("/proc/{}/status", tid.as_raw())).ok()?;
     let (mut tgid, mut ppid) = (None, None);
@@ -1488,6 +1479,31 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
         Ok(())
     }
 
+    /// The descriptor-table relationship Detcore normalized from
+    /// its clone context, delivered before this child's state is
+    /// built: attach the thread to its replay file state's table.
+    fn on_descriptor_table_init(
+        &self,
+        child: Tid,
+        parent: Option<Tid>,
+        init: reverie::DescriptorTableInit,
+    ) {
+        mmap::table_init(child, parent, init);
+    }
+
+    /// The thread's table membership ends with it; the table's
+    /// last user drops it and its aliases.
+    async fn on_exit_thread<G: reverie::GlobalRPC<Self::GlobalState>>(
+        &self,
+        tid: Tid,
+        _global_state: &G,
+        _thread_state: Self::ThreadState,
+        _exit_status: reverie::ExitStatus,
+    ) -> Result<(), reverie::Error> {
+        mmap::release_thread(tid);
+        Ok(())
+    }
+
     fn init_thread_state(
         &self,
         child: Tid,
@@ -1499,15 +1515,6 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
         };
         // Its mappings keep shared files' backings alive.
         mmap::track_task(child.as_raw());
-        // A forked child inherits its parent's placeholder aliases
-        // under its own thread group; a thread in the same group
-        // already shares the rows.
-        if let Some((parent_tid, _)) = parent {
-            let (parent_tgid, child_tgid) = (tgid_of(parent_tid), tgid_of(child));
-            if parent_tgid != child_tgid {
-                mmap::clone_bindings_for_fork(parent_tgid, child_tgid);
-            }
-        }
         // We have to unwrap because there is no way to handle errors here.
         ReplayerThreadState {
             events: EventReader::open(&self.data, &stream_id).unwrap_or_else(|err| {
@@ -1758,8 +1765,19 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
                 self.handle_dup_family(guest, syscall, "fcntl_dupfd").await
             }
             Syscall::Fcntl(call) if matches!(call.cmd(), FcntlCmd::F_SETFD(_)) => {
-                self.handle_replayed_side_effect(guest, syscall, "fcntl_setfd")
-                    .await
+                let (fd, cloexec) = match call.cmd() {
+                    FcntlCmd::F_SETFD(flags) => {
+                        (call.fd(), flags & libc::FD_CLOEXEC != 0)
+                    }
+                    _ => unreachable!("guarded above"),
+                };
+                let recorded = self
+                    .handle_replayed_side_effect(guest, syscall, "fcntl_setfd")
+                    .await;
+                if recorded.is_ok() {
+                    mmap::set_placeholder_cloexec(guest.tid(), fd, cloexec);
+                }
+                recorded
             }
             Syscall::Fcntl(call) if crate::event::fcntl_output(&call).is_some() => {
                 self.handle_fcntl_output(guest, call).await
@@ -1897,7 +1915,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 .retain(|pending| {
                     !(pending.flags.contains(OFlag::O_CLOEXEC) && pending.tgid == exec_tgid)
                 });
-            mmap::retire_cloexec_placeholder_bindings(exec_tgid);
+            mmap::exec_detach_table(guest.tid());
         }
         let actual_request = self
             .read_exec_request(guest, syscall)
@@ -2973,8 +2991,12 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 )
             }),
         };
-        if let Some(id) = id {
-            let tgid = pending.map_or_else(|| tgid_of(tid), |pending| pending.tgid);
+        let Some(id) = id else {
+            panic!(
+                "could not bind the reserved placeholder without its identity:                  the descriptor names no eventfd"
+            );
+        };
+        {
             let pid = guest.pid();
             let pin = H::duplicate_guest_thread_fd(
                 &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
@@ -2983,7 +3005,18 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 fd,
             )
             .unwrap_or_else(|error| mmap::refuse("pin a bound placeholder descriptor", error));
-            mmap::bind_placeholder(id, pin, file_id, tgid, fd, flags.contains(OFlag::O_CLOEXEC));
+            let root = mmap::root_file_id(tid).unwrap_or_else(|error| {
+                mmap::refuse("name the replay root for a placeholder binding", error)
+            });
+            mmap::bind_placeholder(
+                tid,
+                fd,
+                id,
+                pin,
+                file_id,
+                root,
+                flags.contains(OFlag::O_CLOEXEC),
+            );
         }
         if flags.contains(OFlag::O_TRUNC) {
             mmap::truncate_recorded_backing(tid, file_id).unwrap_or_else(|error| {
@@ -4419,7 +4452,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         if !matches!(recorded, Err(Errno::EBADF | Errno::ERESTARTSYS))
             && let Syscall::Close(call) = syscall
         {
-            mmap::retire_placeholder_binding(tgid_of(guest.tid()), call.fd());
+            mmap::retire_placeholder_binding(guest.tid(), call.fd());
         }
 
         // Linux releases a descriptor even when close reports EINTR, EIO,
@@ -4624,11 +4657,15 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                     // The replaced target's binding ends and the
                     // source's alias row follows onto the target
                     // (a dup2 onto itself keeps its own).
-                    let tgid = tgid_of(guest.tid());
                     if call.oldfd() != call.newfd() {
-                        mmap::retire_placeholder_binding(tgid, call.newfd());
+                        mmap::retire_placeholder_binding(guest.tid(), call.newfd());
                     }
-                    mmap::follow_binding_through_dup(tgid, call.oldfd(), call.newfd(), false);
+                    mmap::follow_binding_through_dup(
+                        guest.tid(),
+                        call.oldfd(),
+                        call.newfd(),
+                        false,
+                    );
                     follow_pending_through_dup(guest.tid(), call.oldfd(), call.newfd(), false);
                 }
             }
@@ -4659,12 +4696,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             .handle_replayed_side_effect(guest, syscall, operation)
             .await;
         if let Ok(newfd) = recorded {
-            mmap::follow_binding_through_dup(
-                tgid_of(guest.tid()),
-                oldfd,
-                newfd as libc::c_int,
-                cloexec,
-            );
+            mmap::follow_binding_through_dup(guest.tid(), oldfd, newfd as libc::c_int, cloexec);
             follow_pending_through_dup(guest.tid(), oldfd, newfd as libc::c_int, cloexec);
         }
         recorded
@@ -4820,7 +4852,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 let first = args.arg0 as libc::c_int;
                 let last = args.arg1.min(libc::c_int::MAX as usize) as libc::c_int;
                 mmap::retire_placeholder_bindings_in_range(
-                    tgid_of(guest.tid()),
+                    guest.tid(),
                     first,
                     last,
                     args.arg2 & 0b100 != 0,

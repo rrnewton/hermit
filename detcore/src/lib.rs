@@ -395,7 +395,10 @@ fn signal_bit(signal: i32) -> u64 {
 pub fn mask_restore_handler_runs(facts: &reverie::PendingMaskRestore) -> bool {
     let unrunnable = signal_bit(libc::SIGKILL) | signal_bit(libc::SIGSTOP);
     let runs = |signals: u64| signals & facts.caught & !facts.mask_in_effect & !unrunnable != 0;
-    facts.delivered.is_some_and(|signal| runs(signal_bit(signal))) || runs(facts.pending)
+    facts
+        .delivered
+        .is_some_and(|signal| runs(signal_bit(signal)))
+        || runs(facts.pending)
 }
 
 /// The outcome Linux's `do_signal` takes for the restart code the facts
@@ -6145,6 +6148,28 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     ) -> Self::ThreadState {
         trace!("[tid {}] detcore init new thread state", tid);
 
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(6805): normalized descriptor-table
+        // relation, delivered before the inner state exists.
+        let table_init = match parent {
+            None => reverie::DescriptorTableInit::Fresh,
+            Some((_, parent_state)) => {
+                let clone_flags = parent_state
+                    .clone_flags
+                    .expect("clone_flags must be set by parent");
+                if clone_flags.contains(CloneFlags::CLONE_FILES) {
+                    reverie::DescriptorTableInit::SharedWithParent
+                } else {
+                    reverie::DescriptorTableInit::CopiedFromParent
+                }
+            }
+        };
+        self.record_or_replay.on_descriptor_table_init(
+            tid,
+            parent.map(|(ptid, _)| ptid),
+            table_init,
+        );
+
         let record_or_replay = self
             .record_or_replay
             .init_thread_state(tid, parent.map(|(ptid, ts)| (ptid, ts.as_ref())));
@@ -9674,7 +9699,10 @@ mod subscription_tests {
     fn an_unresolved_restart_code_is_refused_by_name_unless_admitted() {
         use reverie::UnresolvedRestart;
         use reverie::syscalls::Sysno;
-        assert!(!Config::default().allow_unresolved_restart_codes, "strict by default");
+        assert!(
+            !Config::default().allow_unresolved_restart_codes,
+            "strict by default"
+        );
         let admitted = Config {
             allow_unresolved_restart_codes: true,
             ..Config::default()
@@ -9763,12 +9791,18 @@ mod subscription_tests {
             ))
         };
         // A delivered signal with a handler.
-        assert_eq!(outcome(Errno::ERESTARTNOHAND, Some(usr1), 0, bit1, 0), interrupted(true));
+        assert_eq!(
+            outcome(Errno::ERESTARTNOHAND, Some(usr1), 0, bit1, 0),
+            interrupted(true)
+        );
         assert_eq!(
             outcome(Errno::ERESTART_RESTARTBLOCK, Some(usr1), 0, bit1, 0),
             interrupted(true)
         );
-        assert_eq!(outcome(Errno::ERESTARTNOINTR, Some(usr1), 0, bit1, 0), restart(true));
+        assert_eq!(
+            outcome(Errno::ERESTARTNOINTR, Some(usr1), 0, bit1, 0),
+            restart(true)
+        );
         // None runs a handler: every code restarts.
         for code in [
             Errno::ERESTARTNOHAND,
@@ -9781,12 +9815,21 @@ mod subscription_tests {
         }
         // A dropped held signal, and a pending one the mask lets through
         // with a handler: it runs.
-        assert_eq!(outcome(Errno::ERESTARTNOHAND, None, 0, bit2, bit2), interrupted(true));
+        assert_eq!(
+            outcome(Errno::ERESTARTNOHAND, None, 0, bit2, bit2),
+            interrupted(true)
+        );
         // A pending one the mask in effect blocks runs none.
-        assert_eq!(outcome(Errno::ERESTARTNOHAND, None, bit2, bit2, bit2), restart(false));
+        assert_eq!(
+            outcome(Errno::ERESTARTNOHAND, None, bit2, bit2, bit2),
+            restart(false)
+        );
         // SIGKILL and SIGSTOP never run a handler.
         let kill = signal_bit(libc::SIGKILL) | signal_bit(libc::SIGSTOP);
-        assert_eq!(outcome(Errno::ERESTARTNOHAND, None, 0, kill, kill), restart(false));
+        assert_eq!(
+            outcome(Errno::ERESTARTNOHAND, None, 0, kill, kill),
+            restart(false)
+        );
         // The two cases that cannot decide.
         assert_eq!(
             outcome(Errno::ERESTARTSYS, Some(usr1), 0, bit1, 0),

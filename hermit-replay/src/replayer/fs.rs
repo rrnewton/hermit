@@ -766,6 +766,14 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         .map_err(Error::Io)?;
         let file = std::fs::File::from(duplicate);
         file.write_all_at(bytes, offset_u64).map_err(Error::Io)?;
+        // The mode-distinguishing witness for the output-files
+        // policy: only a write this controller actually applies
+        // to the intended replay file reaches this line.
+        tracing::debug!(
+            bytes = count,
+            offset = offset_u64,
+            "reapplied replay-root regular-file write"
+        );
 
         if advances_offset {
             let next = offset
@@ -1256,17 +1264,27 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         if recorded.is_ok() {
             let mode = syscall.mode();
             let access = DescriptorAccess::<H, ()>::task(&self.init, guest.tid(), guest.tid());
+            let has_backing =
+                super::mmap::writes_shared_backing(&access, guest.tid(), syscall.fd());
             // Range-shifting modes move file bytes in ways the
-            // backing model does not reproduce: refused by name
-            // only when a shared backing would actually diverge.
+            // backing model does not reproduce, and modes outside
+            // the modeled set are not guessed at: both are refused
+            // by name when a shared backing would diverge, whether
+            // or not the descriptor also aliases captured output.
+            // Destinations overlap and apply independently below.
+            const WRITE_ZEROES: libc::c_int = 0x80;
+            const NO_HIDE_STALE: libc::c_int = 0x04;
             let shifting = libc::FALLOC_FL_COLLAPSE_RANGE | libc::FALLOC_FL_INSERT_RANGE;
-            if mode & shifting != 0
-                && event.write.output_fd.is_none()
-                && super::mmap::writes_shared_backing(&access, guest.tid(), syscall.fd())
-            {
+            let modeled = libc::FALLOC_FL_KEEP_SIZE
+                | libc::FALLOC_FL_PUNCH_HOLE
+                | NO_HIDE_STALE
+                | libc::FALLOC_FL_ZERO_RANGE
+                | libc::FALLOC_FL_UNSHARE_RANGE
+                | WRITE_ZEROES;
+            if has_backing && (mode & shifting != 0 || mode & !modeled & !shifting != 0) {
                 return Err(Error::Tool(anyhow::anyhow!(
                     "replay cannot reproduce a recorded fallocate with mode {mode:#x}: \
-                     range-shifting modes move shared file bytes"
+                     unmodeled modes move shared file bytes"
                 )));
             }
             if let Some(output_fd) = event.write.output_fd {
@@ -1280,8 +1298,11 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 if unsafe { libc::fallocate(output, mode, syscall.offset(), syscall.len()) } == -1 {
                     return Err(Error::Io(std::io::Error::last_os_error()));
                 }
-            } else {
-                let zeroing = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE;
+            }
+            {
+                const WRITE_ZEROES: libc::c_int = 0x80;
+                let zeroing =
+                    libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE | WRITE_ZEROES;
                 if mode & zeroing != 0
                     && let (Ok(offset), Ok(len)) = (
                         u64::try_from(syscall.offset()),
@@ -1454,8 +1475,20 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             request,
             ioctl::Request::FIOCLEX | ioctl::Request::FIONCLEX | ioctl::Request::FIONBIO(_)
         ) {
-            self.handle_replayed_side_effect(guest, Syscall::from(syscall), "ioctl")
-                .await
+            let cloexec = match request {
+                ioctl::Request::FIOCLEX => Some(true),
+                ioctl::Request::FIONCLEX => Some(false),
+                _ => None,
+            };
+            let recorded = self
+                .handle_replayed_side_effect(guest, Syscall::from(syscall), "ioctl")
+                .await;
+            if recorded.is_ok()
+                && let Some(cloexec) = cloexec
+            {
+                super::mmap::set_placeholder_cloexec(guest.tid(), syscall.fd(), cloexec);
+            }
+            recorded
         } else if request.direction() == ioctl::Direction::Read {
             let output = next_event!(guest, Ioctl)?;
             request.write_output(&mut guest.memory(), &output)?;
