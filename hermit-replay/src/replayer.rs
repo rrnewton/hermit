@@ -67,6 +67,7 @@ use reverie::syscalls::ReadAddr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
+use reverie::syscalls::Truncate;
 use reverie::syscalls::Unlinkat;
 use reverie::syscalls::Whence;
 use serde::Deserialize;
@@ -136,6 +137,7 @@ pub struct ReplayMaterializationScope {
     identity: ReplayFileIdentity,
     _root: OwnedFd,
     pending_at_start: Vec<PendingPlaceholderKey>,
+    bindings_at_start: Vec<mmap::PlaceholderBindingKey>,
 }
 
 /// The identity under which one pending placeholder entry is remembered,
@@ -188,6 +190,7 @@ impl ReplayMaterializationScope {
             identity,
             _root: root,
             pending_at_start,
+            bindings_at_start: mmap::binding_keys(),
         })
     }
 }
@@ -213,6 +216,10 @@ impl Drop for ReplayMaterializationScope {
                         .contains(&pending_placeholder_key(pending))
                 });
         }
+        // Placeholder bindings created during this scope die with
+        // it on the same terms, so a later run cannot resolve a
+        // recycled descriptor number through a stale row.
+        mmap::retain_bindings(&self.bindings_at_start);
         replay_roots()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -343,12 +350,17 @@ fn parse_eventfd_id(fdinfo: &str) -> Option<String> {
 }
 
 /// The `eventfd-id` of descriptor `fd` in thread `tid`'s table.
+/// A descriptor whose fdinfo vanished has no identity; a failed
+/// fdinfo read is an error the registration paths refuse by name,
+/// never a silent "not a placeholder" (6805 round-2 finding 5).
 fn placeholder_eventfd_id<H: RecordHost, G>(
     access: &DescriptorAccess<'_, H, G>,
     fd: libc::c_int,
-) -> Option<String> {
-    let fdinfo = H::fdinfo_text_at(access, fd).ok().flatten()?;
-    parse_eventfd_id(&fdinfo)
+) -> std::io::Result<Option<String>> {
+    let Some(fdinfo) = H::fdinfo_text_at(access, fd)? else {
+        return Ok(None);
+    };
+    Ok(parse_eventfd_id(&fdinfo))
 }
 
 /// The `eventfd-count` line of an fdinfo file, present for eventfds. Linux
@@ -678,6 +690,13 @@ fn remember_pending_placeholder_open(pending: PendingPlaceholderOpen) {
 /// table is not the calling thread's when it was made without
 /// `CLONE_FILES`, so pending entries are judged against the calling
 /// thread (`guest.tid()`), not the leader.
+/// The thread group owning `tid`'s descriptor table, for binding
+/// accounting; the thread's own id when its status is unreadable
+/// (the same fallback the binding registration took).
+fn tgid_of(tid: Pid) -> libc::pid_t {
+    guest_tgid_ppid(tid).map_or(tid.as_raw(), |(tgid, _)| tgid)
+}
+
 fn guest_tgid_ppid(tid: Pid) -> Option<(libc::pid_t, libc::pid_t)> {
     let status = std::fs::read_to_string(format!("/proc/{}/status", tid.as_raw())).ok()?;
     let (mut tgid, mut ppid) = (None, None);
@@ -744,7 +763,12 @@ fn take_pending_placeholder_open<H: RecordHost, G>(
     // here would lock the sibling's file. The opening thread's own
     // entry may spend when no id could be pinned (its table is the
     // one the reservation landed in).
-    let current_id = placeholder_eventfd_id::<H, G>(access, fd);
+    let current_id = placeholder_eventfd_id::<H, G>(access, fd).unwrap_or_else(|error| {
+        panic!(
+            "could not prove the placeholder identity for a pending-open spend \
+             without changing its meaning: {error}"
+        )
+    });
     let id_matches = |pending: &PendingPlaceholderOpen| {
         pending.placeholder_id.is_some() && pending.placeholder_id == current_id
     };
@@ -968,7 +992,12 @@ fn pending_placeholder_open<H: RecordHost, G>(
         mode,
         parent: pins.parent,
         object: pins.object,
-        placeholder_id: placeholder_eventfd_id::<H, G>(access, fd),
+        placeholder_id: placeholder_eventfd_id::<H, G>(access, fd).unwrap_or_else(|error| {
+            panic!(
+                "could not register the reserved placeholder identity without \
+                 changing its meaning: {error}"
+            )
+        }),
     })
 }
 
@@ -1470,6 +1499,15 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
         };
         // Its mappings keep shared files' backings alive.
         mmap::track_task(child.as_raw());
+        // A forked child inherits its parent's placeholder aliases
+        // under its own thread group; a thread in the same group
+        // already shares the rows.
+        if let Some((parent_tid, _)) = parent {
+            let (parent_tgid, child_tgid) = (tgid_of(parent_tid), tgid_of(child));
+            if parent_tgid != child_tgid {
+                mmap::clone_bindings_for_fork(parent_tgid, child_tgid);
+            }
+        }
         // We have to unwrap because there is no way to handle errors here.
         ReplayerThreadState {
             events: EventReader::open(&self.data, &stream_id).unwrap_or_else(|err| {
@@ -1672,7 +1710,7 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(6805): recorded passthrough effects.
             Syscall::Fallocate(syscall) => Ok(self.handle_fallocate(guest, syscall).await?),
-            Syscall::Truncate(_) => self.handle_confined_path_mutation(guest, syscall).await,
+            Syscall::Truncate(call) => Ok(self.handle_truncate_path(guest, call).await?),
             // Advisory/flush effects with no guest-visible state a
             // live call reads back: the recorded result stands.
             Syscall::Readahead(_) | Syscall::SyncFileRange(_) => {
@@ -1765,6 +1803,12 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
             Syscall::Getrandom(syscall) => self.handle_getrandom(guest, syscall).await,
             #[cfg(target_arch = "x86_64")]
             Syscall::Readlink(syscall) => self.handle_readlink(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(6805): recorded readlinkat/inotify.
+            Syscall::Readlinkat(syscall) => self.handle_readlinkat(guest, syscall).await,
+            Syscall::InotifyAddWatch(_) | Syscall::InotifyRmWatch(_) => {
+                self.handle_simple(guest, syscall).await
+            }
             // AUTONOMOUS-BOT-IMPLEMENTED
             #[cfg(target_arch = "x86_64")]
             Syscall::Mkdir(_) => self.handle_mkdir(guest, syscall, false).await,
@@ -2900,8 +2944,9 @@ impl<H: RecordHost> ReplayerWithHost<H> {
     /// truncating virtual open drops the backing's bytes as the
     /// recorded truncation did (6805 Astra B2). Memory coherence is
     /// not an output file: this runs under both output policies.
-    fn bind_virtual_open(
+    fn bind_virtual_open<G: Guest<Self>>(
         &self,
+        guest: &mut G,
         pending: Option<&PendingPlaceholderOpen>,
         tid: Pid,
         fd: libc::c_int,
@@ -2911,18 +2956,37 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         let Some(file_id) = file_id else {
             return;
         };
-        if let Some(id) = pending.and_then(|pending| pending.placeholder_id.clone()) {
-            mmap::bind_placeholder(
-                id,
-                file_id,
-                pending.map_or(tid.as_raw(), |pending| pending.tgid),
+        // The identity usually comes from the pending-open entry
+        // just remembered for this descriptor; when flock
+        // bookkeeping has none, binding reads it directly instead
+        // of silently skipping coherence (round-2 finding 5).
+        let id = match pending.and_then(|pending| pending.placeholder_id.clone()) {
+            Some(id) => Some(id),
+            None => placeholder_eventfd_id::<H, G>(
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
+                fd,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "could not read the placeholder identity to bind it without \
+                     changing its meaning: {error}"
+                )
+            }),
+        };
+        if let Some(id) = id {
+            let tgid = pending.map_or_else(|| tgid_of(tid), |pending| pending.tgid);
+            let pid = guest.pid();
+            let pin = H::duplicate_guest_thread_fd(
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
+                pid,
                 tid,
                 fd,
-                flags.contains(OFlag::O_CLOEXEC),
-            );
+            )
+            .unwrap_or_else(|error| mmap::refuse("pin a bound placeholder descriptor", error));
+            mmap::bind_placeholder(id, pin, file_id, tgid, fd, flags.contains(OFlag::O_CLOEXEC));
         }
         if flags.contains(OFlag::O_TRUNC) {
-            mmap::truncate_recorded_backing(file_id).unwrap_or_else(|error| {
+            mmap::truncate_recorded_backing(tid, file_id).unwrap_or_else(|error| {
                 mmap::refuse("truncate the shared backing after virtual open", error)
             });
         }
@@ -3050,6 +3114,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                             mode,
                         );
                         self.bind_virtual_open(
+                            guest,
                             pending.as_ref(),
                             tid,
                             fd as libc::c_int,
@@ -3089,6 +3154,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                     mode,
                 );
                 self.bind_virtual_open(
+                    guest,
                     pending.as_ref(),
                     tid,
                     fd as libc::c_int,
@@ -3535,6 +3601,52 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             }
         }
         recorded
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(6805): recorded pathname truncate.
+    /// Replays a pathname `truncate`: the recorded file identity
+    /// routes the content effect to that file's shared backing in
+    /// both policies (a mapped load must not keep bytes the
+    /// truncation dropped), and the pathname mutation itself is
+    /// applied in the disposable root like its confined siblings.
+    async fn handle_truncate_path<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Truncate,
+    ) -> Result<i64, Errno> {
+        let event = next_event!(guest, Truncate)?;
+        if event.result.is_ok() {
+            if let Some(file_id) = event.file_id
+                && let Ok(length) = u64::try_from(event.length)
+            {
+                mmap::truncate_recorded_backing_to(guest.tid(), file_id, length).unwrap_or_else(
+                    |error| {
+                        mmap::refuse("truncate the shared backing after pathname truncate", error)
+                    },
+                );
+            }
+            let syscall = Syscall::Truncate(call);
+            if self.path_mutation_dirfds_are_confined(guest.pid(), syscall) {
+                match guest.inject_with_retry(syscall).await {
+                    Ok(actual) => assert_eq!(
+                        Ok(actual),
+                        event.result,
+                        "replayed pathname truncate returned a different result"
+                    ),
+                    Err(error @ (Errno::ENOENT | Errno::ENOTDIR | Errno::EROFS)) => {
+                        tracing::debug!(%error, "replay pathname truncate kept virtual");
+                    }
+                    Err(error) => {
+                        panic!(
+                            "replayed pathname truncate failed after recording returned {:?}: {error}",
+                            event.result
+                        );
+                    }
+                }
+            }
+        }
+        event.result
     }
 
     // TODO-HUMAN-REVIEW(PR-3601)
@@ -4307,7 +4419,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         if !matches!(recorded, Err(Errno::EBADF | Errno::ERESTARTSYS))
             && let Syscall::Close(call) = syscall
         {
-            mmap::retire_placeholder_binding(guest.tid(), call.fd());
+            mmap::retire_placeholder_binding(tgid_of(guest.tid()), call.fd());
         }
 
         // Linux releases a descriptor even when close reports EINTR, EIO,
@@ -4509,9 +4621,14 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             if actual != Err(Errno::EBADF) {
                 assert_eq!(actual, recorded, "dup2 fd-table mutation diverged");
                 if let Syscall::Dup2(call) = syscall {
-                    // The replaced target's binding ends; the alias
-                    // itself resolves through the source's eventfd id.
-                    mmap::retire_placeholder_binding(guest.tid(), call.newfd());
+                    // The replaced target's binding ends and the
+                    // source's alias row follows onto the target
+                    // (a dup2 onto itself keeps its own).
+                    let tgid = tgid_of(guest.tid());
+                    if call.oldfd() != call.newfd() {
+                        mmap::retire_placeholder_binding(tgid, call.newfd());
+                    }
+                    mmap::follow_binding_through_dup(tgid, call.oldfd(), call.newfd(), false);
                     follow_pending_through_dup(guest.tid(), call.oldfd(), call.newfd(), false);
                 }
             }
@@ -4542,6 +4659,12 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             .handle_replayed_side_effect(guest, syscall, operation)
             .await;
         if let Ok(newfd) = recorded {
+            mmap::follow_binding_through_dup(
+                tgid_of(guest.tid()),
+                oldfd,
+                newfd as libc::c_int,
+                cloexec,
+            );
             follow_pending_through_dup(guest.tid(), oldfd, newfd as libc::c_int, cloexec);
         }
         recorded
@@ -4697,7 +4820,7 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 let first = args.arg0 as libc::c_int;
                 let last = args.arg1.min(libc::c_int::MAX as usize) as libc::c_int;
                 mmap::retire_placeholder_bindings_in_range(
-                    guest.tid(),
+                    tgid_of(guest.tid()),
                     first,
                     last,
                     args.arg2 & 0b100 != 0,

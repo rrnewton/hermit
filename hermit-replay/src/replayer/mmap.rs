@@ -252,14 +252,19 @@ struct SharedBacking {
     placeholders: Vec<PlaceholderPin>,
 }
 
-/// One linked placeholder descriptor: its `eventfd-id`, and a
+/// One linked placeholder descriptor: its `eventfd-id`, a
 /// duplicate this process holds open so the id cannot be reused
-/// while the link lives.
+/// while the link lives, and the guest descriptor that made the
+/// link, whose close (or replacement, or close-on-exec death)
+/// retires the pin so links cannot accumulate for the backing's
+/// whole life.
 #[derive(Debug)]
 struct PlaceholderPin {
     id: String,
     #[allow(dead_code, reason = "held open so its eventfd-id cannot be reused")]
     pin: OwnedFd,
+    tgid: libc::pid_t,
+    fd: RawFd,
 }
 
 impl SharedBacking {
@@ -354,9 +359,20 @@ fn shared_backings() -> MutexGuard<'static, SharedBackings> {
 #[derive(Debug)]
 struct PlaceholderBinding {
     id: String,
+    /// A duplicate of the placeholder held open for the row's
+    /// life, so the kernel cannot reuse its eventfd id for a
+    /// different placeholder while this binding can still resolve
+    /// writes (round-2 finding 1). Rows retire per alias, so pins
+    /// do not outlive the descriptor number that created them
+    /// beyond the scope's own retirement.
+    #[allow(dead_code, reason = "held open so its eventfd-id cannot be reused")]
+    pin: OwnedFd,
     recorded: FileId,
+    /// The thread group owning the descriptor table this alias
+    /// lives in. Aliases of one open description (dup copies, fork
+    /// inheritance) each carry a row under their own (tgid, fd), so
+    /// closing the opening descriptor retires only its row.
     tgid: libc::pid_t,
-    table: i32,
     fd: RawFd,
     cloexec: bool,
 }
@@ -370,10 +386,103 @@ fn placeholder_bindings() -> MutexGuard<'static, Vec<PlaceholderBinding>> {
 }
 
 fn bind_placeholder_in(bindings: &mut Vec<PlaceholderBinding>, binding: PlaceholderBinding) {
-    bindings.retain(|existing| {
-        existing.id != binding.id && !(existing.table == binding.table && existing.fd == binding.fd)
-    });
+    bindings.retain(|existing| !(existing.tgid == binding.tgid && existing.fd == binding.fd));
     bindings.push(binding);
+}
+
+/// The identity of one binding row for scope snapshots.
+pub(super) type PlaceholderBindingKey = (String, libc::pid_t, RawFd);
+
+/// Every binding row's identity, for `ReplayMaterializationScope`
+/// to snapshot at creation and retire against at drop.
+pub(super) fn binding_keys() -> Vec<PlaceholderBindingKey> {
+    placeholder_bindings()
+        .iter()
+        .map(|binding| (binding.id.clone(), binding.tgid, binding.fd))
+        .collect()
+}
+
+/// Drops every binding not in `keys` (the rows one materialization
+/// scope created die with it, like its pending opens).
+pub(super) fn retain_bindings(keys: &[PlaceholderBindingKey]) {
+    placeholder_bindings()
+        .retain(|binding| keys.contains(&(binding.id.clone(), binding.tgid, binding.fd)));
+}
+
+/// Clones `from`'s alias rows onto `newfd`, as a dup of `oldfd`
+/// does: the target number's previous binding ends first (a
+/// dup2 onto itself keeps its own).
+fn follow_binding_through_dup_in(
+    bindings: &mut Vec<PlaceholderBinding>,
+    tgid: libc::pid_t,
+    oldfd: RawFd,
+    newfd: RawFd,
+    cloexec: bool,
+) {
+    if oldfd == newfd {
+        return;
+    }
+    let Some(source) = bindings
+        .iter()
+        .find(|binding| binding.tgid == tgid && binding.fd == oldfd)
+    else {
+        return;
+    };
+    let mut alias = PlaceholderBinding {
+        id: source.id.clone(),
+        pin: source
+            .pin
+            .try_clone()
+            .unwrap_or_else(|error| refuse("pin a duplicated placeholder binding", error)),
+        recorded: source.recorded,
+        tgid: source.tgid,
+        fd: source.fd,
+        cloexec: source.cloexec,
+    };
+    bindings.retain(|binding| !(binding.tgid == tgid && binding.fd == newfd));
+    alias.fd = newfd;
+    alias.cloexec = cloexec;
+    bindings.push(alias);
+}
+
+pub(super) fn follow_binding_through_dup(
+    tgid: libc::pid_t,
+    oldfd: RawFd,
+    newfd: RawFd,
+    cloexec: bool,
+) {
+    follow_binding_through_dup_in(&mut placeholder_bindings(), tgid, oldfd, newfd, cloexec);
+}
+
+/// Clones a forking process's binding rows into its child's
+/// thread group, as the child inherits the descriptors.
+fn clone_bindings_for_fork_in(
+    bindings: &mut Vec<PlaceholderBinding>,
+    from_tgid: libc::pid_t,
+    to_tgid: libc::pid_t,
+) {
+    let cloned: Vec<_> = bindings
+        .iter()
+        .filter(|binding| binding.tgid == from_tgid)
+        .map(|binding| PlaceholderBinding {
+            id: binding.id.clone(),
+            pin: binding
+                .pin
+                .try_clone()
+                .unwrap_or_else(|error| refuse("pin a fork-inherited placeholder binding", error)),
+            recorded: binding.recorded,
+            tgid: to_tgid,
+            fd: binding.fd,
+            cloexec: binding.cloexec,
+        })
+        .collect();
+    for binding in cloned {
+        bind_placeholder_in(bindings, binding);
+    }
+}
+
+pub(super) fn clone_bindings_for_fork(from_tgid: libc::pid_t, to_tgid: libc::pid_t) {
+    clone_bindings_for_fork_in(&mut placeholder_bindings(), from_tgid, to_tgid);
 }
 
 fn binding_recorded_in(bindings: &[PlaceholderBinding], id: &str) -> Option<FileId> {
@@ -390,9 +499,9 @@ fn binding_recorded_in(bindings: &[PlaceholderBinding], id: &str) -> Option<File
 /// descriptor query per open.
 pub(super) fn bind_placeholder(
     id: String,
+    pin: OwnedFd,
     recorded: (u64, u64),
     tgid: libc::pid_t,
-    tid: Pid,
     fd: RawFd,
     cloexec: bool,
 ) {
@@ -400,28 +509,38 @@ pub(super) fn bind_placeholder(
         &mut placeholder_bindings(),
         PlaceholderBinding {
             id,
+            pin,
             recorded: FileId {
                 device: recorded.0,
                 inode: recorded.1,
             },
             tgid,
-            table: tid.as_raw(),
             fd,
             cloexec,
         },
     );
 }
 
-/// Retires the binding of descriptor `fd` in `table`'s table, as a
-/// close or a dup onto that number ends it.
-pub(super) fn retire_placeholder_binding(table: Pid, fd: RawFd) {
-    placeholder_bindings().retain(|binding| !(binding.table == table.as_raw() && binding.fd == fd));
+/// Retires the alias row and any mapped-link pin of descriptor
+/// `fd` in thread group `tgid`, as a close ends them. Other
+/// aliases of the same description keep their own rows; a link
+/// pin is no longer needed once no write can arrive through this
+/// descriptor (a surviving alias resolves by the same id through
+/// its own row, and its own guest descriptor keeps the id alive).
+pub(super) fn retire_placeholder_binding(tgid: libc::pid_t, fd: RawFd) {
+    placeholder_bindings().retain(|binding| !(binding.tgid == tgid && binding.fd == fd));
+    for backing in shared_backings().values_mut() {
+        backing
+            .placeholders
+            .retain(|pin| !(pin.tgid == tgid && pin.fd == fd));
+    }
 }
 
-/// Retires `table`'s bindings in `[first, last]`, as `close_range`
-/// ends them. A `CLOSE_RANGE_CLOEXEC` range only flags them.
+/// Retires `tgid`'s alias rows and link pins in `[first, last]`, as
+/// `close_range` ends them. A `CLOSE_RANGE_CLOEXEC` range only
+/// flags the rows (their pins die with the exec that closes them).
 pub(super) fn retire_placeholder_bindings_in_range(
-    table: Pid,
+    tgid: libc::pid_t,
     first: RawFd,
     last: RawFd,
     cloexec_only: bool,
@@ -429,21 +548,35 @@ pub(super) fn retire_placeholder_bindings_in_range(
     let mut bindings = placeholder_bindings();
     if cloexec_only {
         for binding in bindings.iter_mut() {
-            if binding.table == table.as_raw() && (first..=last).contains(&binding.fd) {
+            if binding.tgid == tgid && (first..=last).contains(&binding.fd) {
                 binding.cloexec = true;
             }
         }
-    } else {
-        bindings.retain(|binding| {
-            !(binding.table == table.as_raw() && (first..=last).contains(&binding.fd))
-        });
+        return;
+    }
+    bindings.retain(|binding| !(binding.tgid == tgid && (first..=last).contains(&binding.fd)));
+    drop(bindings);
+    for backing in shared_backings().values_mut() {
+        backing
+            .placeholders
+            .retain(|pin| !(pin.tgid == tgid && (first..=last).contains(&pin.fd)));
     }
 }
 
-/// Retires close-on-exec bindings of thread group `tgid`, as a
-/// successful exec closes their placeholders.
+/// Retires close-on-exec bindings (and their link pins) of thread
+/// group `tgid`, as a successful exec closes their placeholders.
 pub(super) fn retire_cloexec_placeholder_bindings(tgid: libc::pid_t) {
+    let doomed: Vec<RawFd> = placeholder_bindings()
+        .iter()
+        .filter(|binding| binding.cloexec && binding.tgid == tgid)
+        .map(|binding| binding.fd)
+        .collect();
     placeholder_bindings().retain(|binding| !(binding.cloexec && binding.tgid == tgid));
+    for backing in shared_backings().values_mut() {
+        backing
+            .placeholders
+            .retain(|pin| !(pin.tgid == tgid && doomed.contains(&pin.fd)));
+    }
 }
 
 /// Every guest task replay has started (`track_task`), whose mappings decide
@@ -747,11 +880,16 @@ fn link_object<H: RecordHost, G>(
         // all, and writes through it are not regular-file writes.
         // The duplicate pin keeps the eventfd id from being reused
         // while the link lives (Astra B1).
-        if let Some(id) = super::placeholder_eventfd_id::<H, G>(access, fd)
+        if let Some(id) = super::placeholder_eventfd_id::<H, G>(access, fd)?
             && binding_recorded_in(&placeholder_bindings(), &id) == Some(file.recorded)
         {
-            let pin = H::duplicate_guest_thread_fd(access, pid, tid, fd)?;
-            return link_placeholder_in(&mut shared_backings(), file, id, pin);
+            let pin = PlaceholderPin {
+                id,
+                pin: H::duplicate_guest_thread_fd(access, pid, tid, fd)?,
+                tgid: super::guest_tgid_ppid(tid).map_or(tid.as_raw(), |(tgid, _)| tgid),
+                fd,
+            };
+            return link_placeholder_in(&mut shared_backings(), file, pin);
         }
         return Ok(());
     }
@@ -769,15 +907,14 @@ fn link_object<H: RecordHost, G>(
 fn link_placeholder_in(
     backings: &mut SharedBackings,
     file: SharedFile,
-    id: String,
-    pin: OwnedFd,
+    pin: PlaceholderPin,
 ) -> io::Result<()> {
     if backings.iter().any(|(other, backing)| {
         *other != file
             && backing
                 .placeholders
                 .iter()
-                .any(|placeholder| placeholder.id == id)
+                .any(|placeholder| placeholder.id == pin.id)
     }) {
         return Err(io::Error::other(
             "replay object already backs another shared file",
@@ -791,9 +928,9 @@ fn link_placeholder_in(
     if !backing
         .placeholders
         .iter()
-        .any(|placeholder| placeholder.id == id)
+        .any(|placeholder| placeholder.id == pin.id)
     {
-        backing.placeholders.push(PlaceholderPin { id, pin });
+        backing.placeholders.push(pin);
     }
     Ok(())
 }
@@ -826,6 +963,21 @@ fn link_object_in(
     }
     backing.objects.push((object, pin()?));
     Ok(())
+}
+
+/// The replay-root identity `backing_of` keys this task's
+/// backings by: the replay's real root when known, else the
+/// process's own root. Recorded-file resolution must carry the
+/// same key, or two runs sharing a recorded identity could select
+/// each other's backing.
+fn root_file_id(tid: Pid) -> io::Result<FileId> {
+    match super::replay_root_of(tid) {
+        Some(((device, inode), _)) => Ok(FileId { device, inode }),
+        None => Ok(FileId::of(&std::fs::metadata(format!(
+            "/proc/{}/root",
+            tid.as_raw()
+        ))?)),
+    }
 }
 
 /// The backing that descriptor `fd` of thread `tid` writes, if it names a
@@ -866,9 +1018,13 @@ fn object_backing<H: RecordHost, G>(
     {
         return Ok(Some(backing));
     }
-    if let Some(backing) = recorded_backing_in(&backings, &bindings, || Ok(id), OwnedFd::try_clone)?
-    {
-        return Ok(Some(backing));
+    if id.is_some() && !bindings.is_empty() {
+        let root = root_file_id(tid)?;
+        if let Some(backing) =
+            recorded_backing_in(&backings, &bindings, root, || Ok(id), OwnedFd::try_clone)?
+        {
+            return Ok(Some(backing));
+        }
     }
     object_backing_in(&backings, || replay_object(tid, fd), OwnedFd::try_clone)
 }
@@ -902,6 +1058,7 @@ fn placeholder_backing_in(
 fn recorded_backing_in(
     backings: &SharedBackings,
     bindings: &[PlaceholderBinding],
+    root: FileId,
     inspect: impl FnOnce() -> io::Result<Option<String>>,
     duplicate: impl FnOnce(&OwnedFd) -> io::Result<OwnedFd>,
 ) -> io::Result<Option<File>> {
@@ -914,11 +1071,7 @@ fn recorded_backing_in(
     let Some(recorded) = binding_recorded_in(bindings, &id) else {
         return Ok(None);
     };
-    let Some(backing) = backings
-        .iter()
-        .find(|(file, _)| file.recorded == recorded)
-        .map(|(_, backing)| backing)
-    else {
+    let Some(backing) = backings.get(&SharedFile { root, recorded }) else {
         return Ok(None);
     };
     Ok(Some(File::from(duplicate(&backing.file)?)))
@@ -998,24 +1151,85 @@ pub(super) fn truncate_shared_backing<H: RecordHost>(
     truncate_backing_file(&backing, length)
 }
 
+/// Applies a replayed hole-punching/zeroing `fallocate` through
+/// descriptor `fd` of thread `tid` to the backing it names, as one
+/// sparse kernel operation on the backing file: the range is
+/// resolved once and never materialized as allocated zero writes,
+/// however large `len` is (Astra round-2 finding 2). No backing,
+/// no work.
+pub(super) fn punch_shared_backing<H: RecordHost>(
+    access: &DescriptorAccess<'_, H, ()>,
+    tid: Pid,
+    fd: RawFd,
+    mode: libc::c_int,
+    offset: u64,
+    len: u64,
+) -> io::Result<()> {
+    let Some(backing) = shared_write_target(|| object_backing(access, tid, fd)) else {
+        return Ok(());
+    };
+    let (offset, len) = (
+        libc::off_t::try_from(offset).map_err(io::Error::other)?,
+        libc::off_t::try_from(len).map_err(io::Error::other)?,
+    );
+    // SAFETY: backing is an open file; mode/offset/len are the
+    // recorded call's own, which Linux accepted.
+    let result = unsafe { libc::fallocate(backing.as_raw_fd(), mode, offset, len) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() != Some(libc::EOPNOTSUPP) {
+        return Err(error);
+    }
+    // No sparse punch on this filesystem: zero only the part of
+    // the range the backing actually holds, bounded by its size.
+    let size = backing.metadata()?.len();
+    let start = u64::try_from(offset).map_err(io::Error::other)?;
+    if start >= size {
+        return Ok(());
+    }
+    let end = start
+        .saturating_add(u64::try_from(len).map_err(io::Error::other)?)
+        .min(size);
+    let zeros = vec![0u8; 64 * 1024];
+    let mut at = start;
+    while at < end {
+        let chunk = usize::try_from(end - at).map_or(zeros.len(), |left| left.min(zeros.len()));
+        backing.write_all_at(&zeros[..chunk], at)?;
+        at += chunk as u64;
+    }
+    Ok(())
+}
+
 /// Truncates the backing of recorded file `recorded`, if one exists,
 /// as a successful virtual `O_TRUNC` open of that file does (Astra
 /// B2): the recorded result stands either way, and mapped loads
 /// must not keep reading bytes the truncation dropped.
-pub(super) fn truncate_recorded_backing(recorded: (u64, u64)) -> io::Result<()> {
+pub(super) fn truncate_recorded_backing(tid: Pid, recorded: (u64, u64)) -> io::Result<()> {
+    truncate_recorded_backing_to(tid, recorded, 0)
+}
+
+/// Truncates the backing of recorded file `recorded` in `tid`'s
+/// replay run to `length`, if one exists.
+pub(super) fn truncate_recorded_backing_to(
+    tid: Pid,
+    recorded: (u64, u64),
+    length: u64,
+) -> io::Result<()> {
     let recorded = FileId {
         device: recorded.0,
         inode: recorded.1,
     };
+    let root = root_file_id(tid)?;
     let backings = shared_backings();
     let Some(backing) = backings
-        .iter()
-        .find(|(file, _)| file.recorded == recorded)
-        .map(|(_, backing)| backing.file.try_clone())
+        .get(&SharedFile { root, recorded })
+        .map(|backing| backing.file.try_clone())
     else {
         return Ok(());
     };
-    truncate_backing_file(&File::from(backing?), 0)
+    truncate_backing_file(&File::from(backing?), length)
 }
 
 fn truncate_backing_file(backing: &File, length: u64) -> io::Result<()> {
@@ -2521,11 +2735,41 @@ mod tests {
         // The pin is a real held descriptor: it is what keeps the
         // eventfd instance (and so its id) alive for the link.
         let pin = || std::fs::File::open(directory.path()).unwrap().into();
-        link_placeholder_in(&mut backings, key, "41".to_owned(), pin()).unwrap();
+        link_placeholder_in(
+            &mut backings,
+            key,
+            PlaceholderPin {
+                id: "41".to_owned(),
+                pin: pin(),
+                tgid: 99,
+                fd: 9,
+            },
+        )
+        .unwrap();
         // Idempotent for the same file, refused for another.
-        link_placeholder_in(&mut backings, key, "41".to_owned(), pin()).unwrap();
+        link_placeholder_in(
+            &mut backings,
+            key,
+            PlaceholderPin {
+                id: "41".to_owned(),
+                pin: pin(),
+                tgid: 99,
+                fd: 9,
+            },
+        )
+        .unwrap();
         assert!(
-            link_placeholder_in(&mut backings, other_key, "41".to_owned(), pin()).is_err(),
+            link_placeholder_in(
+                &mut backings,
+                other_key,
+                PlaceholderPin {
+                    id: "41".to_owned(),
+                    pin: pin(),
+                    tgid: 99,
+                    fd: 9
+                }
+            )
+            .is_err(),
             "one placeholder id linked two shared files"
         );
         assert_eq!(
@@ -2564,9 +2808,9 @@ mod tests {
             &mut bindings,
             PlaceholderBinding {
                 id: "43".to_owned(),
+                pin: std::fs::File::open(directory.path()).unwrap().into(),
                 recorded: key.recorded,
                 tgid: 99,
-                table: 99,
                 fd: 9,
                 cloexec: false,
             },
@@ -2576,6 +2820,7 @@ mod tests {
         let resolved = recorded_backing_in(
             &backings,
             &bindings,
+            key.root,
             || Ok(Some("43".to_owned())),
             |fd| fd.try_clone(),
         )
@@ -2584,6 +2829,7 @@ mod tests {
         let unbound = recorded_backing_in(
             &backings,
             &bindings,
+            key.root,
             || Ok(Some("44".to_owned())),
             |fd| fd.try_clone(),
         )
@@ -2594,9 +2840,9 @@ mod tests {
             &mut bindings,
             PlaceholderBinding {
                 id: "45".to_owned(),
+                pin: std::fs::File::open(directory.path()).unwrap().into(),
                 recorded: key.recorded,
                 tgid: 99,
-                table: 99,
                 fd: 9,
                 cloexec: true,
             },

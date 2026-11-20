@@ -854,8 +854,11 @@ fn pipe_fork_then_vfork_runs_at_l2() {
     assert_pipe_fork_then_vfork_runs_at_l2("ptrace");
 }
 
-/// Replay must take the kernel lock again for a materialized file, not merely
-/// repeat the recorded return value.
+/// Replay with `--write-output-files` must take the kernel lock
+/// again for a materialized file, not merely repeat the recorded
+/// return value. Under the rr-like default every flock is
+/// answered from the recording instead (the companion test below
+/// pins that mode explicitly).
 ///
 /// `Replayer::handle_simple` consumes the recorded `Return` and injects
 /// nothing, which is valid only when nothing outside the return value depends
@@ -911,7 +914,12 @@ fn replay_reissues_every_flock_for_a_materialized_file() {
     replay
         .args(["--kill-after", "10s", "180s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
-        .args(["--log=debug", "replay", "--autopilot"])
+        .args([
+            "--log=debug",
+            "replay",
+            "--autopilot",
+            "--write-output-files",
+        ])
         .arg(format!("--data-dir={}", data_dir.path().display()));
     let replayed = finish(hermit_test::hermit_output(
         &format!("{replay:?}"),
@@ -957,6 +965,62 @@ fn replay_reissues_every_flock_for_a_materialized_file() {
             replayed.combined()
         );
     }
+}
+
+/// The rr-like default's flock posture, explicit: every flock is
+/// answered from the recording and none is re-issued to the
+/// kernel. The guest's exclusion output is unchanged because the
+/// recorded lock outcomes are what it printed from.
+#[test]
+fn replay_by_default_answers_every_flock_from_the_recording() {
+    let _guard = record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create the flock recording directory");
+
+    let mut record = Command::new("timeout");
+    record
+        .args(["--kill-after", "10s", "180s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=off", "record", "start", "--record-timeout=120"])
+        .arg(format!("--data-dir={}", data_dir.path().display()))
+        .args(["--"])
+        .arg(guest())
+        .arg("exclusion");
+    let recorded = finish(hermit_test::hermit_output(
+        &format!("{record:?}"),
+        &mut record,
+    ));
+    assert!(recorded.status.success(), "{}", recorded.combined());
+
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after", "10s", "180s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["--log=debug", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()));
+    let replayed = finish(hermit_test::hermit_output(
+        &format!("{replay:?}"),
+        &mut replay,
+    ));
+    assert!(replayed.status.success(), "{}", replayed.combined());
+    assert!(
+        replayed.stdout.contains("flock-exclusion-ok"),
+        "{}",
+        replayed.combined()
+    );
+    assert!(
+        replayed.stderr.matches("inbound syscall: flock").count() > 0,
+        "the guest issued no flock calls\n{}",
+        replayed.combined()
+    );
+    assert_eq!(
+        replayed
+            .stderr
+            .matches("beginning inject of syscall: flock")
+            .count(),
+        0,
+        "default replay re-issued a flock it should have answered from the log\n{}",
+        replayed.combined()
+    );
 }
 
 /// pidfd_getfd creates a real descriptor alias, so replay must both consume an
@@ -1027,9 +1091,12 @@ fn replay_reissues_pidfd_getfd_success_and_failure() {
     );
 }
 
-/// Replay cannot reproduce the lock side effect for an external file that was
-/// not materialized in the replay root. It must fail closed rather than replay
-/// the recorded success while holding no lock.
+/// With `--write-output-files`, replay cannot reproduce the lock
+/// side effect for an external file that was not materialized in
+/// the replay root. It must fail closed rather than replay the
+/// recorded success while holding no lock. Under the rr-like
+/// default the same flock is answered from the recording, which
+/// the first replay below pins explicitly.
 #[test]
 fn replay_refuses_flock_for_a_non_materialized_file() {
     let _guard = record_lock();
@@ -1055,11 +1122,35 @@ fn replay_refuses_flock_for_a_non_materialized_file() {
     );
     assert!(recorded.stdout.contains("flock-holder-ok"));
 
+    // Default: answered from the recording, succeeds.
     let mut replay = Command::new("timeout");
     replay
         .args(["--kill-after", "10s", "180s"])
         .arg(env!("CARGO_BIN_EXE_hermit"))
         .args(["--log=off", "replay", "--autopilot"])
+        .arg(format!("--data-dir={}", data_dir.path().display()));
+    let replayed_default = finish(hermit_test::hermit_output(
+        &format!("{replay:?}"),
+        &mut replay,
+    ));
+    assert!(
+        replayed_default.status.success()
+            && replayed_default.stdout.contains("flock-holder-ok"),
+        "default replay of the external flock failed\n{}",
+        replayed_default.combined()
+    );
+
+    // Flag on: the side effect cannot be reproduced, refused.
+    let mut replay = Command::new("timeout");
+    replay
+        .args(["--kill-after", "10s", "180s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args([
+            "--log=off",
+            "replay",
+            "--autopilot",
+            "--write-output-files",
+        ])
         .arg(format!("--data-dir={}", data_dir.path().display()));
     let replayed = finish(hermit_test::hermit_output(
         &format!("{replay:?}"),

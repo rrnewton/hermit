@@ -154,6 +154,10 @@ pub enum SyscallEvent {
     ReadV2(ReadEvent),
     ReadvV2(ReadEvent),
     FtruncateV2(FtruncateEvent),
+    // AUTONOMOUS-BOT-IMPLEMENTED (6805): recorded passthrough
+    // file-content effects.
+    Truncate(TruncateEvent),
+    Fallocate(FallocateEvent),
     /// Destination length after a successful clone ioctl.
     FileClone(FileCloneEvent),
     /// A successful exec and the executable images required immediately before
@@ -225,6 +229,29 @@ pub struct WriteEvent {
     pub replay_file_offset: Option<i64>,
     /// Whether the regular-file write advanced its open-file description.
     pub replay_file_advances_offset: bool,
+}
+
+/// Recorded result and file-content effect of pathname
+/// `truncate` (6805): replay truncates the shared backing of the
+/// recorded file, not only the disposable-root pathname.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TruncateEvent {
+    /// Recorded syscall result.
+    pub result: Result<i64, Errno>,
+    /// The truncated regular file's identity (`stat` device and
+    /// inode), when the recorder could name it.
+    pub file_id: Option<(u64, u64)>,
+    /// Requested file length.
+    pub length: libc::off_t,
+}
+
+/// Recorded result and file/output effects of `fallocate`
+/// (6805): the write-side classification of its descriptor, as a
+/// write's is recorded, so replay can route the extent effect to
+/// the shared backing or the captured output endpoint.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FallocateEvent {
+    pub write: WriteEvent,
 }
 
 /// Recorded result and captured-output side effect of ftruncate.

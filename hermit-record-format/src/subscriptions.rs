@@ -74,6 +74,24 @@ pub fn record_and_replay() -> Subscription {
         Sysno::readahead,
         Sysno::sync_file_range,
         Sysno::chroot,
+        Sysno::readlinkat,
+        Sysno::inotify_add_watch,
+        Sysno::inotify_rm_watch,
+        // Forwarded-but-unsubscribed census (6805 round 2): the
+        // calls Detcore still forwards to these tools or runs
+        // natively without a subscription, and why each is safe to
+        // leave live under the rr-like default.
+        // - set_tid_address: stores a guest-memory pointer; no
+        //   filesystem or kernel-object state later calls read.
+        // - socketpair, pipe2, eventfd2, memfd_create,
+        //   inotify_init1: Detcore creates the real kernel objects
+        //   deterministically in both modes; their contents flow
+        //   through subscribed read/write/poll paths.
+        // - sendmmsg/recvmmsg: live on real sockets whose state
+        //   (shutdown, options, epoll sets) replay maintains in
+        //   both modes.
+        // Anything else forwarded that touches filesystem or
+        // kernel-object state belongs in this list, subscribed.
         // Descriptor syncs, metadata changes and xattr calls: replay
         // returns the recorded results, because a replayed descriptor may
         // be a placeholder, and reapplies changes inside the replay root.

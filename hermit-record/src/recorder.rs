@@ -800,11 +800,11 @@ impl<H: RecordHost> Tool for RecorderWithHost<H> {
             // effects, recorded so replay serves them instead of
             // running them against a virtual descriptor or a path
             // the replay root lacks.
-            Syscall::Fallocate(_)
-            | Syscall::Truncate(_)
-            | Syscall::Readahead(_)
-            | Syscall::SyncFileRange(_)
-            | Syscall::Chroot(_) => self.handle_simple(guest, syscall).await,
+            Syscall::Readahead(_) | Syscall::SyncFileRange(_) | Syscall::Chroot(_) => {
+                self.handle_simple(guest, syscall).await
+            }
+            Syscall::Fallocate(syscall) => self.handle_fallocate(guest, syscall).await,
+            Syscall::Truncate(syscall) => self.handle_truncate(guest, syscall).await,
             Syscall::Dup(_) => self.handle_simple(guest, syscall).await,
             Syscall::Dup3(_) => self.handle_fd_table_mutation(guest, syscall).await,
             #[cfg(target_arch = "x86_64")]
@@ -868,6 +868,13 @@ impl<H: RecordHost> Tool for RecorderWithHost<H> {
             Syscall::Getrandom(syscall) => self.handle_getrandom(guest, syscall).await,
             #[cfg(target_arch = "x86_64")]
             Syscall::Readlink(syscall) => self.handle_readlink(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(6805): ordinary-path readlinkat and
+            // inotify watches, recorded like their subscribed kin.
+            Syscall::Readlinkat(syscall) => self.handle_readlinkat(guest, syscall).await,
+            Syscall::InotifyAddWatch(_) | Syscall::InotifyRmWatch(_) => {
+                self.handle_simple(guest, syscall).await
+            }
             // AUTONOMOUS-BOT-IMPLEMENTED
             #[cfg(target_arch = "x86_64")]
             Syscall::Mkdir(_) => self.handle_mkdir(guest, syscall).await,
@@ -941,13 +948,20 @@ impl<H: RecordHost> RecorderWithHost<H> {
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
         let table = guest.tid();
+        // A vanished descriptor (Ok(None)) may record as no facts;
+        // a failed facts read must not silently degrade the open
+        // to no materialization and no recorded identity.
         let metadata = result.ok().and_then(|fd| {
             H::fd_metadata(
                 &DescriptorAccess::guest_bound(&self.init, &mut *guest, table),
                 fd as libc::c_int,
             )
-            .ok()
-            .flatten()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "could not classify the recorded open without changing its meaning: \
+                     descriptor facts failed: {error}"
+                )
+            })
         });
         let materialize = metadata
             .as_ref()
@@ -1887,6 +1901,75 @@ mod dispatch_agreement_tests {
     /// in arms the compiler would actually build: comments are
     /// stripped first, and an arm disabled by `#[cfg(any())]` or
     /// `#[cfg(false)]` does not count (Astra B6: both used to count).
+    /// Evaluates the cfg predicates dispatch arms actually use
+    /// for the architecture this test binary was built for.
+    /// Unknown bare flags count as active: the guard's job is to
+    /// catch arms this build cannot contain, not to model every
+    /// cfg in the tree.
+    fn cfg_active(predicate: &str) -> bool {
+        fn eval(predicate: &str) -> bool {
+            let predicate = predicate.trim();
+            for (name, want_any) in [("all", false), ("any", true)] {
+                if let Some(inner) = predicate
+                    .strip_prefix(&format!("{name}("))
+                    .and_then(|inner| inner.strip_suffix(')'))
+                {
+                    let parts = split_cfg_args(inner);
+                    return if want_any {
+                        parts.iter().any(|part| eval(part))
+                    } else {
+                        parts.iter().all(|part| eval(part))
+                    };
+                }
+            }
+            if let Some(inner) = predicate
+                .strip_prefix("not(")
+                .and_then(|inner| inner.strip_suffix(')'))
+            {
+                return !eval(inner);
+            }
+            if let Some(value) = predicate
+                .strip_prefix("target_arch")
+                .and_then(|rest| rest.trim().strip_prefix('='))
+            {
+                return value.trim().trim_matches('"') == std::env::consts::ARCH;
+            }
+            if let Some(value) = predicate
+                .strip_prefix("target_os")
+                .and_then(|rest| rest.trim().strip_prefix('='))
+            {
+                return value.trim().trim_matches('"') == std::env::consts::OS;
+            }
+            !matches!(predicate, "false")
+        }
+        fn split_cfg_args(inner: &str) -> Vec<&str> {
+            let mut parts = Vec::new();
+            let mut depth = 0usize;
+            let mut start = 0usize;
+            for (index, c) in inner.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth = depth.saturating_sub(1),
+                    ',' if depth == 0 => {
+                        parts.push(&inner[start..index]);
+                        start = index + 1;
+                    }
+                    _ => {}
+                }
+            }
+            if start < inner.len() {
+                parts.push(&inner[start..]);
+            }
+            parts
+        }
+        eval(predicate)
+    }
+
+    /// The typed variants and raw sysnos named by arm *patterns*
+    /// of the dispatch match that this build compiles: only
+    /// pattern headers at the match's own brace depth count, so a
+    /// token elsewhere (a matches! mention, an arm body) or under
+    /// an inactive cfg is not coverage (round-2 finding 6).
     fn dispatch_tokens(source_text: &str) -> BTreeSet<String> {
         let stripped = strip_comments(source_text);
         let start = stripped
@@ -1897,27 +1980,53 @@ mod dispatch_agreement_tests {
             .find("async fn handle_post_exec")
             .expect("dispatch end");
         let window = &rest[..end];
+        let match_start = window.find("match syscall").expect("dispatch match");
+        let lines: Vec<&str> = window[match_start..].lines().collect();
+        // Arm patterns share one indent; bodies sit deeper. Only
+        // pattern lines at that indent (and their `|` continuations)
+        // count, and only up to each arm's `=>`.
+        let indent_of = |line: &str| line.len() - line.trim_start().len();
+        let arm_indent = lines
+            .iter()
+            .find(|line| line.trim_start().starts_with("Syscall::"))
+            .map(|line| indent_of(line))
+            .expect("first dispatch arm");
         let mut out = BTreeSet::new();
-        let mut skip_arm = false;
-        for line in window.lines() {
-            let squashed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
-            if squashed.starts_with("#[cfg(any())]") || squashed.starts_with("#[cfg(false)]") {
-                skip_arm = true;
+        let mut arm_active = true;
+        let mut in_header = true;
+        for line in &lines {
+            let trimmed = line.trim_start();
+            if indent_of(line) == arm_indent && trimmed.starts_with("#[cfg(") {
+                let predicate = trimmed
+                    .strip_prefix("#[cfg(")
+                    .and_then(|rest| rest.strip_suffix(")]"))
+                    .unwrap_or_default();
+                arm_active = cfg_active(predicate);
+                in_header = true;
                 continue;
             }
-            if skip_arm {
-                if line.contains("=>") {
-                    skip_arm = false;
-                }
-                continue;
+            let at_arm_line = indent_of(line) == arm_indent
+                && (trimmed.starts_with("Syscall::")
+                    || trimmed.starts_with('|')
+                    || trimmed.starts_with("unsupported"));
+            if at_arm_line && !in_header {
+                // A new arm begins where the previous body ended.
+                in_header = true;
+                arm_active = true;
             }
-            for token in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == ':' || c == '_'))
-            {
-                if let Some(variant) = token.strip_prefix("Syscall::") {
-                    out.insert(format!("variant:{variant}"));
-                } else if let Some(sysno) = token.strip_prefix("Sysno::") {
-                    out.insert(format!("sysno:{sysno}"));
+            if in_header && arm_active && indent_of(line) <= arm_indent + 4 {
+                for token in
+                    line.split(|c: char| !(c.is_ascii_alphanumeric() || c == ':' || c == '_'))
+                {
+                    if let Some(variant) = token.strip_prefix("Syscall::") {
+                        out.insert(format!("variant:{variant}"));
+                    } else if let Some(sysno) = token.strip_prefix("Sysno::") {
+                        out.insert(format!("sysno:{sysno}"));
+                    }
                 }
+            }
+            if in_header && line.contains("=>") {
+                in_header = false;
             }
         }
         out
@@ -1985,24 +2094,50 @@ mod dispatch_agreement_tests {
     /// arm must not count as dispatch coverage.
     #[test]
     fn commented_and_cfg_disabled_arms_do_not_count() {
-        let window = "async fn handle_syscall_event() { match x {\n\
+        let window = "async fn handle_syscall_event() {\n\
+            let _mention = matches!(x, Syscall::Read(_));\n\
+            match syscall {\n\
             Syscall::Write(_) => 1,\n\
             // Syscall::Read(_) => 2,\n\
             #[cfg(any())]\n\
             Syscall::Openat(_) => 3,\n\
-            Syscall::Other(Sysno::close_range, _) => 4,\n\
-            _ => 5 } }\n\
+            #[cfg(not(all()))]\n\
+            Syscall::Mmap(_) => 4,\n\
+            #[cfg(target_arch = \"aarch64\")]\n\
+            Syscall::Fstat(_) => 5,\n\
+            Syscall::Close(_) => {\n\
+                let _body_token = Syscall::Fork;\n\
+                6\n\
+            }\n\
+            Syscall::Other(Sysno::close_range, _) => 7,\n\
+            _ => 8,\n\
+            } }\n\
             async fn handle_post_exec() {}";
         let tokens = dispatch_tokens(window);
         assert!(tokens.contains("variant:Write"), "{tokens:?}");
+        assert!(tokens.contains("variant:Close"), "{tokens:?}");
         assert!(tokens.contains("sysno:close_range"), "{tokens:?}");
         assert!(
             !tokens.contains("variant:Read"),
-            "a commented arm counted: {tokens:?}"
+            "a commented or matches!-mentioned arm counted: {tokens:?}"
         );
         assert!(
             !tokens.contains("variant:Openat"),
             "a cfg(any()) arm counted: {tokens:?}"
+        );
+        assert!(
+            !tokens.contains("variant:Mmap"),
+            "a cfg(not(all())) arm counted: {tokens:?}"
+        );
+        if std::env::consts::ARCH != "aarch64" {
+            assert!(
+                !tokens.contains("variant:Fstat"),
+                "an other-arch arm counted: {tokens:?}"
+            );
+        }
+        assert!(
+            !tokens.contains("variant:Fork"),
+            "an arm-body token counted as an arm: {tokens:?}"
         );
     }
 }

@@ -1673,11 +1673,19 @@ pub struct Config {
     pub replaying: bool,
 
     /// **Internal:** Set only by `hermit replay --write-output-files`.
-    /// Detcore never reads it; the replay tool does. Without it replay is
-    /// rr-like: regular-file writes and opens are answered from the
-    /// recording and no output file is materialized in the replay root.
+    /// Detcore never reads it; the replay tool does. Without it replay
+    /// is rr-like: regular-file writes and opens are answered from the
+    /// recording and no regular-file output is created for them.
     /// With it, replay re-applies them as it did before the rr-like
-    /// default. Captured stdout/stderr are emitted either way.
+    /// default. In both modes the disposable replay root still
+    /// receives what replay needs and what namespace state later live
+    /// calls observe: exec images and their dependencies (including
+    /// guest-built executables and symlink topology), the working
+    /// directory, mkdir/rename/symlink and other confined path-mutation
+    /// results, empty files a confined create makes (`openat2`,
+    /// `mknod`), materialized directories, and relative removals.
+    /// Kernel-object state (socket, eventfd, epoll) is likewise live
+    /// in both modes. Captured stdout/stderr are emitted either way.
     ///
     /// Like `replaying`, it never enters the legacy form.
     #[serde(default)]

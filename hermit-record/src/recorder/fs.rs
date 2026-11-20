@@ -16,6 +16,8 @@ use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
+use reverie::syscalls::Close;
+use reverie::syscalls::Fallocate;
 use reverie::syscalls::Ftruncate;
 use reverie::syscalls::Getcwd;
 #[cfg(target_arch = "x86_64")]
@@ -23,19 +25,23 @@ use reverie::syscalls::Getdents;
 use reverie::syscalls::Getdents64;
 use reverie::syscalls::Ioctl;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Openat;
 use reverie::syscalls::Pread64;
 use reverie::syscalls::Read;
 use reverie::syscalls::ReadAddr;
 #[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Readlink;
+use reverie::syscalls::Readlinkat;
 use reverie::syscalls::Sendfile;
 use reverie::syscalls::Statx;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::Truncate;
 use reverie::syscalls::family::StatFamily;
 use reverie::syscalls::family::WriteFamily;
 use reverie::syscalls::ioctl;
 
 use super::RecorderWithHost;
+use crate::event::FallocateEvent;
 use crate::event::FileCloneEvent;
 use crate::event::FileCloneImage;
 use crate::event::FileExtent;
@@ -45,6 +51,7 @@ use crate::event::ReplayFdKind;
 use crate::event::SendfileEvent;
 use crate::event::StatEvent;
 use crate::event::SyscallEvent;
+use crate::event::TruncateEvent;
 use crate::event::WriteEvent;
 use crate::event::deterministic_ioctl_error;
 use crate::event::xattr_query_output;
@@ -1236,6 +1243,104 @@ impl<H: RecordHost> RecorderWithHost<H> {
         );
         result
     }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(6805): recorded fallocate file effects.
+    pub(super) async fn handle_fallocate<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Fallocate,
+    ) -> Result<i64, Errno> {
+        let (pid, task) = (guest.pid(), guest.tid());
+        let result = guest.inject(syscall).await;
+        // The descriptor classification a write through it gets:
+        // captured output, shared-backing regular file, or neither.
+        let write = self
+            .write_event(
+                guest,
+                pid,
+                task,
+                syscall.fd(),
+                WritePlacement::Explicit(syscall.offset()),
+                result,
+            )
+            .await;
+        self.record_event(guest, Ok(SyscallEvent::Fallocate(FallocateEvent { write })));
+        result
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(6805): recorded pathname truncate.
+    pub(super) async fn handle_truncate<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Truncate,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+        let file_id = if result.is_ok() {
+            Some(self.truncated_file_identity(guest, syscall).await)
+        } else {
+            None
+        };
+        self.record_event(
+            guest,
+            Ok(SyscallEvent::Truncate(TruncateEvent {
+                result,
+                file_id,
+                length: syscall.length(),
+            })),
+        );
+        result
+    }
+
+    /// The identity of the file `syscall` just truncated, named
+    /// through a guest `O_PATH` probe whose descriptor is classified
+    /// and closed before returning. Identity here is required, not
+    /// best-effort: any failure refuses the recording by name
+    /// rather than recording a truncate replay cannot route.
+    async fn truncated_file_identity<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Truncate,
+    ) -> (u64, u64) {
+        let probe = Openat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(syscall.path())
+            .with_flags(
+                reverie::syscalls::OFlag::O_PATH
+                    | reverie::syscalls::OFlag::O_NOFOLLOW
+                    | reverie::syscalls::OFlag::O_CLOEXEC,
+            );
+        let descriptor = guest
+            .inject_with_retry(probe)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("could not name the recorded truncate target without changing its meaning: open probe failed: {error:?}")
+            });
+        let descriptor = descriptor as libc::c_int;
+        let tid = guest.tid();
+        let identity = H::fd_metadata(
+            &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
+            descriptor,
+        )
+        .unwrap_or_else(|error| {
+            panic!("could not name the recorded truncate target without changing its meaning: descriptor facts failed: {error}")
+        })
+        .filter(|metadata| metadata.is_file())
+        .map(|metadata| (metadata.device, metadata.inode));
+        let closed = guest
+            .inject_with_retry(Close::new().with_fd(descriptor))
+            .await;
+        assert_eq!(
+            closed,
+            Ok(0),
+            "could not close the truncate identity probe descriptor without changing guest state"
+        );
+        identity.unwrap_or_else(|| {
+            panic!("could not name the recorded truncate target without changing its meaning: target is not a regular file")
+        })
+    }
+
     pub(super) async fn handle_stat_family<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1415,6 +1520,28 @@ impl<H: RecordHost> RecorderWithHost<H> {
         &self,
         guest: &mut G,
         syscall: Readlink,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        self.record_event(
+            guest,
+            result.and_then(|length| {
+                let mut buf = vec![0; length as usize];
+                let addr = syscall.buf().ok_or(Errno::EFAULT)?.cast::<u8>();
+                guest.memory().read_exact(addr, &mut buf)?;
+                Ok(SyscallEvent::Bytes(buf))
+            }),
+        );
+
+        result
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(6805): recorded ordinary-path readlinkat.
+    pub(super) async fn handle_readlinkat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Readlinkat,
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
 

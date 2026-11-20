@@ -66,7 +66,10 @@ pub struct ReplayOpts {
     /// files, as rr replay does; captured stdout and stderr are
     /// emitted either way. Either way, inputs a replay needs (the
     /// guest executable and its dependencies, the working directory)
-    /// may still be created in the disposable replay root.
+    /// and replay-root namespace state later live calls observe
+    /// (mkdir/rename/symlink results, confined creates, materialized
+    /// directories, relative removals) may still be created in the
+    /// disposable replay root.
     #[clap(long)]
     write_output_files: bool,
 

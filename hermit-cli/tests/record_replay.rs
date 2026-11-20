@@ -4719,12 +4719,15 @@ fn record_forked_child_writes_into_a_redirected_stdout_pipe() {
     );
 }
 
-/// The rr-like replay default (6805) in both modes: a guest that
-/// writes a regular file and reads it back prints the same in
-/// record and in replay, and neither replay leaves the file in
-/// the host working directory (the replay root is disposable in
-/// both modes; the flag re-applies writes inside it, which is
-/// what live in-replay consumers read).
+/// Confinement and stdout in both output modes (6805): a guest
+/// that writes a regular file and reads it back prints the same
+/// in record and in replay under either policy, and neither
+/// replay leaves the file in the host working directory, because
+/// the replay root is disposable in both modes. This test cannot
+/// by itself tell the modes apart — the root is deleted before
+/// its contents could be listed — and does not claim to: the mode
+/// distinction is witnessed by the flock injection counts in
+/// flock_exclusion.rs (0 by default, every mirror with the flag).
 #[test]
 fn replay_write_output_files_reapplies_regular_file_writes() {
     let _guard = hermit_record_lock();
@@ -6590,7 +6593,10 @@ fn record_replay_shares_pages_across_independent_opens() {
     let failures = shared_mappings_failures(
         "independent-open",
         "independent-open: view sees after!\n\
-         independent-open: after realloc view sees after!\n",
+         independent-open: after sibling close view sees sibcls\n\
+         independent-open: dup alias view sees dupdup\n\
+         independent-open: after fork close view sees forked\n\
+         independent-open: after realloc view sees forked\n",
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

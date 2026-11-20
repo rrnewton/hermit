@@ -33,6 +33,7 @@ use reverie::syscalls::Pread64;
 use reverie::syscalls::Read;
 #[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Readlink;
+use reverie::syscalls::Readlinkat;
 use reverie::syscalls::RtSigtimedwait;
 use reverie::syscalls::RtTgsigqueueinfo;
 use reverie::syscalls::Sendfile;
@@ -1240,7 +1241,9 @@ impl<H: RecordHost> ReplayerWithHost<H> {
     /// already read as zeros. Range-shifting modes
     /// (`COLLAPSE_RANGE`/`INSERT_RANGE`) move file bytes in ways the
     /// backing model does not reproduce, so a recorded success with
-    /// one is refused by name instead of silently diverging. With
+    /// one is refused by name when a shared backing would diverge.
+    /// A descriptor aliasing captured output applies the extent to
+    /// the output endpoint instead, as `ftruncate` does. With
     /// `--write-output-files`, the effect is also reapplied to the
     /// replay-root file.
     pub(super) async fn handle_fallocate<G: Guest<Self>>(
@@ -1248,46 +1251,60 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         guest: &mut G,
         syscall: Fallocate,
     ) -> Result<i64, Error> {
-        let recorded = next_event!(guest, Return);
+        let event = next_event!(guest, Fallocate)?;
+        let recorded = event.write.result;
         if recorded.is_ok() {
             let mode = syscall.mode();
+            let access = DescriptorAccess::<H, ()>::task(&self.init, guest.tid(), guest.tid());
+            // Range-shifting modes move file bytes in ways the
+            // backing model does not reproduce: refused by name
+            // only when a shared backing would actually diverge.
             let shifting = libc::FALLOC_FL_COLLAPSE_RANGE | libc::FALLOC_FL_INSERT_RANGE;
-            if mode & shifting != 0 {
+            if mode & shifting != 0
+                && event.write.output_fd.is_none()
+                && super::mmap::writes_shared_backing(&access, guest.tid(), syscall.fd())
+            {
                 return Err(Error::Tool(anyhow::anyhow!(
                     "replay cannot reproduce a recorded fallocate with mode {mode:#x}: \
                      range-shifting modes move shared file bytes"
                 )));
             }
-            let zeroing = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE;
-            if mode & zeroing != 0
-                && let (Ok(offset), Ok(len)) = (
-                    u64::try_from(syscall.offset()),
-                    u64::try_from(syscall.len()),
-                )
-            {
-                let access = DescriptorAccess::<H, ()>::task(&self.init, guest.tid(), guest.tid());
-                let zeros = vec![0u8; 64 * 1024];
-                let mut written = 0u64;
-                while written < len {
-                    let chunk = usize::try_from(len - written)
-                        .map_or(zeros.len(), |left| left.min(zeros.len()));
-                    super::mmap::write_shared_backing(
+            if let Some(output_fd) = event.write.output_fd {
+                // The extent effect lands on the captured output
+                // endpoint, as ftruncate's does, in both policies.
+                let outputs = guest.thread_state().outputs.clone();
+                let (output_lock, output) = outputs.output_endpoint(output_fd)?;
+                let _guard = output_lock.lock().await;
+                // SAFETY: output is an owned duplicate and the
+                // recorded call was accepted by the kernel.
+                if unsafe { libc::fallocate(output, mode, syscall.offset(), syscall.len()) } == -1 {
+                    return Err(Error::Io(std::io::Error::last_os_error()));
+                }
+            } else {
+                let zeroing = libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE;
+                if mode & zeroing != 0
+                    && let (Ok(offset), Ok(len)) = (
+                        u64::try_from(syscall.offset()),
+                        u64::try_from(syscall.len()),
+                    )
+                {
+                    super::mmap::punch_shared_backing(
                         &access,
                         guest.tid(),
                         syscall.fd(),
-                        &zeros[..chunk],
-                        offset + written,
+                        mode,
+                        offset,
+                        len,
                     )
                     .map_err(Error::Io)?;
-                    written += chunk as u64;
                 }
-            }
-            if self.write_output_files && self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
-                let actual = guest.inject_with_retry(Syscall::Fallocate(syscall)).await;
-                assert_eq!(
-                    actual, recorded,
-                    "replayed fallocate returned a different result"
-                );
+                if self.write_output_files && self.fd_is_in_replay_root(guest.pid(), syscall.fd()) {
+                    let actual = guest.inject_with_retry(Syscall::Fallocate(syscall)).await;
+                    assert_eq!(
+                        actual, recorded,
+                        "replayed fallocate returned a different result"
+                    );
+                }
             }
         }
         recorded.map_err(Error::from)
@@ -1460,6 +1477,23 @@ impl<H: RecordHost> ReplayerWithHost<H> {
         debug_assert!(buf.len() <= syscall.bufsize());
 
         // Write out the buffer.
+        guest
+            .memory()
+            .write_exact(syscall.buf().unwrap().cast::<u8>(), &buf)?;
+        Ok(buf.len() as i64)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(6805): recorded ordinary-path readlinkat.
+    pub(super) async fn handle_readlinkat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Readlinkat,
+    ) -> Result<i64, Errno> {
+        let buf = next_event!(guest, Bytes)?;
+
+        debug_assert!(buf.len() <= syscall.buf_len());
+
         guest
             .memory()
             .write_exact(syscall.buf().unwrap().cast::<u8>(), &buf)?;

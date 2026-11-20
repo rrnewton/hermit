@@ -384,11 +384,26 @@ static void read_only_truncate_advice(void) {
   check(unlink(path) == 0, "unlink the advice file");
 }
 
-/* 6805 Astra B1/B2: coherence is per recorded file, not per
- * descriptor. A second independent open's pwrite must reach the
- * first open's shared view, and closing that second open and
- * opening another file (whose placeholder may recycle the freed
- * eventfd id in replay) must not write into the first file. */
+/* 6805 Astra B1/B2 (round 2): coherence is per recorded file and
+ * per open file description, not per descriptor number. A second
+ * independent open's pwrite reaches the first open's shared view;
+ * the binding survives a sibling thread closing one alias and a
+ * dup outliving the opener; a forked child's close does not end
+ * the parent's alias; and closing the mapped descriptor then
+ * reallocating through a fresh placeholder (whose
+ * eventfd may recycle the freed id in replay) must not write
+ * into the first file. */
+static int sibling_close_fd = -1;
+static volatile int sibling_closed;
+
+static int sibling_close_worker(void* unused) {
+  (void)unused;
+  syscall(SYS_close, (long)sibling_close_fd);
+  sibling_closed = 1;
+  syscall(SYS_exit, 0);
+  return 0;
+}
+
 static void independent_open(void) {
   const char* path = "/tmp/hermit-shared-mappings-independent-open";
   const char* other = "/tmp/hermit-shared-mappings-independent-other";
@@ -403,15 +418,58 @@ static void independent_open(void) {
   if (second < 0) return;
   check(pwrite(second, "after!", 6, 0) == 6, "pwrite through the second open");
   printf("independent-open: view sees %.6s\n", view);
-  check(close(second) == 0, "close the second open");
-  int third = open(other, O_RDWR | O_CREAT | O_TRUNC, 0600);
-  check(third >= 0, "create the other file");
-  if (third < 0) return;
-  check(ftruncate(third, page) == 0, "size the other file");
-  check(pwrite(third, "zzzzzz", 6, 0) == 6, "pwrite the other file");
+
+  /* A sibling thread sharing the table closes the second open;
+   * a fresh open of the same file must still write through. */
+  sibling_close_fd = second;
+  sibling_closed = 0;
+  int thread_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+                     CLONE_THREAD | CLONE_SYSVSEM;
+  check(clone(sibling_close_worker, worker_stack + sizeof(worker_stack),
+              thread_flags, NULL) > 0,
+        "clone the sibling closer");
+  while (!sibling_closed) {
+    sched_yield();
+  }
+  int fourth = open(path, O_RDWR);
+  check(fourth >= 0, "open the same file after the sibling close");
+  if (fourth < 0) return;
+  check(pwrite(fourth, "sibcls", 6, 0) == 6, "pwrite after the sibling close");
+  printf("independent-open: after sibling close view sees %.6s\n", view);
+  check(close(fourth) == 0, "close the fourth open");
+
+  /* The binding follows a dup alias past the opener's close. */
+  int alias = dup(first);
+  check(alias >= 0, "dup the mapped descriptor");
+  if (alias < 0) return;
+  check(close(first) == 0, "close the mapped descriptor");
+  check(pwrite(alias, "dupdup", 6, 0) == 6, "pwrite through the dup alias");
+  printf("independent-open: dup alias view sees %.6s\n", view);
+
+  /* A forked child's close of its inherited alias must not end
+   * the parent's. */
+  pid_t child = fork();
+  check(child >= 0, "fork");
+  if (child == 0) {
+    close(alias);
+    _exit(0);
+  }
+  int status = 0;
+  check(waitpid(child, &status, 0) == child, "wait for the forked child");
+  check(pwrite(alias, "forked", 6, 0) == 6, "pwrite after the child's close");
+  printf("independent-open: after fork close view sees %.6s\n", view);
+  check(close(alias) == 0, "close the alias");
+
+  /* With every descriptor of the file closed, a fresh open of
+   * another file (whose replay placeholder may recycle a freed
+   * eventfd id) must not reach the still-mapped view. */
+  long other2 = open(other, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  check(other2 >= 0, "open the other file again");
+  if (other2 < 0) return;
+  check(ftruncate((int)other2, page) == 0, "size the other file");
+  check(pwrite((int)other2, "zzzzzz", 6, 0) == 6, "pwrite the other file");
   printf("independent-open: after realloc view sees %.6s\n", view);
-  check(close(third) == 0, "close the other file");
-  check(close(first) == 0, "close the first open");
+  check(close((int)other2) == 0, "close the other file");
   check(unlink(path) == 0, "unlink the independent-open file");
   check(unlink(other) == 0, "unlink the other file");
 }
