@@ -1899,7 +1899,7 @@ mod dispatch_agreement_tests {
                         j += 1;
                     }
                     assert!(closed, "unterminated raw string in dispatch source");
-                    tokens.push(text[start - 1 - hashes..j + closer.len()].to_owned());
+                    tokens.push(text[i..j + closer.len()].to_owned());
                     i = j + closer.len();
                     continue;
                 }
@@ -1975,6 +1975,31 @@ mod dispatch_agreement_tests {
         tokens
     }
 
+    /// The exact value of a cfg string literal token, normal or
+    /// raw. Escapes and other literal forms are unsupported here
+    /// and fail by name rather than being approximated.
+    fn cfg_string_value(token: &str) -> &str {
+        if let Some(value) = token
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+        {
+            assert!(
+                !value.contains('\\') && !value.contains('"'),
+                "unsupported escaped cfg string literal in dispatch guard: {token}"
+            );
+            return value;
+        }
+        if let Some(rest) = token.strip_prefix('r') {
+            let hashes = rest.bytes().take_while(|byte| *byte == b'#').count();
+            let mut closer = String::from("\"");
+            closer.extend(std::iter::repeat_n('#', hashes));
+            if rest[hashes..].starts_with('"') && token.ends_with(&closer) {
+                return &token[1 + hashes + 1..token.len() - closer.len()];
+            }
+        }
+        panic!("unsupported cfg string literal in dispatch guard: {token}")
+    }
+
     /// Evaluates one cfg predicate token list for this build.
     /// Unknown or malformed predicates fail the guard by name:
     /// assumed coverage is exactly what this test exists to deny.
@@ -2021,7 +2046,7 @@ mod dispatch_agreement_tests {
                 return !eval(&tokens[2..tokens.len() - 1]);
             }
             if tokens.len() == 3 && tokens[1] == "=" {
-                let value = tokens[2].trim_matches('"');
+                let value = cfg_string_value(&tokens[2]);
                 return match tokens[0].as_str() {
                     "target_arch" => value == std::env::consts::ARCH,
                     "target_os" => value == std::env::consts::OS,
@@ -2030,8 +2055,11 @@ mod dispatch_agreement_tests {
             }
             if tokens.len() == 1 {
                 return match tokens[0].as_str() {
-                    "true" | "test" => true,
+                    "true" => true,
                     "false" => false,
+                    // In particular `test`: production membership is
+                    // what is being proved, and a test-only arm is
+                    // absent there. It is unsupported, not active.
                     other => panic!("unsupported cfg predicate {other} in dispatch guard"),
                 };
             }
@@ -2040,14 +2068,35 @@ mod dispatch_agreement_tests {
         eval(tokens)
     }
 
-    /// The typed variants and raw sysnos named by arm *patterns*
-    /// of the dispatch match that this build compiles. Patterns
-    /// are the token groups at the match's own depth up to each
-    /// arm's structural arrow; attributes accumulate and conjoin;
-    /// anything the restricted parser cannot prove (unknown cfg,
-    /// cfg_attr, a macro in pattern position, unbalanced groups)
-    /// fails by name instead of approximating coverage.
+    /// The typed variants and raw sysnos named by *unconditional*
+    /// arm patterns of the dispatch match that this build's
+    /// production configuration compiles. Each arm is parsed as
+    /// attributes, a balanced pattern up to its structural arrow,
+    /// then a balanced body. A guarded arm is buffered and only
+    /// discarded when its guard is seen, so it cannot establish
+    /// coverage alone; body tokens never count, whatever commas
+    /// their nested groups contain. Anything this restricted
+    /// parser cannot prove (unknown cfg, `cfg(test)`, cfg_attr, a
+    /// macro in pattern position, unbalanced groups, or a
+    /// block-like body it does not model) fails by name instead
+    /// of approximating coverage.
     fn dispatch_tokens(source_text: &str) -> BTreeSet<String> {
+        fn update_delimiters(stack: &mut Vec<&'static str>, token: &str) {
+            match token {
+                "(" => stack.push(")"),
+                "[" => stack.push("]"),
+                "{" => stack.push("}"),
+                ")" | "]" | "}" => {
+                    assert_eq!(
+                        stack.pop(),
+                        Some(token),
+                        "unbalanced delimiter in dispatch guard"
+                    );
+                }
+                _ => {}
+            }
+        }
+
         let tokens = lex_dispatch(source_text);
         let start = tokens
             .windows(4)
@@ -2061,16 +2110,27 @@ mod dispatch_agreement_tests {
             .position(|window| window == ["match", "syscall"])
             .map(|at| start + at)
             .expect("dispatch match");
+        let mut i = match_at
+            + tokens[match_at..]
+                .iter()
+                .position(|token| token == "{")
+                .expect("dispatch match body")
+            + 1;
         let mut out = BTreeSet::new();
-        let mut depth = 0isize;
-        let mut in_match = false;
-        let mut arm_active = true;
-        let mut in_header = true;
-        let mut i = match_at;
-        while i < tokens.len() {
-            let token = &tokens[i];
-            if in_match && depth == 1 && token == "#" {
-                // Attribute group: #[cfg(...)] / #[cfg_attr(...)].
+
+        loop {
+            assert!(i < tokens.len(), "unterminated dispatch match in guard");
+            if tokens[i] == "," {
+                i += 1;
+                continue;
+            }
+            if tokens[i] == "}" {
+                break;
+            }
+
+            // Attributes on this arm accumulate and conjoin.
+            let mut arm_active = true;
+            while tokens.get(i).is_some_and(|token| token == "#") {
                 assert!(
                     tokens.get(i + 1).is_some_and(|t| t == "["),
                     "malformed attribute in dispatch guard"
@@ -2100,55 +2160,118 @@ mod dispatch_agreement_tests {
                 } else if group.first().is_some_and(|t| t == "cfg_attr") {
                     panic!("unsupported cfg_attr in dispatch guard: {group:?}");
                 }
-                in_header = true;
                 i = j;
-                continue;
             }
-            if in_match && depth == 1 && in_header {
-                if token == "=>" || token == "if" {
-                    // The pattern ends here; a guard expression
-                    // (which may contain macros) is not membership.
-                    in_header = false;
-                } else if arm_active {
+
+            // Pattern header, up to the structural arrow outside
+            // every balanced group. Tokens are provisional until
+            // the arrow proves there was no guard.
+            let mut arm_tokens = BTreeSet::new();
+            let mut guarded = false;
+            let mut delimiters: Vec<&'static str> = Vec::new();
+            let mut saw_arrow = false;
+            while i < tokens.len() {
+                let token = &tokens[i];
+                if delimiters.is_empty() && token == "=>" {
+                    i += 1;
+                    saw_arrow = true;
+                    break;
+                }
+                if delimiters.is_empty() && token == "}" {
+                    panic!("dispatch arm without => in dispatch guard");
+                }
+                if delimiters.is_empty() && token == "if" && !guarded {
+                    guarded = true;
+                    i += 1;
+                    continue;
+                }
+                if !guarded && arm_active {
                     if token == "Syscall"
                         && tokens.get(i + 1).is_some_and(|t| t == "::")
                         && let Some(variant) = tokens.get(i + 2)
                     {
-                        out.insert(format!("variant:{variant}"));
+                        arm_tokens.insert(format!("variant:{variant}"));
                     }
                     if token == "Sysno"
                         && tokens.get(i + 1).is_some_and(|t| t == "::")
                         && let Some(sysno) = tokens.get(i + 2)
                     {
-                        out.insert(format!("sysno:{sysno}"));
+                        arm_tokens.insert(format!("sysno:{sysno}"));
                     }
                     if tokens.get(i + 1).is_some_and(|t| t == "!") {
                         panic!("unsupported macro {token}! in dispatch pattern");
                     }
                 }
+                update_delimiters(&mut delimiters, token);
+                i += 1;
             }
-            match token.as_str() {
-                "{" => {
-                    depth += 1;
-                    in_match = true;
-                }
-                "}" => {
-                    depth -= 1;
-                    if in_match && depth == 0 {
+            assert!(saw_arrow, "dispatch arm without => in dispatch guard");
+            assert!(
+                delimiters.is_empty(),
+                "unbalanced dispatch pattern in guard"
+            );
+            if arm_active && !guarded {
+                out.extend(arm_tokens);
+            }
+
+            // Arm body. A block body ends at its balanced close
+            // (an optional comma is consumed at the loop head);
+            // an expression body ends at a comma outside every
+            // balanced group, or at the match's close. Body tokens
+            // are never inspected for membership.
+            assert!(i < tokens.len(), "dispatch arm without body in guard");
+            let mut consume_expression = false;
+            if tokens[i] == "{" {
+                let mut delimiters: Vec<&'static str> = Vec::new();
+                loop {
+                    assert!(i < tokens.len(), "unterminated dispatch arm body in guard");
+                    let token = tokens[i].clone();
+                    update_delimiters(&mut delimiters, &token);
+                    i += 1;
+                    if delimiters.is_empty() {
                         break;
                     }
-                    if in_match && depth == 1 {
-                        in_header = true;
-                        arm_active = true;
+                }
+                match tokens.get(i).map(String::as_str) {
+                    Some(".") | Some("?") => consume_expression = true,
+                    Some("[") | Some("(") | Some("as") => {
+                        panic!(
+                            "unsupported suffix after block-bodied dispatch arm in guard: {:?}",
+                            tokens.get(i)
+                        );
                     }
+                    _ => {}
                 }
-                "," if in_match && depth == 1 && !in_header => {
-                    in_header = true;
-                    arm_active = true;
-                }
-                _ => {}
+            } else if matches!(
+                tokens[i].as_str(),
+                "if" | "match" | "unsafe" | "loop" | "while" | "for"
+            ) {
+                panic!(
+                    "unsupported block-like dispatch arm body in guard: {}",
+                    tokens[i]
+                );
+            } else {
+                consume_expression = true;
             }
-            i += 1;
+            if consume_expression {
+                let mut delimiters: Vec<&'static str> = Vec::new();
+                while i < tokens.len() {
+                    let token = &tokens[i];
+                    if delimiters.is_empty() && token == "," {
+                        i += 1;
+                        break;
+                    }
+                    if delimiters.is_empty() && token == "}" {
+                        break;
+                    }
+                    update_delimiters(&mut delimiters, token);
+                    i += 1;
+                }
+                assert!(
+                    delimiters.is_empty(),
+                    "unbalanced dispatch arm body in guard"
+                );
+            }
         }
         out
     }
@@ -2172,15 +2295,11 @@ mod dispatch_agreement_tests {
         variant != "Other" && tokens.contains(&format!("variant:{variant}"))
     }
 
-    /// 6805 slice 5 detector: every subscribed syscall must have an
-    /// active dispatch arm in BOTH tools, and the two arm sets must
-    /// agree. The subscribed set comes from the compiled
-    /// subscription, not from parsing its source. Syscalls outside
-    /// the subscription still reach the tools by Detcore forwarding
-    /// and take the live-injection fallthrough; this test guards
-    /// only the subscribed set replay answers from the recording.
-    #[test]
-    fn subscription_and_both_dispatches_agree() {
+    /// The complete 6805 slice-5 agreement check over two actual
+    /// dispatch sources. Extracted so the seat mutants below run
+    /// mutated *actual* sources through this same wired checker,
+    /// not a synthetic parser-only window.
+    fn assert_dispatches_agree(recorder_source: &str, replayer_source: &str) {
         let subscribed: Vec<_> = hermit_record_format::subscriptions::record_and_replay()
             .iter_syscalls()
             .collect();
@@ -2189,8 +2308,8 @@ mod dispatch_agreement_tests {
             "subscription enumeration found only {}",
             subscribed.len()
         );
-        let recorder = dispatch_tokens(&source("src/recorder.rs"));
-        let replayer = dispatch_tokens(&source("../hermit-replay/src/replayer.rs"));
+        let recorder = dispatch_tokens(recorder_source);
+        let replayer = dispatch_tokens(replayer_source);
         assert!(
             recorder.len() > 100 && replayer.len() > 100,
             "dispatch token parse found {} / {}",
@@ -2211,6 +2330,122 @@ mod dispatch_agreement_tests {
         );
     }
 
+    /// 6805 slice 5 detector: every subscribed syscall must have an
+    /// active dispatch arm in BOTH tools, and the two arm sets must
+    /// agree. The subscribed set comes from the compiled
+    /// subscription, not from parsing its source. Syscalls outside
+    /// the subscription still reach the tools by Detcore forwarding
+    /// and take the live-injection fallthrough; this test guards
+    /// only the subscribed set replay answers from the recording.
+    #[test]
+    fn subscription_and_both_dispatches_agree() {
+        assert_dispatches_agree(
+            &source("src/recorder.rs"),
+            &source("../hermit-replay/src/replayer.rs"),
+        );
+    }
+
+    fn replace_once(source_text: &str, from: &str, to: &str) -> String {
+        let mutated = source_text.replacen(from, to, 1);
+        assert_ne!(mutated, source_text, "mutant anchor not found: {from}");
+        mutated
+    }
+
+    /// Astra/Claude round-3 M1(a): a guard cannot establish the
+    /// coverage its pattern names. Mutating the actual replayer
+    /// Read arm to `if false` must fail the complete checker.
+    #[test]
+    #[should_panic(expected = "dispatch sets drifted")]
+    fn dispatch_guard_rejects_a_guarded_actual_arm() {
+        let replayer = replace_once(
+            &source("../hermit-replay/src/replayer.rs"),
+            "Syscall::Read(syscall) =>",
+            "Syscall::Read(syscall) if false =>",
+        );
+        assert_dispatches_agree(&source("src/recorder.rs"), &replayer);
+    }
+
+    /// Claude round-3 M1(a), the concrete fallback case: deleting
+    /// the replayer's unguarded Fcntl arm leaves only guarded
+    /// Fcntl arms there, which must not count as coverage.
+    #[test]
+    #[should_panic(expected = "dispatch sets drifted")]
+    fn dispatch_guard_rejects_guarded_fcntl_without_fallback() {
+        let replayer = replace_once(
+            &source("../hermit-replay/src/replayer.rs"),
+            "Syscall::Fcntl(_) => self.handle_simple(guest, syscall).await,\n",
+            "",
+        );
+        assert_dispatches_agree(&source("src/recorder.rs"), &replayer);
+    }
+
+    /// Astra round-3 finding 5 / Claude M1(c): deleting Read from
+    /// both actual dispatches while mentioning it after commas in
+    /// a Brk arm body must still report Read missing.
+    #[test]
+    #[should_panic(expected = "subscribed syscalls with no active dispatch arm")]
+    fn dispatch_guard_ignores_body_tokens_after_argument_commas() {
+        let body = "Syscall::Brk(_) => self.let_through(guest, std::iter::once(syscall).chain(std::iter::once(Syscall::Read(syscalls::Read::new()))).next().unwrap()).await,";
+        let recorder = replace_once(
+            &source("src/recorder.rs"),
+            "Syscall::Read(syscall) => self.handle_read(guest, syscall).await,\n",
+            "",
+        );
+        let recorder = replace_once(
+            &recorder,
+            "Syscall::Brk(_) => self.let_through(guest, syscall).await,",
+            body,
+        );
+        let replayer = replace_once(
+            &source("../hermit-replay/src/replayer.rs"),
+            "Syscall::Read(syscall) => Ok(self.handle_read(guest, syscall).await?),\n",
+            "",
+        );
+        let replayer = replace_once(
+            &replayer,
+            "Syscall::Brk(_) => self.let_through(guest, syscall).await,",
+            body,
+        );
+        assert_dispatches_agree(&recorder, &replayer);
+    }
+
+    /// Astra round-3 finding 5: a raw-string cfg value means the
+    /// same string as a normal literal. Disabling Read in both
+    /// actual dispatches with one must report it missing.
+    #[test]
+    #[should_panic(expected = "subscribed syscalls with no active dispatch arm")]
+    fn dispatch_guard_evaluates_raw_string_cfg_values() {
+        let attribute = format!(
+            "#[cfg(not(target_arch = r#\"{}\"#))]\n            ",
+            std::env::consts::ARCH
+        );
+        let recorder = replace_once(
+            &source("src/recorder.rs"),
+            "Syscall::Read(syscall) =>",
+            &format!("{attribute}Syscall::Read(syscall) =>"),
+        );
+        let replayer = replace_once(
+            &source("../hermit-replay/src/replayer.rs"),
+            "Syscall::Read(syscall) =>",
+            &format!("{attribute}Syscall::Read(syscall) =>"),
+        );
+        assert_dispatches_agree(&recorder, &replayer);
+    }
+
+    /// Claude round-3 M1(b): `cfg(test)` is the test build's
+    /// configuration, not production membership, and is refused
+    /// by name rather than counted active.
+    #[test]
+    #[should_panic(expected = "unsupported cfg predicate test")]
+    fn dispatch_guard_rejects_cfg_test_on_actual_sources() {
+        let replayer = replace_once(
+            &source("../hermit-replay/src/replayer.rs"),
+            "Syscall::Read(syscall) =>",
+            "#[cfg(test)]\n            Syscall::Read(syscall) =>",
+        );
+        assert_dispatches_agree(&source("src/recorder.rs"), &replayer);
+    }
+
     /// The B6 mutants: a commented-out arm and a `#[cfg(any())]`
     /// arm must not count as dispatch coverage.
     #[test]
@@ -2218,6 +2453,8 @@ mod dispatch_agreement_tests {
         let window = "async fn handle_syscall_event() {\n\
             let _mention = matches!(x, Syscall::Read(_));\n\
             match syscall {\n\
+            Syscall::Brk(_) => self.let_through(guest, [syscall, Syscall::Read(Read::new())][0]),\n\
+            Syscall::Fcntl(_) if false => 9,\n\
             Syscall::Write(_) => 1,\n\
             // Syscall::Read(_) => 2,\n\
             #[cfg(any())]\n\
@@ -2240,7 +2477,11 @@ mod dispatch_agreement_tests {
         assert!(tokens.contains("sysno:close_range"), "{tokens:?}");
         assert!(
             !tokens.contains("variant:Read"),
-            "a commented or matches!-mentioned arm counted: {tokens:?}"
+            "a commented, matches!-mentioned or body-mentioned arm counted: {tokens:?}"
+        );
+        assert!(
+            !tokens.contains("variant:Fcntl"),
+            "a guarded arm counted as unconditional coverage: {tokens:?}"
         );
         assert!(
             !tokens.contains("variant:Openat"),

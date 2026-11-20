@@ -4859,6 +4859,74 @@ fn replay_output_policies_keep_writes_inside_the_disposable_root() {
     );
 }
 
+/// Placeholder pins die with their thread groups (6805 round 3):
+/// under a 256-descriptor soft limit, a guest that spawns more
+/// short-lived processes than that — each inheriting the parent's
+/// opened regular file and opening another, then exiting without
+/// closing either — must still record and replay. If binding
+/// rows or their pins outlived the exiting processes, the replay
+/// would exhaust the tracer's own descriptor limit and refuse.
+#[test]
+fn replay_releases_placeholder_pins_when_processes_exit() {
+    let _guard = hermit_record_lock();
+    let data_dir = tempfile::tempdir().expect("failed to create recording directory");
+    let work = tempfile::tempdir().expect("failed to create guest working directory");
+    let script = "import os, sys\n\
+        held = os.open('held.txt', os.O_RDWR | os.O_CREAT, 0o600)\n\
+        os.write(held, b'held')\n\
+        for i in range(300):\n\
+            pid = os.fork()\n\
+            if pid == 0:\n\
+                extra = os.open('held.txt', os.O_RDONLY)\n\
+                os._exit(0)\n\
+            os.waitpid(pid, 0)\n\
+        os.lseek(held, 0, 0)\n\
+        print('survived', os.read(held, 4).decode(), flush=True)\n";
+    let run = |subcommand: &[&str], what: &str| {
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after=5s", "60s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg("--log=off")
+            .args(subcommand.iter().copied())
+            .arg("--data-dir")
+            .arg(data_dir.path())
+            .current_dir(work.path());
+        if subcommand[0] == "record" {
+            command.args(["--", "python3", "-c", script]);
+        }
+        command_output(command, what)
+    };
+    // The limit that matters is the replaying tracer's own, so
+    // the replay half below runs hermit itself under ulimit -n.
+    let recorded = run(
+        &["record", "start", "--record-timeout=30"],
+        "record nofile guest",
+    );
+    assert!(
+        String::from_utf8_lossy(&recorded.stdout).contains("survived held"),
+        "recording failed: {}",
+        String::from_utf8_lossy(&recorded.stderr)
+    );
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after=5s", "60s"])
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(format!(
+            "ulimit -n 256; exec {} --log=off replay --autopilot --data-dir={}",
+            env!("CARGO_BIN_EXE_hermit"),
+            data_dir.path().display()
+        ))
+        .current_dir(work.path());
+    let replayed = command_output(command, "replay nofile guest");
+    assert!(
+        String::from_utf8_lossy(&replayed.stdout).contains("survived held"),
+        "replay under NOFILE 256 failed: {}",
+        String::from_utf8_lossy(&replayed.stderr)
+    );
+}
+
 /// Records, then replays, the guest with a regular-file stdout that the test
 /// opened, and writes `TAIL` through the test's own copy of that description
 /// after each run, so the file shows where the run left the description's
@@ -6682,6 +6750,128 @@ fn record_replay_shares_pages_across_independent_opens() {
          independent-open: dup alias view sees dupdup\n\
          independent-open: after fork close view sees forked\n\
          independent-open: after realloc view sees forked\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A `pidfd_getfd` result aliases the same open file
+/// description: closing the source must not drop replay's
+/// placeholder association while the imported alias lives.
+#[test]
+fn record_replay_shares_pages_through_a_pidfd_alias() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "pidfd-alias",
+        "pidfd-alias: view sees pidfd!\n\
+         pidfd-alias: alias mapping sees pidfd!\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// An F_SETFD-cleared descriptor survives exec with its replay
+/// placeholder description, so a mapping made through it in the
+/// new image shares pages with an independent open.
+#[test]
+fn record_replay_shares_pages_through_an_exec_survivor() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "exec-survivor",
+        "exec-survivor: new mapping sees before\n\
+         exec-survivor: view then sees after!\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// After a non-leader exec, the survivor runs under the leader
+/// TID with the transferred ThreadState: its first virtual
+/// regular-file open must find a descriptor table and share
+/// pages normally.
+#[test]
+fn record_replay_shares_pages_after_a_nonleader_exec() {
+    let _guard = hermit_record_lock();
+    let failures =
+        shared_mappings_failures("nonleader-exec", "nonleader-exec: view sees after!\n");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+fn captured_mapped_failures(mode: &str) -> Vec<String> {
+    let data_dir = tempfile::tempdir().expect("failed to create Hermit recording directory");
+    let program = &workload("c_record_replay_shared_mappings").path;
+    let expected = format!("{mode}: view zero endpoint zero");
+    let mut failures = Vec::new();
+    for (phase, subcommand) in [
+        (
+            "record",
+            ["record", "start", "--record-timeout=30"].as_slice(),
+        ),
+        ("replay", ["replay", "--autopilot"].as_slice()),
+    ] {
+        let stdout_file =
+            tempfile::NamedTempFile::new().expect("failed to create regular captured stdout");
+        let stdout = stdout_file
+            .as_file()
+            .try_clone()
+            .expect("failed to clone regular captured stdout");
+        let mut command = Command::new("timeout");
+        command
+            .args(["--kill-after=5s", "45s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .arg("--log=off")
+            .args(subcommand.iter().copied())
+            .arg("--data-dir")
+            .arg(data_dir.path())
+            .stdout(Stdio::from(stdout));
+        if phase == "record" {
+            command.arg("--").arg(program).arg(mode);
+        }
+        let output = command_output(command, &format!("{mode} {phase}"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains(&expected) {
+            failures.push(format!(
+                "{mode} {phase}: expected stderr line {expected:?}\nstderr:\n{stderr}"
+            ));
+        }
+        let endpoint = fs::read(stdout_file.path()).expect("read regular captured stdout");
+        if endpoint.len() < 4096 || endpoint.iter().any(|byte| *byte != 0) {
+            failures.push(format!(
+                "{mode} {phase}: captured endpoint is not one zero page ({} bytes)",
+                endpoint.len()
+            ));
+        }
+        if phase == "record" && !failures.is_empty() {
+            break;
+        }
+    }
+    failures
+}
+
+/// A fallocate punch through a captured-output alias reaches
+/// both the captured endpoint and the shared backing.
+#[test]
+fn record_replay_punches_a_captured_mapped_file() {
+    let _guard = hermit_record_lock();
+    let failures = captured_mapped_failures("captured-fallocate");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// An ftruncate through a captured-output alias likewise
+/// reaches both destinations independently.
+#[test]
+fn record_replay_truncates_a_captured_mapped_file() {
+    let _guard = hermit_record_lock();
+    let failures = captured_mapped_failures("captured-ftruncate");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Pathname truncate follows its final symlink, reaches the
+/// mapped target's backing, and records with a full guest
+/// descriptor table (its identity probe allocates no fd).
+#[test]
+fn record_replay_truncates_through_a_symlink_with_a_full_table() {
+    let _guard = hermit_record_lock();
+    let failures = shared_mappings_failures(
+        "truncate-symlink-full",
+        "truncate-symlink-full: view zero\n",
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

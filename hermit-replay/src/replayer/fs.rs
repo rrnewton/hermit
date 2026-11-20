@@ -1198,9 +1198,10 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             }
             // The shared backing truncates in both modes (slice 4):
             // under the default it is a memfd; only the replay-root
-            // file below stays gated.
+            // file below stays gated. A captured-output alias is an
+            // independent overlapping destination, not a reason to
+            // skip the backing a mapping of the same file reads.
             if event.replay_regular_file
-                && event.output_fd.is_none()
                 && let Ok(length) = u64::try_from(event.length)
             {
                 super::mmap::truncate_shared_backing(
@@ -1300,7 +1301,6 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 }
             }
             {
-                const WRITE_ZEROES: libc::c_int = 0x80;
                 let zeroing =
                     libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_ZERO_RANGE | WRITE_ZEROES;
                 if mode & zeroing != 0

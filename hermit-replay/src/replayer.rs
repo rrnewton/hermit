@@ -593,6 +593,12 @@ pub struct ReplayerThreadState {
     interrupted_poll: Option<InterruptedPoll>,
     stream_id: EventStreamId,
     child_stream_ids: ChildEventStreamIds,
+    /// Stable descriptor-table membership token delivered by the
+    /// lifecycle bridge for this exact ThreadState. It travels
+    /// with the state when an exec backend transfers it to the
+    /// leader TID, unlike a physical-TID key.
+    #[serde(skip)]
+    descriptor_thread: Option<u64>,
     bootstrapped: bool,
     /// Minted only for a fresh root state (init with no parent) and
     /// consumed once at `handle_thread_start`: whether root output
@@ -1491,16 +1497,29 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
         mmap::table_init(child, parent, init);
     }
 
-    /// The thread's table membership ends with it; the table's
-    /// last user drops it and its aliases.
+    /// Detcore's successful-exec table transition: move this
+    /// survivor's replay rows into the private post-exec table
+    /// whose surviving descriptor numbers Detcore delivers. The
+    /// physical-TID handoff itself completes in
+    /// `handle_post_exec`, from the transferred state's token.
+    fn on_descriptor_table_exec(&self, exec: reverie::DescriptorTableExec<'_>) {
+        mmap::exec_detach_table(exec.former, exec.surviving_fds);
+    }
+
+    /// The thread's table membership ends with the exact state
+    /// being retired; its token distinguishes a survivor from a
+    /// displaced leader when both callbacks name the leader TID.
     async fn on_exit_thread<G: reverie::GlobalRPC<Self::GlobalState>>(
         &self,
         tid: Tid,
         _global_state: &G,
-        _thread_state: Self::ThreadState,
+        thread_state: Self::ThreadState,
         _exit_status: reverie::ExitStatus,
     ) -> Result<(), reverie::Error> {
-        mmap::release_thread(tid);
+        match thread_state.descriptor_thread {
+            Some(thread) => mmap::release_table_thread(thread),
+            None => mmap::release_thread(tid),
+        }
         Ok(())
     }
 
@@ -1526,6 +1545,7 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
             stream_id,
             child_stream_ids: ChildEventStreamIds::default(),
             interrupted_poll: None,
+            descriptor_thread: mmap::table_thread_for(child),
             bootstrapped: parent.is_some_and(|(_, state)| state.bootstrapped),
             fresh_root_capture: parent.is_none() && !H::CAPTURE_AT_CONSTRUCTION,
             outputs: match parent {
@@ -1875,6 +1895,10 @@ impl<H: RecordHost> Tool for ReplayerWithHost<H> {
 
     // TODO-HUMAN-REVIEW(#2370)
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        // This state may have been transferred from the exec'ing
+        // worker to the leader task; rebind its stable membership
+        // token to the TID it now runs under before any syscall.
+        mmap::exec_thread_handoff(guest.thread_state().descriptor_thread, guest.tid());
         guest.thread_state_mut().bootstrapped = true;
         Ok(())
     }
@@ -1915,7 +1939,12 @@ impl<H: RecordHost> ReplayerWithHost<H> {
                 .retain(|pending| {
                     !(pending.flags.contains(OFlag::O_CLOEXEC) && pending.tgid == exec_tgid)
                 });
-            mmap::exec_detach_table(guest.tid());
+            // The descriptor-table transition itself is delivered
+            // by Detcore after the successful exec, through
+            // `on_descriptor_table_exec`, from its own post-exec
+            // table. Detaching here would re-derive that model
+            // (and would run for a recorded success even if the
+            // physical exec then diverged).
         }
         let actual_request = self
             .read_exec_request(guest, syscall)
@@ -4836,6 +4865,27 @@ impl<H: RecordHost> ReplayerWithHost<H> {
             actual, recorded,
             "pidfd_getfd side effects diverged: replay observed {actual:?}, recording observed {recorded:?}"
         );
+        if let Ok(returned) = actual {
+            let fd = libc::c_int::try_from(returned).unwrap_or_else(|_| {
+                panic!("pidfd_getfd returned out-of-range descriptor {returned}")
+            });
+            // The returned descriptor is a new alias of the source
+            // open file description. If that description is a
+            // tracked placeholder, this alias must keep it alive
+            // independently of every source alias (Astra r3.3).
+            let tid = guest.tid();
+            let id = placeholder_eventfd_id::<H, G>(
+                &DescriptorAccess::guest_bound(&self.init, &mut *guest, tid),
+                fd,
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "could not read the pidfd_getfd result identity without \
+                     changing its meaning: {error}"
+                )
+            });
+            mmap::follow_binding_through_pidfd_getfd(tid, fd, id);
+        }
         recorded
     }
 

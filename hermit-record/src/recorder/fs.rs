@@ -145,11 +145,38 @@ impl WritePlacement {
     }
 }
 
+/// One write-like result with the descriptor classification that
+/// accompanies it into its recorded `WriteEvent`.
+struct ClassifiedWrite {
+    result: Result<i64, Errno>,
+    metadata: Option<reverie::DescriptorMetadata>,
+}
+
 fn write_advances_output_offset(placement: WritePlacement) -> bool {
     match placement {
         WritePlacement::Position => true,
         WritePlacement::Pwritev2 { offset, .. } => offset == -1,
         WritePlacement::Explicit(_) => false,
+    }
+}
+
+/// The one required descriptor classification for a successful
+/// recorded `fallocate`: both a failed fact read and unavailable
+/// facts refuse the recording by name, so no apparently valid
+/// unclassified extent event can be emitted.
+fn required_fallocate_metadata(
+    metadata: std::io::Result<Option<reverie::DescriptorMetadata>>,
+) -> reverie::DescriptorMetadata {
+    match metadata {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => panic!(
+            "could not classify the recorded fallocate target without \
+             changing its meaning: descriptor facts unavailable"
+        ),
+        Err(error) => panic!(
+            "could not classify the recorded fallocate target without \
+             changing its meaning: descriptor facts failed: {error}"
+        ),
     }
 }
 
@@ -1129,6 +1156,31 @@ impl<H: RecordHost> RecorderWithHost<H> {
         )
         .ok()
         .flatten();
+        self.write_event_classified(
+            guest,
+            pid,
+            task,
+            fd,
+            placement,
+            ClassifiedWrite { result, metadata },
+        )
+        .await
+    }
+
+    /// `write_event` with the descriptor classification supplied
+    /// by the caller, for handlers whose recorded effect makes
+    /// that classification a required fact. It is consumed here
+    /// exactly once; there is no second best-effort lookup.
+    async fn write_event_classified<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        pid: reverie::Pid,
+        task: reverie::Pid,
+        fd: libc::c_int,
+        placement: WritePlacement,
+        classified: ClassifiedWrite,
+    ) -> WriteEvent {
+        let ClassifiedWrite { result, metadata } = classified;
         let outputs = guest.thread_state().outputs;
         let (output_fd, shares_output_ofd) = metadata.as_ref().map_or((None, false), |metadata| {
             let (stdout_matches, stderr_matches) = outputs.matching(metadata);
@@ -1251,32 +1303,26 @@ impl<H: RecordHost> RecorderWithHost<H> {
     ) -> Result<i64, Errno> {
         let (pid, task) = (guest.pid(), guest.tid());
         let result = guest.inject(syscall).await;
-        // Extent effects are required facts: a failed descriptor
-        // classification must refuse the recording by name rather
-        // than encode an unclassified fallocate whose captured-
-        // output effect replay would silently omit.
-        if result.is_ok() {
-            let _ = H::fd_metadata(
+        // Extent effects are required facts. Read the target's
+        // classification once and thread that same fact into the
+        // event construction below; do not discard it and let a
+        // second best-effort lookup silently encode `None`.
+        let metadata = result.is_ok().then(|| {
+            required_fallocate_metadata(H::fd_metadata(
                 &DescriptorAccess::guest_bound(&self.init, &mut *guest, task),
                 syscall.fd(),
-            )
-            .unwrap_or_else(|error| {
-                panic!(
-                    "could not classify the recorded fallocate target without \
-                     changing its meaning: descriptor facts failed: {error}"
-                )
-            });
-        }
+            ))
+        });
         // The descriptor classification a write through it gets:
         // captured output, shared-backing regular file, or neither.
         let write = self
-            .write_event(
+            .write_event_classified(
                 guest,
                 pid,
                 task,
                 syscall.fd(),
                 WritePlacement::Explicit(syscall.offset()),
-                result,
+                ClassifiedWrite { result, metadata },
             )
             .await;
         self.record_event(guest, Ok(SyscallEvent::Fallocate(FallocateEvent { write })));
@@ -1709,6 +1755,24 @@ impl<H: RecordHost> RecorderWithHost<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_fallocate_metadata_passes_the_one_fact_through() {
+        let metadata = reverie::DescriptorMetadata::new(libc::S_IFREG, 0, 7, 11, 13);
+        assert_eq!(required_fallocate_metadata(Ok(Some(metadata))), metadata);
+    }
+
+    #[test]
+    #[should_panic(expected = "descriptor facts unavailable")]
+    fn required_fallocate_metadata_rejects_unavailable_facts() {
+        let _ = required_fallocate_metadata(Ok(None));
+    }
+
+    #[test]
+    #[should_panic(expected = "descriptor facts failed")]
+    fn required_fallocate_metadata_rejects_a_failed_fact_read() {
+        let _ = required_fallocate_metadata(Err(std::io::Error::other("fdinfo failed")));
+    }
 
     /// Whether a user access can read and write sendfile's offset argument
     /// decides how it is recorded

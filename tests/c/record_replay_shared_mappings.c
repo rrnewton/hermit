@@ -109,10 +109,18 @@
 #include <stddef.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#ifndef SYS_pidfd_open
+#define SYS_pidfd_open 434
+#endif
+#ifndef SYS_pidfd_getfd
+#define SYS_pidfd_getfd 438
+#endif
 
 static int failures;
 static long page;
@@ -420,31 +428,31 @@ static void independent_open(void) {
   check(pwrite(second, "after!", 6, 0) == 6, "pwrite through the second open");
   printf("independent-open: view sees %.6s\n", view);
 
-  /* A sibling thread sharing the table closes the second open;
-   * a fresh open of the same file must still write through. */
+  /* A sibling thread with a copied descriptor table (no
+   * CLONE_FILES) closes its copy of the second open. That close
+   * must not end this thread's row: the surviving descriptor
+   * itself, not a fresh open, writes through next. */
   sibling_close_fd = second;
   sibling_closed = 0;
-  int thread_flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+  int thread_flags = CLONE_VM | CLONE_FS | CLONE_SIGHAND |
                      CLONE_THREAD | CLONE_SYSVSEM;
   check(clone(sibling_close_worker, worker_stack + sizeof(worker_stack),
               thread_flags, NULL) > 0,
-        "clone the sibling closer");
+        "clone the copied-table sibling closer");
   while (!sibling_closed) {
     sched_yield();
   }
-  check(sibling_close_result == 0, "the sibling thread's close");
-  int fourth = open(path, O_RDWR);
-  check(fourth >= 0, "open the same file after the sibling close");
-  if (fourth < 0) return;
-  check(pwrite(fourth, "sibcls", 6, 0) == 6, "pwrite after the sibling close");
+  check(sibling_close_result == 0, "the copied-table sibling's close");
+  check(pwrite(second, "sibcls", 6, 0) == 6,
+        "pwrite through the surviving descriptor after the copied close");
   printf("independent-open: after sibling close view sees %.6s\n", view);
 
   /* The binding follows a dup alias of a descriptor that was
    * never itself mapped, past its source's close. */
-  int alias = dup(fourth);
+  int alias = dup(second);
   check(alias >= 0, "dup the independent descriptor");
   if (alias < 0) return;
-  check(close(fourth) == 0, "close the dup source");
+  check(close(second) == 0, "close the dup source");
   check(pwrite(alias, "dupdup", 6, 0) == 6, "pwrite through the dup alias");
   printf("independent-open: dup alias view sees %.6s\n", view);
 
@@ -475,6 +483,178 @@ static void independent_open(void) {
   check(close((int)other2) == 0, "close the other file");
   check(unlink(path) == 0, "unlink the independent-open file");
   check(unlink(other) == 0, "unlink the other file");
+}
+
+/* A pidfd_getfd alias is another descriptor for the same open
+ * file description. It must keep replay's placeholder backing
+ * association after the source descriptor closes. */
+static void pidfd_alias(void) {
+  const char* path = "/tmp/hermit-shared-mappings-pidfd-alias";
+  int first = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  check(first >= 0, "create the pidfd-alias file");
+  if (first < 0) return;
+  check(ftruncate(first, page) == 0, "size the pidfd-alias file");
+  char* view = map_pages(first, 0, 1);
+  memcpy(view, "before", 6);
+  long pidfd = syscall(SYS_pidfd_open, (long)getpid(), 0L);
+  check(pidfd >= 0, "pidfd_open self");
+  if (pidfd < 0) return;
+  long alias = syscall(SYS_pidfd_getfd, pidfd, (long)first, 0L);
+  check(alias >= 0, "pidfd_getfd self");
+  if (alias < 0) return;
+  check(close(first) == 0, "close the pidfd_getfd source");
+  check(close((int)pidfd) == 0, "close the pidfd");
+  check(pwrite((int)alias, "pidfd!", 6, 0) == 6, "pwrite through the pidfd alias");
+  printf("pidfd-alias: view sees %.6s\n", view);
+  char* again = map_pages((int)alias, 0, 1);
+  printf("pidfd-alias: alias mapping sees %.6s\n", again);
+  check(close((int)alias) == 0, "close the pidfd alias");
+  check(unlink(path) == 0, "unlink the pidfd-alias file");
+}
+
+static void exec_survivor_after(int fd) {
+  const char* path = "/tmp/hermit-shared-mappings-exec-survivor";
+  check(fcntl(fd, F_GETFD) >= 0, "the cleared descriptor survived exec");
+  char* view = map_pages(fd, 0, 1);
+  printf("exec-survivor: new mapping sees %.6s\n", view);
+  int second = open(path, O_RDWR);
+  check(second >= 0, "open the exec-survivor file again");
+  if (second < 0) return;
+  check(pwrite(second, "after!", 6, 0) == 6, "pwrite after exec");
+  printf("exec-survivor: view then sees %.6s\n", view);
+  check(close(second) == 0, "close the second exec-survivor descriptor");
+  check(close(fd) == 0, "close the surviving descriptor");
+  check(unlink(path) == 0, "unlink the exec-survivor file");
+}
+
+static void exec_survivor(void) {
+  const char* path = "/tmp/hermit-shared-mappings-exec-survivor";
+  int fd = open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  check(fd >= 0, "create the exec-survivor file");
+  if (fd < 0) return;
+  check(ftruncate(fd, page) == 0, "size the exec-survivor file");
+  check(pwrite(fd, "before", 6, 0) == 6, "seed the exec-survivor file");
+  check(fcntl(fd, F_SETFD, 0) == 0, "clear close-on-exec with F_SETFD");
+  char fd_text[16];
+  snprintf(fd_text, sizeof(fd_text), "%d", fd);
+  char* const next[] = {(char*)"/proc/self/exe", (char*)"exec-survivor-after",
+                        fd_text, NULL};
+  execv("/proc/self/exe", next);
+  check(0, "exec the survivor image");
+}
+
+static int nonleader_exec_worker(void* unused) {
+  (void)unused;
+  char* const next[] = {(char*)"/proc/self/exe",
+                        (char*)"nonleader-exec-after", NULL};
+  char* const empty_env[] = {NULL};
+  syscall(SYS_execve, "/proc/self/exe", next, empty_env);
+  syscall(SYS_exit, 127);
+  return 0;
+}
+
+static void nonleader_exec(void) {
+  int flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND |
+              CLONE_THREAD | CLONE_SYSVSEM;
+  check(clone(nonleader_exec_worker, worker_stack + sizeof(worker_stack), flags,
+              NULL) > 0,
+        "clone the non-leader exec worker");
+  for (;;) {
+    sched_yield();
+  }
+}
+
+static void nonleader_exec_after(void) {
+  const char* path = "/tmp/hermit-shared-mappings-nonleader-exec";
+  int first = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  check(first >= 0, "open a regular file after non-leader exec");
+  if (first < 0) return;
+  check(ftruncate(first, page) == 0, "size the non-leader-exec file");
+  char* view = map_pages(first, 0, 1);
+  memcpy(view, "before", 6);
+  int second = open(path, O_RDWR);
+  check(second >= 0, "open the non-leader-exec file again");
+  if (second < 0) return;
+  check(pwrite(second, "after!", 6, 0) == 6, "pwrite after non-leader exec");
+  printf("nonleader-exec: view sees %.6s\n", view);
+  check(close(second) == 0, "close the second non-leader descriptor");
+  check(close(first) == 0, "close the first non-leader descriptor");
+  check(unlink(path) == 0, "unlink the non-leader-exec file");
+}
+
+/* Captured stdout is supplied by the Rust harness as a regular
+ * RDWR file. A punch/ftruncate through that alias must reach
+ * both the captured endpoint and the shared backing its mapping
+ * reads; diagnostics go to stderr so the endpoint stays data. */
+static void captured_mapped(const char* mode, int use_fallocate) {
+  check(ftruncate(STDOUT_FILENO, page) == 0, "size captured stdout");
+  check(pwrite(STDOUT_FILENO, "before", 6, 0) == 6, "seed captured stdout");
+  char* view = map_pages(STDOUT_FILENO, 0, 1);
+  if (use_fallocate) {
+    check(fallocate(STDOUT_FILENO,
+                    FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, 0, page) == 0,
+          "punch captured stdout");
+  } else {
+    check(ftruncate(STDOUT_FILENO, 0) == 0, "truncate captured stdout");
+    check(ftruncate(STDOUT_FILENO, page) == 0, "regrow captured stdout");
+  }
+  const volatile unsigned char* observed = (const volatile unsigned char*)view;
+  int zero = 1;
+  for (long i = 0; i < page; i++) zero &= observed[i] == 0;
+  check(zero, "the captured mapped page is zero after the extent effect");
+  char endpoint[6] = {0};
+  check(pread(STDOUT_FILENO, endpoint, sizeof(endpoint), 0) ==
+            (ssize_t)sizeof(endpoint),
+        "read captured endpoint after the extent effect");
+  int endpoint_zero = 1;
+  for (size_t i = 0; i < sizeof(endpoint); i++) endpoint_zero &= endpoint[i] == 0;
+  check(endpoint_zero, "the captured endpoint is zero after the extent effect");
+  dprintf(STDERR_FILENO, "%s: view %s endpoint %s\n", mode,
+          zero ? "zero" : "stale", endpoint_zero ? "zero" : "stale");
+}
+
+/* Pathname truncate identity follows a final symlink and needs
+ * no spare guest descriptor: record it with the table full,
+ * then regrow and read the mapped target. */
+static void truncate_symlink_full(void) {
+  const char* target = "/tmp/hermit-shared-mappings-truncate-target";
+  const char* link = "/tmp/hermit-shared-mappings-truncate-link";
+  unlink(link);
+  unlink(target);
+  int fd = open(target, O_RDWR | O_CREAT | O_TRUNC, 0600);
+  check(fd >= 0, "create the truncate target");
+  if (fd < 0) return;
+  check(ftruncate(fd, page) == 0, "size the truncate target");
+  char* view = map_pages(fd, 0, 1);
+  memcpy(view, "before", 6);
+  check(symlink(target, link) == 0, "symlink to the truncate target");
+
+  struct rlimit limit;
+  check(getrlimit(RLIMIT_NOFILE, &limit) == 0, "read the descriptor limit");
+  struct rlimit capped = limit;
+  if (capped.rlim_cur > 64) capped.rlim_cur = 64;
+  check(setrlimit(RLIMIT_NOFILE, &capped) == 0, "cap the descriptor limit");
+  int fillers[128];
+  int filler_count = 0;
+  while (filler_count < 128) {
+    int filler = open("/dev/null", O_RDONLY);
+    if (filler < 0) break;
+    fillers[filler_count++] = filler;
+  }
+  check(filler_count > 0 && errno == EMFILE, "fill the descriptor table");
+  check(truncate(link, 0) == 0, "truncate through a symlink with a full table");
+  if (filler_count > 0) close(fillers[--filler_count]);
+  check(truncate(link, page) == 0, "regrow through the symlink");
+  const volatile unsigned char* observed = (const volatile unsigned char*)view;
+  int zero = 1;
+  for (long i = 0; i < page; i++) zero &= observed[i] == 0;
+  check(zero, "the symlink-truncated page is zero");
+  printf("truncate-symlink-full: view %s\n", zero ? "zero" : "stale");
+  while (filler_count > 0) close(fillers[--filler_count]);
+  setrlimit(RLIMIT_NOFILE, &limit);
+  check(close(fd) == 0, "close the truncate target");
+  check(unlink(link) == 0, "unlink the truncate symlink");
+  check(unlink(target) == 0, "unlink the truncate target");
 }
 
 static void chroot_remap(void) {
@@ -642,6 +822,10 @@ static void dev_zero_map_files(void) {
 int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   page = sysconf(_SC_PAGESIZE);
+  if (argc == 3 && strcmp(argv[1], "exec-survivor-after") == 0) {
+    exec_survivor_after(atoi(argv[2]));
+    return failures == 0 ? 0 : 1;
+  }
   if (argc != 2) {
     fprintf(stderr, "usage: %s <mode>\n", argv[0]);
     return 2;
@@ -677,6 +861,20 @@ int main(int argc, char** argv) {
     read_only_truncate_advice();
   } else if (strcmp(mode, "independent-open") == 0) {
     independent_open();
+  } else if (strcmp(mode, "pidfd-alias") == 0) {
+    pidfd_alias();
+  } else if (strcmp(mode, "exec-survivor") == 0) {
+    exec_survivor();
+  } else if (strcmp(mode, "nonleader-exec") == 0) {
+    nonleader_exec();
+  } else if (strcmp(mode, "nonleader-exec-after") == 0) {
+    nonleader_exec_after();
+  } else if (strcmp(mode, "captured-fallocate") == 0) {
+    captured_mapped(mode, 1);
+  } else if (strcmp(mode, "captured-ftruncate") == 0) {
+    captured_mapped(mode, 0);
+  } else if (strcmp(mode, "truncate-symlink-full") == 0) {
+    truncate_symlink_full();
   } else if (strcmp(mode, "chroot") == 0) {
     chroot_remap();
   } else if (strcmp(mode, "seccomp-filter") == 0) {

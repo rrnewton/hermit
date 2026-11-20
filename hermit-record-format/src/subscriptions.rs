@@ -178,13 +178,14 @@ pub fn record_and_replay() -> Subscription {
 /// Forwarded-but-unsubscribed census (6805): syscalls Detcore
 /// forwards to the record/replay tools or runs natively without a
 /// subscription, each with why leaving it live is safe under the
-/// rr-like replay default. The guard test below enforces that
-/// this census and the subscription stay disjoint and that every
-/// entry keeps its reason; subscribing an entry here without
-/// removing it (or naming a new forwarded call nowhere) fails
-/// there. A forwarded call that touches filesystem or
-/// kernel-object state later live calls read does not belong
-/// here: it belongs in the subscription.
+/// rr-like replay default. The guard test below enforces only
+/// that this census and the subscription stay disjoint and that
+/// every entry keeps its reason; it does not yet derive Detcore's
+/// forwarding callers, so completeness remains a review
+/// obligation when a Detcore handler starts forwarding a call. A
+/// forwarded call that touches filesystem or kernel-object state
+/// later live calls read does not belong here: it belongs in the
+/// subscription.
 pub const FORWARDED_UNSUBSCRIBED: &[(Sysno, &str)] = &[
     (
         Sysno::set_tid_address,
@@ -243,8 +244,12 @@ pub const FORWARDED_UNSUBSCRIBED: &[(Sysno, &str)] = &[
         "Detcore refuses or determinizes userfaultfd creation itself in both modes",
     ),
     (
+        Sysno::prctl,
+        "only PR_CAPBSET_READ is forwarded; it reports the fixed container launch bounding set and reads no replay state",
+    ),
+    (
         Sysno::pidfd_open,
-        "subscribed through its raw Other dispatch in both tools; listed in the agreement census",
+        "Detcore forwards it to both tools' typed pidfd_open arms, which record and replay its result",
     ),
     (
         Sysno::madvise,

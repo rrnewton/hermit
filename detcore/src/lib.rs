@@ -7080,6 +7080,25 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             )?;
         }
 
+        // Detcore owns the descriptor-table model: its exec path
+        // has already installed `FileMetadata::for_exec`'s private
+        // survivor table and rebound a non-leader survivor above.
+        // Deliver that exact transition to a replay tool before
+        // its post-exec callback, so it moves only its own rows
+        // and never re-derives close-on-exec or identity rebinding.
+        // Ordinary runs take no survivor snapshot for this.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(6805): descriptor-table lifecycle bridge.
+        if self.cfg.replaying {
+            let surviving_fds = guest.thread_state().descriptor_table().0;
+            self.record_or_replay
+                .on_descriptor_table_exec(reverie::DescriptorTableExec {
+                    former: Tid::from_raw(dettid.as_raw()),
+                    current: guest.tid(),
+                    surviving_fds: &surviving_fds,
+                });
+        }
+
         // Successful exec never returns through handle_syscall_event, so the
         // nested recorder/replayer needs this callback to commit or retire its
         // pending exec state before the replacement image issues another exec.

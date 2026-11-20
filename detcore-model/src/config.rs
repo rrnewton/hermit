@@ -1682,8 +1682,8 @@ pub struct Config {
     /// calls observe: exec images and their dependencies (including
     /// guest-built executables and symlink topology), the working
     /// directory, mkdir/rename/symlink and other confined path-mutation
-    /// results, empty files a confined create makes (`openat2`,
-    /// `mknod`), materialized directories, and relative removals.
+    /// results, empty files a confined `mknod` makes, materialized
+    /// directories, and relative removals.
     /// Kernel-object state (socket, eventfd, epoll) is likewise live
     /// in both modes. Captured stdout/stderr are emitted either way.
     ///

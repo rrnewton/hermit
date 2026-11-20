@@ -340,7 +340,17 @@ fn shared_backings() -> MutexGuard<'static, SharedBackings> {
 #[derive(Default)]
 struct ReplayFileState {
     next_table: u64,
-    thread_table: BTreeMap<libc::pid_t, u64>,
+    next_thread: u64,
+    /// Stable per-ThreadState membership token -> descriptor table.
+    /// The token travels in `ReplayerThreadState`, so an exec that
+    /// transfers that state to the leader TID does not alias the
+    /// displaced leader's membership merely because both callbacks
+    /// name the same physical TID.
+    thread_table: BTreeMap<u64, u64>,
+    /// Current physical TID -> membership token, for syscall-time
+    /// lookups and for a parent lookup at clone delivery. The
+    /// post-exec handoff rewrites this map for the survivor token.
+    tid_thread: BTreeMap<libc::pid_t, u64>,
     tables: BTreeMap<u64, DescriptorTable>,
     descriptions: BTreeMap<String, OpenDescription>,
 }
@@ -387,8 +397,17 @@ impl ReplayFileState {
         id
     }
 
+    fn thread_for(&self, tid: Pid) -> Option<u64> {
+        self.tid_thread.get(&tid.as_raw()).copied()
+    }
+
+    fn table_of_thread(&self, thread: u64) -> Option<u64> {
+        self.thread_table.get(&thread).copied()
+    }
+
     fn table_of(&self, tid: Pid) -> Option<u64> {
-        self.thread_table.get(&tid.as_raw()).copied()
+        self.thread_for(tid)
+            .and_then(|thread| self.table_of_thread(thread))
     }
 
     fn drop_alias(&mut self, id: &str) {
@@ -428,9 +447,18 @@ impl ReplayFileState {
 /// Attaches a new thread to its descriptor table, as delivered by
 /// the lifecycle bridge before the child's state exists: shared
 /// joins the parent's table, copied clones its alias rows under a
-/// fresh table, and the root thread starts one.
-pub(super) fn table_init(child: Pid, parent: Option<Pid>, init: reverie::DescriptorTableInit) {
+/// fresh table, and the root thread starts one. Returns the
+/// stable membership token `init_thread_state` stores in the
+/// child's ThreadState; a later exec transfers that state (and
+/// thus this membership) even when the physical TID changes.
+pub(super) fn table_init(
+    child: Pid,
+    parent: Option<Pid>,
+    init: reverie::DescriptorTableInit,
+) -> u64 {
     let mut state = replay_file_state();
+    let thread = state.next_thread;
+    state.next_thread += 1;
     let table = match init {
         reverie::DescriptorTableInit::Fresh => state.fresh_table(),
         reverie::DescriptorTableInit::SharedWithParent => {
@@ -460,7 +488,15 @@ pub(super) fn table_init(child: Pid, parent: Option<Pid>, init: reverie::Descrip
     if let Some(table) = state.tables.get_mut(&table) {
         table.users += 1;
     }
-    state.thread_table.insert(child.as_raw(), table);
+    state.thread_table.insert(thread, table);
+    state.tid_thread.insert(child.as_raw(), thread);
+    thread
+}
+
+/// The membership token the lifecycle bridge just delivered for
+/// `child`, for `init_thread_state` to carry in its ThreadState.
+pub(super) fn table_thread_for(child: Pid) -> Option<u64> {
+    replay_file_state().thread_for(child)
 }
 
 /// Binds descriptor `fd` of `tid`'s table to the description for
@@ -522,6 +558,10 @@ pub(super) fn bind_placeholder(
     if let Some(table) = state.tables.get_mut(&table) {
         table.aliases.insert(fd, Alias { id, cloexec });
     }
+    // Rebinding this number may have retired the description that
+    // kept a mapped link's eventfd id un-reusable; that link dies
+    // with it rather than resolving a later recycled id.
+    scrub_link_pins(&state);
 }
 
 /// The recorded file a placeholder identity names in this run,
@@ -630,7 +670,8 @@ pub(super) fn set_placeholder_cloexec(tid: Pid, fd: RawFd, cloexec: bool) {
 /// end first (dup2 onto itself keeps its own).
 pub(super) fn follow_binding_through_dup(tid: Pid, oldfd: RawFd, newfd: RawFd, cloexec: bool) {
     if oldfd == newfd {
-        set_placeholder_cloexec(tid, newfd, cloexec);
+        // Linux `dup2(fd, fd)` is a no-op and leaves FD_CLOEXEC
+        // exactly as it was; it does not apply the call's flags.
         return;
     }
     retire_placeholder_binding(tid, newfd);
@@ -654,15 +695,67 @@ pub(super) fn follow_binding_through_dup(tid: Pid, oldfd: RawFd, newfd: RawFd, c
     }
 }
 
-/// Detaches the exec'ing thread into a private table: its rows
-/// are the old table's minus close-on-exec, exactly as the
-/// kernel's `unshare_files` copy leaves the survivor, and other
-/// holders keep theirs.
-pub(super) fn exec_detach_table(tid: Pid) {
-    let mut state = replay_file_state();
-    let Some(old_table) = state.table_of(tid) else {
+/// Joins descriptor `fd` returned by `pidfd_getfd` to the live
+/// placeholder description its eventfd id names. The kernel
+/// returns a fresh close-on-exec alias of the *same* open file
+/// description, so it must independently keep that description
+/// (and its pin/backing association) alive after every source
+/// alias closes. An untracked or non-placeholder result has no
+/// replay placeholder lifetime to join.
+pub(super) fn follow_binding_through_pidfd_getfd(tid: Pid, fd: RawFd, id: Option<String>) {
+    let Some(id) = id else {
         return;
     };
+    let mut state = replay_file_state();
+    let Some(table_id) = state.table_of(tid) else {
+        return;
+    };
+    if !state.descriptions.contains_key(&id) {
+        return;
+    }
+    let existing = state
+        .tables
+        .get(&table_id)
+        .and_then(|table| table.aliases.get(&fd).cloned());
+    if let Some(existing) = &existing
+        && existing.id == id
+    {
+        if let Some(alias) = state
+            .tables
+            .get_mut(&table_id)
+            .and_then(|table| table.aliases.get_mut(&fd))
+        {
+            alias.cloexec = true;
+        }
+        return;
+    }
+    if let Some(description) = state.descriptions.get_mut(&id) {
+        description.aliases += 1;
+    }
+    if let Some(table) = state.tables.get_mut(&table_id) {
+        table.aliases.insert(fd, Alias { id, cloexec: true });
+    }
+    if let Some(existing) = existing {
+        state.drop_alias(&existing.id);
+    }
+    scrub_link_pins(&state);
+}
+
+/// Detaches the exec'ing thread into the private table Detcore
+/// delivered for the successful exec: its rows are exactly the
+/// old rows whose descriptor numbers Detcore's post-exec table
+/// (`FileMetadata::for_exec`) retained. This state does not
+/// decide close-on-exec or table copying itself; it only moves
+/// its replay-specific rows and description references.
+pub(super) fn exec_detach_table(tid: Pid, surviving_fds: &[RawFd]) {
+    let mut state = replay_file_state();
+    let Some(thread) = state.thread_for(tid) else {
+        return;
+    };
+    let Some(old_table) = state.table_of_thread(thread) else {
+        return;
+    };
+    let surviving: std::collections::BTreeSet<RawFd> = surviving_fds.iter().copied().collect();
     let rows: BTreeMap<RawFd, Alias> = state
         .tables
         .get(&old_table)
@@ -670,59 +763,70 @@ pub(super) fn exec_detach_table(tid: Pid) {
             table
                 .aliases
                 .iter()
-                .filter(|(_, alias)| !alias.cloexec)
+                .filter(|(fd, _)| surviving.contains(fd))
                 .map(|(fd, alias)| (*fd, alias.clone()))
                 .collect()
         })
         .unwrap_or_default();
-    // Cloexec rows of the old table lose this holder's reference
-    // through the new table not carrying them; the descriptions'
-    // counts follow the rows actually carried over, so first drop
-    // every old row's reference, then take the survivors'.
-    let old_ids: Vec<String> = state
-        .tables
-        .get(&old_table)
-        .map(|table| {
-            table
-                .aliases
-                .values()
-                .map(|alias| alias.id.clone())
-                .collect()
-        })
-        .unwrap_or_default();
-    for id in &old_ids {
-        if let Some(description) = state.descriptions.get_mut(id) {
-            description.aliases = description.aliases.saturating_sub(1);
-        }
-    }
-    state.descriptions.retain(|_, d| d.aliases > 0);
-    if let Some(table) = state.tables.get_mut(&old_table) {
-        table.users = table.users.saturating_sub(1);
-        if table.users == 0 {
-            state.tables.remove(&old_table);
-        }
-    }
-    let new_table = state.fresh_table();
+    // Take the survivor table's references first. If another user
+    // still holds the old table, its rows keep their own references
+    // and only this thread's *user* count leaves it below. If this
+    // was its last user, dropping it after the copy decrements all
+    // old rows: non-CLOEXEC rows net to the same count, while
+    // CLOEXEC rows lose their one reference. Reversing this order
+    // transiently drops sole-owner descriptions (and their pins)
+    // before the survivor rows can be counted.
     for alias in rows.values() {
         if let Some(description) = state.descriptions.get_mut(&alias.id) {
             description.aliases += 1;
         }
     }
+    let new_table = state.fresh_table();
     if let Some(table) = state.tables.get_mut(&new_table) {
         table.users = 1;
         table.aliases = rows;
     }
-    state.thread_table.insert(tid.as_raw(), new_table);
+    state.thread_table.insert(thread, new_table);
+
+    let drop_old = match state.tables.get_mut(&old_table) {
+        Some(table) => {
+            table.users = table.users.saturating_sub(1);
+            table.users == 0
+        }
+        None => false,
+    };
+    if drop_old {
+        state.drop_table(old_table);
+    }
     scrub_link_pins(&state);
 }
 
-/// Releases one thread's table membership at its exit; the
-/// table's last user drops it and its aliases.
-pub(super) fn release_thread(tid: Pid) {
-    let mut state = replay_file_state();
-    let Some(table) = state.thread_table.remove(&tid.as_raw()) else {
+/// Rebinds a transferred ThreadState's membership token to the
+/// physical TID it runs under after exec. The token (not the old
+/// TID) is the membership identity, so the displaced leader's
+/// exit callback, also delivered under this TID with *its* state
+/// token, cannot release the survivor's table.
+pub(super) fn exec_thread_handoff(thread: Option<u64>, tid: Pid) {
+    let Some(thread) = thread else {
         return;
     };
+    let mut state = replay_file_state();
+    if !state.thread_table.contains_key(&thread) {
+        return;
+    }
+    state.tid_thread.retain(|_, candidate| *candidate != thread);
+    state.tid_thread.insert(tid.as_raw(), thread);
+}
+
+/// Releases the membership carried by one exiting ThreadState,
+/// identified by its stable token rather than the physical TID
+/// in the callback. The table's last user drops it and aliases.
+pub(super) fn release_table_thread(thread: u64) {
+    let mut state = replay_file_state();
+    let Some(table) = state.thread_table.remove(&thread) else {
+        return;
+    };
+    state.tid_thread.retain(|_, candidate| *candidate != thread);
     let drop_it = match state.tables.get_mut(&table) {
         Some(table) => {
             table.users = table.users.saturating_sub(1);
@@ -734,6 +838,16 @@ pub(super) fn release_thread(tid: Pid) {
         state.drop_table(table);
     }
     scrub_link_pins(&state);
+}
+
+/// Releases one thread's table membership at its exit; the
+/// table's last user drops it and its aliases. This physical-TID
+/// form is only a fallback for a state with no bridge token.
+pub(super) fn release_thread(tid: Pid) {
+    let thread = replay_file_state().thread_for(tid);
+    if let Some(thread) = thread {
+        release_table_thread(thread);
+    }
 }
 
 /// Removes one run's descriptions (and the alias rows naming
@@ -1189,23 +1303,23 @@ fn object_backing<H: RecordHost, G>(
     } else {
         None
     };
-    if let Some(backing) = placeholder_backing_in(&backings, || Ok(id.clone()), OwnedFd::try_clone)?
+    if let Some(id) = &id
+        && let Some(backing) =
+            placeholder_backing_for(&file_state, &backings, tid, fd, id, OwnedFd::try_clone)?
     {
         return Ok(Some(backing));
-    }
-    if let Some(id) = &id
-        && let Some((root, recorded)) = resolve_placeholder(&file_state, tid, fd, id)?
-        && let Some(backing) = backings.get(&SharedFile { root, recorded })
-    {
-        return Ok(Some(File::from(backing.file.try_clone()?)));
     }
     object_backing_in(&backings, || replay_object(tid, fd), OwnedFd::try_clone)
 }
 
+/// The linked backing for an inspected placeholder id, only
+/// where that link names `expected`. A failed required identity
+/// inspection propagates; it is never "no backing".
 fn placeholder_backing_in(
     backings: &SharedBackings,
+    expected: SharedFile,
     inspect: impl FnOnce() -> io::Result<Option<String>>,
-    duplicate: impl FnOnce(&OwnedFd) -> io::Result<OwnedFd>,
+    duplicate: impl Fn(&OwnedFd) -> io::Result<OwnedFd>,
 ) -> io::Result<Option<File>> {
     if backings.is_empty() {
         return Ok(None);
@@ -1213,10 +1327,45 @@ fn placeholder_backing_in(
     let Some(id) = inspect()? else {
         return Ok(None);
     };
-    let Some(backing) = backings
-        .values()
-        .find(|backing| backing.placeholders.contains(&id))
+    let Some((linked_file, backing)) = backings
+        .iter()
+        .find(|(_, backing)| backing.placeholders.contains(&id))
     else {
+        return Ok(None);
+    };
+    if *linked_file != expected {
+        return Err(io::Error::other(format!(
+            "placeholder identity mismatch: eventfd {id} is linked to {linked_file:?} \
+             but its live description names {expected:?}"
+        )));
+    }
+    Ok(Some(File::from(duplicate(&backing.file)?)))
+}
+
+/// The backing for placeholder `id` on (`tid`, `fd`), through
+/// the production resolution path: kernel identity first, the
+/// alias row as a cross-check, and a mapped link only for the
+/// same recorded file that live description still names. A
+/// stale link left by a dropped description resolves nothing,
+/// so a recycled eventfd id cannot write the old file.
+fn placeholder_backing_for(
+    state: &ReplayFileState,
+    backings: &SharedBackings,
+    tid: Pid,
+    fd: RawFd,
+    id: &str,
+    duplicate: impl Fn(&OwnedFd) -> io::Result<OwnedFd>,
+) -> io::Result<Option<File>> {
+    let Some((root, recorded)) = resolve_placeholder(state, tid, fd, id)? else {
+        return Ok(None);
+    };
+    let file = SharedFile { root, recorded };
+    if let Some(backing) =
+        placeholder_backing_in(backings, file, || Ok(Some(id.to_owned())), &duplicate)?
+    {
+        return Ok(Some(backing));
+    }
+    let Some(backing) = backings.get(&file) else {
         return Ok(None);
     };
     Ok(Some(File::from(duplicate(&backing.file)?)))
@@ -2889,19 +3038,28 @@ mod tests {
             1,
             "relinking one placeholder linked it twice"
         );
-        let resolved =
-            placeholder_backing_in(&backings, || Ok(Some("41".to_owned())), |fd| fd.try_clone())
-                .unwrap();
+        let resolved = placeholder_backing_in(
+            &backings,
+            key,
+            || Ok(Some("41".to_owned())),
+            |fd| fd.try_clone(),
+        )
+        .unwrap();
         assert!(resolved.is_some(), "linked placeholder did not resolve");
-        let missing =
-            placeholder_backing_in(&backings, || Ok(Some("99".to_owned())), |fd| fd.try_clone())
-                .unwrap();
+        let missing = placeholder_backing_in(
+            &backings,
+            key,
+            || Ok(Some("99".to_owned())),
+            |fd| fd.try_clone(),
+        )
+        .unwrap();
         assert!(missing.is_none(), "unlinked placeholder id resolved");
         // A failed required identity lookup is an error, not "no
         // backing" (Astra B5).
         assert!(
             placeholder_backing_in(
                 &backings,
+                key,
                 || Err(io::Error::other("fdinfo read failed")),
                 |fd| fd.try_clone(),
             )
@@ -2914,7 +3072,7 @@ mod tests {
     fn a_bound_placeholder_resolves_by_recorded_identity() {
         let directory = tempfile::tempdir().unwrap();
         let (key, backing, _file) = local_backing(directory.path(), 7);
-        let backings = SharedBackings::from([(key, backing)]);
+        let mut backings = SharedBackings::from([(key, backing)]);
         let tid = Pid::from_raw(990_701);
         table_init(tid, None, reverie::DescriptorTableInit::Fresh);
         bind_placeholder(
@@ -2935,24 +3093,372 @@ mod tests {
         let unbound = resolve_placeholder(&state, tid, 9, "bound-44").unwrap();
         assert!(unbound.is_none(), "unbound placeholder id resolved");
         drop(state);
-        // A row naming a different identity than the descriptor
-        // shows is a named refusal, never a guess.
+
+        // Rebinding the *same* descriptor number replaces its one
+        // row, retires the old description (and pin), and counts
+        // exactly the new identity (the assertions an earlier
+        // rewrite dropped; Astra round-3 N3).
+        let replacement = FileId {
+            device: key.recorded.device,
+            inode: 99,
+        };
+        bind_placeholder(
+            tid,
+            9,
+            "bound-44".to_owned(),
+            std::fs::File::open(directory.path()).unwrap().into(),
+            (replacement.device, replacement.inode),
+            (key.root.device, key.root.inode),
+            false,
+        );
+        {
+            let state = replay_file_state();
+            assert!(
+                !state.descriptions.contains_key("bound-43"),
+                "the replaced descriptor kept its old description"
+            );
+            assert_eq!(
+                state
+                    .descriptions
+                    .get("bound-44")
+                    .map(|description| description.aliases),
+                Some(1),
+                "the replacement description must have exactly one alias"
+            );
+            let table = state.table_of(tid).expect("bound thread has a table");
+            let aliases = &state.tables[&table].aliases;
+            assert_eq!(aliases.len(), 1, "same-fd rebind kept two rows");
+            assert_eq!(aliases[&9].id, "bound-44");
+            assert_eq!(
+                resolve_placeholder(&state, tid, 9, "bound-44").unwrap(),
+                Some((key.root, replacement))
+            );
+            assert_eq!(
+                resolve_placeholder(&state, tid, 9, "bound-43").unwrap(),
+                None,
+                "the retired identity still resolves"
+            );
+        }
+
+        // The production resolution path refuses both a link and
+        // an alias row that disagree with the live description.
+        link_placeholder_in(&mut backings, key, "bound-44".to_owned()).unwrap();
+        {
+            let state = replay_file_state();
+            assert!(
+                placeholder_backing_for(&state, &backings, tid, 9, "bound-44", OwnedFd::try_clone)
+                    .is_err(),
+                "a link naming another recorded file resolved through object backing"
+            );
+        }
         bind_placeholder(
             tid,
             10,
             "bound-45".to_owned(),
             std::fs::File::open(directory.path()).unwrap().into(),
-            (key.recorded.device, key.recorded.inode),
+            (replacement.device, replacement.inode),
             (key.root.device, key.root.inode),
             false,
         );
-        let state = replay_file_state();
-        assert!(
-            resolve_placeholder(&state, tid, 10, "bound-43").is_err(),
-            "an alias/identity mismatch resolved instead of refusing"
-        );
-        drop(state);
+        {
+            let state = replay_file_state();
+            assert!(
+                resolve_placeholder(&state, tid, 10, "bound-44").is_err(),
+                "an alias/identity mismatch resolved instead of refusing"
+            );
+            assert!(
+                placeholder_backing_for(&state, &backings, tid, 10, "bound-44", OwnedFd::try_clone)
+                    .is_err(),
+                "the production backing path bypassed the alias cross-check"
+            );
+        }
+        // Once the description is gone, its stale mapped link in
+        // this local registry resolves nothing.
+        retire_placeholder_binding(tid, 9);
+        {
+            let state = replay_file_state();
+            assert!(
+                placeholder_backing_for(&state, &backings, tid, 9, "bound-44", OwnedFd::try_clone)
+                    .unwrap()
+                    .is_none(),
+                "a stale placeholder link resolved after its description dropped"
+            );
+        }
         release_thread(tid);
+    }
+
+    fn bind_test_placeholder(
+        directory: &std::path::Path,
+        tid: Pid,
+        fd: RawFd,
+        id: &str,
+        cloexec: bool,
+    ) {
+        bind_placeholder(
+            tid,
+            fd,
+            id.to_owned(),
+            std::fs::File::open(directory).unwrap().into(),
+            (44, 55),
+            (66, 77),
+            cloexec,
+        );
+    }
+
+    #[test]
+    fn copied_and_shared_tables_follow_the_delivered_relation() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = Pid::from_raw(990_720);
+        let copied = Pid::from_raw(990_721);
+        let shared = Pid::from_raw(990_722);
+        let parent_thread = table_init(parent, None, reverie::DescriptorTableInit::Fresh);
+        bind_test_placeholder(directory.path(), parent, 3, "copy-shared-1", false);
+
+        let copied_thread = table_init(
+            copied,
+            Some(parent),
+            reverie::DescriptorTableInit::CopiedFromParent,
+        );
+        {
+            let state = replay_file_state();
+            assert_ne!(state.table_of(parent), state.table_of(copied));
+            assert_eq!(
+                state
+                    .descriptions
+                    .get("copy-shared-1")
+                    .map(|description| description.aliases),
+                Some(2)
+            );
+        }
+        retire_placeholder_binding(copied, 3);
+        {
+            let state = replay_file_state();
+            assert_eq!(
+                state
+                    .descriptions
+                    .get("copy-shared-1")
+                    .map(|description| description.aliases),
+                Some(1),
+                "a copied table's close ended the parent's alias"
+            );
+            assert!(
+                resolve_placeholder(&state, parent, 3, "copy-shared-1")
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        let shared_thread = table_init(
+            shared,
+            Some(parent),
+            reverie::DescriptorTableInit::SharedWithParent,
+        );
+        bind_test_placeholder(directory.path(), shared, 4, "copy-shared-2", false);
+        {
+            let state = replay_file_state();
+            assert_eq!(state.table_of(parent), state.table_of(shared));
+            assert!(
+                resolve_placeholder(&state, parent, 4, "copy-shared-2")
+                    .unwrap()
+                    .is_some(),
+                "a shared table's new row is not in the parent's table"
+            );
+        }
+        release_table_thread(shared_thread);
+        {
+            let state = replay_file_state();
+            assert!(
+                state.table_of(parent).is_some(),
+                "one shared user dropped the table"
+            );
+        }
+        release_table_thread(copied_thread);
+        release_table_thread(parent_thread);
+    }
+
+    #[test]
+    fn exec_preserves_survivor_references_and_shared_old_table() {
+        let directory = tempfile::tempdir().unwrap();
+        let leader = Pid::from_raw(990_730);
+        let worker = Pid::from_raw(990_731);
+        let sharer = Pid::from_raw(990_732);
+        let leader_thread = table_init(leader, None, reverie::DescriptorTableInit::Fresh);
+        let worker_thread = table_init(
+            worker,
+            Some(leader),
+            reverie::DescriptorTableInit::SharedWithParent,
+        );
+        let sharer_thread = table_init(
+            sharer,
+            Some(leader),
+            reverie::DescriptorTableInit::SharedWithParent,
+        );
+        bind_test_placeholder(directory.path(), leader, 3, "exec-shared-a", false);
+        bind_test_placeholder(directory.path(), leader, 4, "exec-shared-b", true);
+        bind_test_placeholder(directory.path(), leader, 5, "exec-shared-c", true);
+        // F_SETFD clearing close-on-exec is reflected in the row
+        // Detcore's survivor set below retains.
+        set_placeholder_cloexec(leader, 5, false);
+        follow_binding_through_dup(leader, 3, 6, false);
+
+        exec_detach_table(worker, &[3, 5, 6]);
+        {
+            let state = replay_file_state();
+            assert_ne!(state.table_of(leader), state.table_of(worker));
+            assert_eq!(state.table_of(leader), state.table_of(sharer));
+            assert_eq!(
+                state
+                    .descriptions
+                    .get("exec-shared-a")
+                    .map(|description| description.aliases),
+                Some(4),
+                "old and survivor tables each hold both aliases"
+            );
+            assert_eq!(
+                state
+                    .descriptions
+                    .get("exec-shared-b")
+                    .map(|description| description.aliases),
+                Some(1),
+                "the shared old table lost a row it still holds"
+            );
+            assert_eq!(
+                state
+                    .descriptions
+                    .get("exec-shared-c")
+                    .map(|description| description.aliases),
+                Some(2)
+            );
+            let worker_table = state.table_of(worker).unwrap();
+            assert_eq!(
+                state.tables[&worker_table]
+                    .aliases
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![3, 5, 6]
+            );
+        }
+        release_table_thread(leader_thread);
+        release_table_thread(sharer_thread);
+        {
+            let state = replay_file_state();
+            assert_eq!(
+                state
+                    .descriptions
+                    .get("exec-shared-a")
+                    .map(|description| description.aliases),
+                Some(2),
+                "dropping the old shared table must leave only survivor aliases"
+            );
+            assert!(!state.descriptions.contains_key("exec-shared-b"));
+            assert!(
+                resolve_placeholder(&state, worker, 3, "exec-shared-a")
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        release_table_thread(worker_thread);
+    }
+
+    #[test]
+    fn sole_owner_exec_keeps_non_cloexec_and_dup2_self_keeps_flag() {
+        let directory = tempfile::tempdir().unwrap();
+        let tid = Pid::from_raw(990_740);
+        let thread = table_init(tid, None, reverie::DescriptorTableInit::Fresh);
+        bind_test_placeholder(directory.path(), tid, 3, "exec-sole-a", false);
+        bind_test_placeholder(directory.path(), tid, 4, "exec-sole-b", true);
+        bind_test_placeholder(directory.path(), tid, 5, "exec-sole-c", true);
+        // dup2(fd, fd) must not clear the flag it is handed.
+        follow_binding_through_dup(tid, 5, 5, false);
+        {
+            let state = replay_file_state();
+            let table = state.table_of(tid).unwrap();
+            assert!(state.tables[&table].aliases[&5].cloexec);
+        }
+        exec_detach_table(tid, &[3]);
+        {
+            let state = replay_file_state();
+            assert_eq!(
+                state
+                    .descriptions
+                    .get("exec-sole-a")
+                    .map(|description| description.aliases),
+                Some(1)
+            );
+            assert!(!state.descriptions.contains_key("exec-sole-b"));
+            assert!(!state.descriptions.contains_key("exec-sole-c"));
+        }
+        release_table_thread(thread);
+    }
+
+    #[test]
+    fn non_leader_exec_handoff_rebinds_the_transferred_state_token() {
+        let directory = tempfile::tempdir().unwrap();
+        let leader = Pid::from_raw(990_750);
+        let worker = Pid::from_raw(990_751);
+        let leader_thread = table_init(leader, None, reverie::DescriptorTableInit::Fresh);
+        let worker_thread = table_init(
+            worker,
+            Some(leader),
+            reverie::DescriptorTableInit::SharedWithParent,
+        );
+        exec_detach_table(worker, &[]);
+        // The displaced leader's exit callback names the leader
+        // TID but carries the leader's state token.
+        release_table_thread(leader_thread);
+        exec_thread_handoff(Some(worker_thread), leader);
+        bind_test_placeholder(directory.path(), leader, 3, "exec-handoff-a", false);
+        {
+            let state = replay_file_state();
+            assert_eq!(state.thread_for(leader), Some(worker_thread));
+            assert!(
+                resolve_placeholder(&state, leader, 3, "exec-handoff-a")
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        release_table_thread(worker_thread);
+        assert!(replay_file_state().table_of(leader).is_none());
+    }
+
+    #[test]
+    fn pidfd_getfd_alias_keeps_the_description_after_source_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let tid = Pid::from_raw(990_760);
+        let thread = table_init(tid, None, reverie::DescriptorTableInit::Fresh);
+        bind_test_placeholder(directory.path(), tid, 3, "pidfd-alias-a", false);
+        follow_binding_through_pidfd_getfd(tid, 4, Some("pidfd-alias-a".to_owned()));
+        {
+            let state = replay_file_state();
+            assert_eq!(
+                state
+                    .descriptions
+                    .get("pidfd-alias-a")
+                    .map(|description| description.aliases),
+                Some(2)
+            );
+            let table = state.table_of(tid).unwrap();
+            assert!(state.tables[&table].aliases[&4].cloexec);
+        }
+        retire_placeholder_binding(tid, 3);
+        {
+            let state = replay_file_state();
+            assert_eq!(
+                state
+                    .descriptions
+                    .get("pidfd-alias-a")
+                    .map(|description| description.aliases),
+                Some(1),
+                "the imported alias did not keep its description"
+            );
+            assert!(
+                resolve_placeholder(&state, tid, 4, "pidfd-alias-a")
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        release_table_thread(thread);
     }
 
     fn assert_shared_refusal(action: impl FnOnce(), step: &str) {
