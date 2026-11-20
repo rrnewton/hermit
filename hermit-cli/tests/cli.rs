@@ -81667,6 +81667,10 @@ fn a_group_members_call_is_not_failed_for_another_members_terminal_stop() {
     let guest_path = guest.to_str().expect("guest path is UTF-8");
     const READER_REFUSED: &str =
         "read refused: Linux raised SIGTTIN, at its default disposition, during the call";
+    // Any call's refusal during the call: the reader's read's, or one of the
+    // sibling's calls refused in error.
+    const REFUSED_DURING_A_CALL: &str =
+        "refused: Linux raised SIGTTIN, at its default disposition, during the call";
     for (mode, call) in [("sibling", "read"), ("sibling-poll", "poll")] {
         let native = with_job_control_signals(Command::new(guest).arg(mode), libc::SIG_DFL)
             .output()
@@ -81730,8 +81734,11 @@ fn a_group_members_call_is_not_failed_for_another_members_terminal_stop() {
             "{permissive:?}: {printed}{stderr}"
         );
         assert_eq!(
-            stderr.matches(READER_REFUSED).count(),
-            1,
+            (
+                stderr.matches(REFUSED_DURING_A_CALL).count(),
+                stderr.matches(READER_REFUSED).count()
+            ),
+            (1, 1),
             "{permissive:?}: only the reader's read is refused during the call: \
              {printed}{stderr}"
         );
