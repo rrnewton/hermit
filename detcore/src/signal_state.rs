@@ -288,9 +288,10 @@ pub(crate) struct ThreadSignals {
     pub(crate) wait_ran: Option<bool>,
     /// The `uc_sigmask` of each handler frame entered and not yet known to
     /// have returned, innermost last. A backend that reports `rt_sigreturn`
-    /// pops one per return ([`ThreadSignals::sigreturn`]); where the kernel
-    /// runs `rt_sigreturn` unseen, a return is recognised when the kernel's
-    /// mask equals one of these ([`ThreadSignals::reconcile_returns`]).
+    /// pops one per return of an open frame ([`ThreadSignals::sigreturn`]);
+    /// where the kernel runs `rt_sigreturn` unseen, a return is recognised
+    /// when the kernel's mask equals one of these
+    /// ([`ThreadSignals::reconcile_returns`]).
     #[serde(default)]
     pub(crate) activations: Vec<Sigset>,
     /// For each open frame, whether a check saw its handler's mask installed.
@@ -307,6 +308,12 @@ pub(crate) struct ThreadSignals {
     /// check.
     #[serde(default)]
     pub(crate) verify_at_entry: bool,
+    /// The stack pointer of the last `rt_sigreturn` the backend reported, until
+    /// a handler is entered again: a second report at that stack pointer with
+    /// no handler entered between them cannot be an open handler frame's
+    /// return, and closes no frame.
+    #[serde(default)]
+    pub(crate) last_reported_return: Option<u64>,
 }
 
 impl ThreadSignals {
@@ -320,6 +327,7 @@ impl ThreadSignals {
             activations: Vec::new(),
             observed: Vec::new(),
             verify_at_entry: false,
+            last_reported_return: None,
         }
     }
 
@@ -378,6 +386,7 @@ impl ThreadSignals {
         self.blocked = blocked & !UNBLOCKABLE;
         self.activations.push(frame);
         self.observed.push(false);
+        self.last_reported_return = None;
         true
     }
 
@@ -398,10 +407,18 @@ impl ThreadSignals {
         self.observed.last().copied().unwrap_or(true)
     }
 
-    /// `rt_sigreturn` read `mask` from the frame and installed it.
+    /// `rt_sigreturn` read `mask` from the innermost open handler frame,
+    /// which closes, and installed it.
     pub(crate) fn sigreturn(&mut self, mask: Sigset) {
         self.activations.pop();
         self.observed.pop();
+        self.sigreturn_closing_no_frame(mask);
+    }
+
+    /// `rt_sigreturn` read `mask` from a frame that is not an open handler
+    /// frame's, such as one the guest wrote itself, and installed it: Linux
+    /// restores whatever frame the stack pointer points at.
+    pub(crate) fn sigreturn_closing_no_frame(&mut self, mask: Sigset) {
         self.saved = None;
         self.blocked = mask & !UNBLOCKABLE;
     }
@@ -520,6 +537,7 @@ impl SignalShadow {
         }
         thread.activations.clear();
         thread.observed.clear();
+        thread.last_reported_return = None;
         Some(SignalShadow {
             dispositions,
             thread,
@@ -539,6 +557,7 @@ impl SignalShadow {
         self.thread.settle();
         self.thread.activations.clear();
         self.thread.observed.clear();
+        self.thread.last_reported_return = None;
         true
     }
 

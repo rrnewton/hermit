@@ -54599,17 +54599,83 @@ fn the_work_span_report_leaves_signal_continuations_unchanged() {
 /// its next signal stop. That stop yields, and its delivery then waits behind
 /// the other runnable threads, as Linux reschedules (TIF_NEED_RESCHED) before
 /// it delivers; it is not taken right after the yield as a continuation of
-/// the `rt_sigreturn`. The count is Hermit's deterministic schedule, not a
-/// native comparison: with the delivery taken right after the yield, the
-/// sender sends 3 signals instead of 4 (Claude and Codex reviews of
-/// https://github.com/rrnewton/hermit/pull/4509).
+/// the `rt_sigreturn`. The schedule is checked directly: the reader yields at
+/// least once, and the commit right before each of its deliveries is another
+/// thread's, with a yield of the reader's before it. The count is Hermit's
+/// deterministic schedule, not a native comparison: with the delivery taken
+/// right after the yield, the sender sends 3 signals instead of 4 (Claude and
+/// Codex reviews of https://github.com/rrnewton/hermit/pull/4509). aarch64's
+/// clock counts every branch, so the slice that ends at the handler's signal
+/// stop is 1200 there, measured: at 1000 its slices end elsewhere, and taking
+/// the delivery right after the yield changes neither the count nor the
+/// schedule.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 #[test]
 fn a_slice_that_ends_at_a_signal_stop_puts_its_delivery_behind_other_threads() {
+    #[cfg(target_arch = "x86_64")]
+    let timeslice = "--target-timeslice=1000";
+    #[cfg(target_arch = "aarch64")]
+    let timeslice = "--target-timeslice=1200";
     let guest = pipe_read_signal_guest().to_str().unwrap().to_owned();
+
+    let args = [
+        "--log=info",
+        "run",
+        "--strict",
+        timeslice,
+        "--",
+        guest.as_str(),
+        "repeat-join-spin",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let log = stderr(&output);
+    // (thread, resources) of each committed turn, in order.
+    let commits: Vec<(&str, &str)> = log
+        .lines()
+        .filter_map(|line| {
+            let (_, tail) = line.split_once(" COMMIT turn ")?;
+            let (_, tail) = tail.split_once(", dettid ")?;
+            tail.split_once(" using resources ")
+        })
+        .collect();
+    let is_delivery = |resources: &str| resources.starts_with("{InboundSignal(SigWrapper(10))");
+    let is_yield = |resources: &str| resources.starts_with("{SleepUntil(LogicalTime(0))");
+    let deliveries: Vec<usize> = (0..commits.len())
+        .filter(|&index| is_delivery(commits[index].1))
+        .collect();
+    let Some(&first) = deliveries.first() else {
+        panic!("no delivery commits:\n{log}");
+    };
+    let reader = commits[first].0;
+    assert!(
+        commits
+            .iter()
+            .any(|&(thread, resources)| thread == reader && is_yield(resources)),
+        "no yield commit of the reader, thread {reader}:\n{log}"
+    );
+    for index in deliveries {
+        let (thread, _) = commits[index];
+        assert_eq!(thread, reader, "SIGUSR1 deliveries to two threads:\n{log}");
+        let previous = index.checked_sub(1).map(|previous| commits[previous].0);
+        assert!(
+            previous.is_some_and(|previous| previous != reader),
+            "the commit before delivery commit {index} is not another thread's:\n{log}"
+        );
+        let reader_before = commits[..index]
+            .iter()
+            .rev()
+            .find(|&&(thread, _)| thread == reader);
+        assert!(
+            reader_before.is_some_and(|&(_, resources)| is_yield(resources)),
+            "delivery commit {index} does not follow a yield of the reader:\n{log}"
+        );
+    }
+
     let args = [
         "run",
         "--strict",
-        "--target-timeslice=1000",
+        timeslice,
         "--verify",
         "--verify-strict",
         "--",

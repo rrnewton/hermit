@@ -5338,7 +5338,12 @@ impl<T: RunMode> Tool for Detcore<T> {
         thread_state: &mut Self::ThreadState,
         report: reverie::SigreturnReport,
     ) {
-        crate::syscalls::signal_shadow::record_sigreturn_report(thread_state, report);
+        // This process's detpid is the host pid its tool was created for.
+        crate::syscalls::signal_shadow::record_sigreturn_report(
+            thread_state,
+            Pid::from_raw(self.detpid.as_raw()),
+            report,
+        );
         thread_state.returned_from_sigreturn = true;
     }
 
