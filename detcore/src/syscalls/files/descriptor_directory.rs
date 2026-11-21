@@ -6576,21 +6576,20 @@ const RWH_WRITE_LIFE_EXTREME: u64 = 5;
 /// the guest's root, with its capabilities in the guest's user namespace,
 /// as it renders every live task's files as owned by it
 /// (`rendered_file_owner`, named approximation): a task's descriptor
-/// directory is its own; `/proc` is global root's, whom the caller may act
-/// as only where the guest's user namespace maps it, as the guest's own stat
-/// of `/proc` shows (`guest_procfs_root`: an unmapped owner reads as the
-/// overflow ID, which no mapped caller has); a system-wide directory is its
-/// owner's as the kernel reports it in the guest's user namespace
-/// (`SystemObject`, from the object the lookup reached: global root, or the root of the
-/// network namespace's owner for `/proc/sys/net`).
+/// directory is its own; `/proc` is global root's, whom the guest's user
+/// namespace does not map (as every system-wide rendered file is answered,
+/// [`super::rendered_procfs::FileAccess::GLOBAL_ROOT`]), so no guest may
+/// act as its owner, whatever the backing descriptor in the host image
+/// stats as; a system-wide directory is its owner's as the kernel reports
+/// it in the guest's user namespace (`SystemObject`, from the object the
+/// lookup reached: global root, or the root of the network namespace's
+/// owner for `/proc/sys/net`, an unmapped owner reading as the overflow
+/// ID, which no mapped caller has).
 fn placeholder_owner_or_capable(directory: &PlaceholderDirectory) -> Result<bool, Errno> {
     const OVERFLOW_ID: u32 = 65534;
     match directory {
         PlaceholderDirectory::Descriptors(_) | PlaceholderDirectory::Task(_) => Ok(true),
-        PlaceholderDirectory::Root => {
-            let (_, uid, gid) = super::rendered_procfs::guest_procfs_root()?;
-            Ok(uid != OVERFLOW_ID && gid != OVERFLOW_ID)
-        }
+        PlaceholderDirectory::Root => Ok(false),
         PlaceholderDirectory::System(system) => {
             Ok(system.object.uid != OVERFLOW_ID && system.object.gid != OVERFLOW_ID)
         }
@@ -6601,20 +6600,17 @@ fn placeholder_owner_or_capable(directory: &PlaceholderDirectory) -> Result<bool
 /// `vfs_setlease` asks for a lease (the file's owner is the caller's
 /// filesystem uid; `CAP_LEASE` counts only in the initial user namespace):
 /// Detcore takes the caller to be the guest's root, which owns its own task's
-/// descriptor directory (`rendered_file_owner`), and owns `/proc` only where
-/// global root is the guest's root, as the guest's own stat of `/proc` shows
-/// (`guest_procfs_root`: uid 0), and a system-wide directory where its owner
-/// is (`SystemObject`). Read from the same facts as
-/// [`placeholder_owner_or_capable`], which also lets a caller act as an owner
-/// its user namespace maps, as `inode_owner_or_capable` does and
-/// `vfs_setlease` does not.
+/// descriptor directory (`rendered_file_owner`), and never owns `/proc`,
+/// global root's, unmapped in the guest's user namespace (as
+/// [`placeholder_owner_or_capable`] answers for it), and owns a system-wide
+/// directory where its owner, as the guest's namespace reports it, is the
+/// guest's root (`SystemObject`). The two predicates differ as the kernel's
+/// do: `inode_owner_or_capable` also lets a caller act as an owner its user
+/// namespace maps, as `vfs_setlease` does not.
 fn placeholder_lease_owner(directory: &PlaceholderDirectory) -> Result<bool, Errno> {
     match directory {
         PlaceholderDirectory::Descriptors(_) | PlaceholderDirectory::Task(_) => Ok(true),
-        PlaceholderDirectory::Root => {
-            let (_, uid, _) = super::rendered_procfs::guest_procfs_root()?;
-            Ok(uid == 0)
-        }
+        PlaceholderDirectory::Root => Ok(false),
         PlaceholderDirectory::System(system) => Ok(system.object.uid == 0),
     }
 }
@@ -6730,6 +6726,22 @@ const LOCK_MAND: libc::c_int = 32;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/proc` is global root's, unmapped in the guest's user namespace, so
+    /// no guest may act as its owner (`O_NOATIME`, `F_SETFL`'s `O_NOATIME`,
+    /// `F_SET_RW_HINT`, a lease) on any backend, whatever the backing
+    /// descriptor in the host image stats as.
+    #[test]
+    fn no_guest_owns_proc() {
+        assert_eq!(
+            placeholder_owner_or_capable(&PlaceholderDirectory::Root),
+            Ok(false)
+        );
+        assert_eq!(
+            placeholder_lease_owner(&PlaceholderDirectory::Root),
+            Ok(false)
+        );
+    }
 
     #[test]
     fn a_name_below_a_directory_keeps_what_linux_resolves() {
