@@ -575,6 +575,10 @@ jobs:
       run: |
         install -m 0644 docs/site/index.html target/doc/index.html
         install -m 0644 docs/site/site.css target/doc/site.css
+        # The per-syscall pages the landing page links as syscalls/
+        # (rendered by scripts/syscall-pages.rs render).
+        rm -rf target/doc/syscalls
+        cp -R docs/site/syscalls target/doc/syscalls
     - name: Add reviewed compatibility website
       # Release assets are checksum-bound handoffs from separately reviewed
       # real-ledger builds. Reconstruct every retained content-addressed path and
