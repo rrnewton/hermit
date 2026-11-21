@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["plan_bytes","rewrite_bytes","rewrite_file","write_rewritten"],"struct":["FilePatch","FilePlan","FileReport"]};

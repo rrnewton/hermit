@@ -1,0 +1,81 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Telling code from data in an aarch64 ELF file’s executable sections, by the file’s mapping symbols."><title>detcore::aarch64_lse::mapping - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module mapping</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../detcore/index.html">detcore</a><span class="version">0.5.7</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module mapping</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#enums" title="Enums">Enums</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="../index.html">In detcore::<wbr>aarch64_<wbr>lse</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../index.html">detcore</a>::<wbr><a href="../index.html">aarch64_lse</a></div><h1>Module <span>mapping</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../../src/detcore/aarch64_lse/mapping.rs.html#9-2540">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Telling code from data in an aarch64 ELF file’s executable sections, by
+the file’s mapping symbols.</p>
+<p>An executable section can hold data as well as instructions: OpenSSL’s
+generated assembly, for one, keeps its constant tables in <code>.text</code>. Those
+words decode as instructions as readily as code does, so a scan that reads
+the whole section finds load/store-exclusive “loops” that never execute,
+and a rewrite that took one would corrupt the table. The AArch64 ELF ABI
+marks the boundaries with mapping symbols in the symbol table: <code>$x</code> (or
+<code>$x.&lt;any&gt;</code>) starts A64 code and <code>$d</code> (or <code>$d.&lt;any&gt;</code>) starts data, each
+running to the next mapping symbol of the same section (“ELF for the Arm
+64-bit Architecture”, section 5.5.4, Mapping symbols). A stripped file has
+no symbol table and so no mapping symbols, and a section can lack them too.</p>
+<p>Where a section has no mapping symbols, the file’s unwind table
+(<code>.eh_frame</code>) is the evidence instead: each frame description entry (FDE)
+covers one function’s code, stripped files keep the table for unwinding,
+and a constant table has no FDE. An FDE covers its whole function, so a
+table or literal pool placed inside the function is inside it too: under
+that evidence alone, code is what control reaches from the functions’
+entries (<a href="fn.reachable_code.html" title="fn detcore::aarch64_lse::mapping::reachable_code"><code>reachable_code</code></a>), less what the code addresses as data, up
+to the next instruction a branch reaches (<a href="fn.data_extents.html" title="fn detcore::aarch64_lse::mapping::data_extents"><code>data_extents</code></a>), since a
+call is taken to return; and a sequence a literal load reaches is
+refused in any case (<a href="fn.literal_targets.html" title="fn detcore::aarch64_lse::mapping::literal_targets"><code>literal_targets</code></a>). Bytes neither marks are not
+known to be code.</p>
+<p>These are pure functions of the file’s bytes, which the rewriter
+(<a href="../elf/index.html" title="mod detcore::aarch64_lse::elf"><code>super::elf</code></a>) consults before it plans a single sequence.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.Addressed.html" title="struct detcore::aarch64_lse::mapping::Addressed">Addressed</a></dt><dd>What <a href="fn.addressed_starts.html" title="fn detcore::aarch64_lse::mapping::addressed_starts"><code>addressed_starts</code></a> found.</dd><dt><a class="struct" href="struct.CodeEvidence.html" title="struct detcore::aarch64_lse::mapping::CodeEvidence">Code<wbr>Evidence</a></dt><dd>What tells an ELF file’s code from its data: its mapping symbols, and the
+code ranges its unwind table’s FDEs cover.</dd><dt><a class="struct" href="struct.MappingSymbol.html" title="struct detcore::aarch64_lse::mapping::MappingSymbol">Mapping<wbr>Symbol</a></dt><dd>One mapping symbol: where in which section code or data starts.</dd><dt><a class="struct" href="struct.SectionCode.html" title="struct detcore::aarch64_lse::mapping::SectionCode">Section<wbr>Code</a></dt><dd>What one executable section holds, as address ranges, by
+<a href="struct.CodeEvidence.html#method.classify" title="method detcore::aarch64_lse::mapping::CodeEvidence::classify"><code>CodeEvidence::classify</code></a>. What is in neither list is data (<code>$d</code>).</dd></dl><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.Evidence.html" title="enum detcore::aarch64_lse::mapping::Evidence">Evidence</a></dt><dd>What <a href="struct.CodeEvidence.html#method.classify" title="method detcore::aarch64_lse::mapping::CodeEvidence::classify"><code>CodeEvidence::classify</code></a> found a section’s code by.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.addressed_starts.html" title="fn detcore::aarch64_lse::mapping::addressed_starts">addressed_<wbr>starts</a></dt><dd>Where <code>words</code> (at <code>base</code>) address bytes as data, or may: the target of
+each <code>LDR</code> (literal) and <code>ADR</code>, and of each <code>ADRP</code> with every <code>ADD</code>
+(immediate) or unsigned-offset load or store that completes it among the
+eight instructions after it, taking the <code>ADRP</code>’s register as its base,
+up to the instruction that writes that register without completing it,
+since the page is gone from there. One <code>ADRP</code> can address several tables.
+An <code>ADRP</code> nothing completes gives its page, the lowest address it can be
+completing. Each is where a table may start: how far it runs is not in
+the instruction (<a href="fn.data_extents.html" title="fn detcore::aarch64_lse::mapping::data_extents"><code>data_extents</code></a>).</dd><dt><a class="fn" href="fn.code_spans.html" title="fn detcore::aarch64_lse::mapping::code_spans">code_<wbr>spans</a></dt><dd>The code of section <code>section</code>, which starts at <code>address</code> and is <code>size</code>
+bytes long, as address ranges, given <code>symbols</code> sorted as
+<a href="fn.mapping_symbols.html" title="fn detcore::aarch64_lse::mapping::mapping_symbols"><code>mapping_symbols</code></a> returns them: each <code>$x</code> to the next mapping symbol of
+the section, or to its end. Bytes before the section’s first mapping
+symbol are not code, and a mark outside the section is ignored. <code>None</code>
+when the section has no mapping symbol, so its code cannot be told from
+its data.</dd><dt><a class="fn" href="fn.data_extents.html" title="fn detcore::aarch64_lse::mapping::data_extents">data_<wbr>extents</a></dt><dd>The bytes a function may hold as data, where only the unwind table tells
+code from data: from each address the code addresses as data
+(<code>starts</code>, <a href="fn.addressed_starts.html" title="fn detcore::aarch64_lse::mapping::addressed_starts"><code>addressed_starts</code></a>) inside a function (<code>functions</code>, the
+FDEs’ ranges, sorted) to the next instruction a branch reaches
+(<code>branches</code>, as <a href="fn.direct_branches.html" title="fn detcore::aarch64_lse::mapping::direct_branches"><code>direct_branches</code></a> gives them), or the function’s end.
+Control does not run into a table, so the code after one is reached by a
+branch, and only a branch that is not itself inside a table counts: a
+table word can decode as one. An address at a function’s entry is a
+pointer to the function, not data. The ranges come back sorted and merged.</dd><dt><a class="fn" href="fn.direct_branches.html" title="fn detcore::aarch64_lse::mapping::direct_branches">direct_<wbr>branches</a></dt><dd>Every direct branch of <code>words</code> (at <code>base</code>), as (its address, its target).</dd><dt><a class="fn" href="fn.fde_ranges.html" title="fn detcore::aarch64_lse::mapping::fde_ranges">fde_<wbr>ranges</a></dt><dd>The address range of each FDE of an unwind table (<code>.eh_frame</code>, at
+<code>address</code>), sorted. <code>None</code> when the table cannot be read to its end: a
+reader that skipped an FDE it could not decode would take that
+function’s code for data, which is safe, but one that misread a length
+could take data for code.</dd><dt><a class="fn" href="fn.literal_targets.html" title="fn detcore::aarch64_lse::mapping::literal_targets">literal_<wbr>targets</a></dt><dd>The byte ranges <code>words</code> (at <code>base</code>) load as literals or take the address
+of: each <code>LDR</code> (literal) target with its load’s size, and each <code>ADR</code>
+target as one word, since what follows it is not known. A literal pool
+inside a function is read this way, so a candidate sequence any of these
+reach is data the unwind table took for code.</dd><dt><a class="fn" href="fn.mapping_symbols.html" title="fn detcore::aarch64_lse::mapping::mapping_symbols">mapping_<wbr>symbols</a></dt><dd>The mapping symbols of a symbol table, given the string table it names:
+the local, untyped symbols whose names are <code>$x</code> or <code>$d</code>, sorted by
+section and address. Where a <code>$x</code> and a <code>$d</code> mark the same
+address, the <code>$d</code> sorts last and so wins: a word that may be data is not
+taken for code.</dd><dt><a class="fn" href="fn.reachable_code.html" title="fn detcore::aarch64_lse::mapping::reachable_code">reachable_<wbr>code</a></dt><dd>The code among <code>words</code> (at <code>base</code>) that control can reach from
+<code>entries</code> without leaving <code>covered</code> (sorted, disjoint): following each
+instruction to the next unless it is an unconditional branch, a return,
+an indirect jump or a trap, and each direct branch to its target. Under
+the unwind table alone this is what is taken for code: an FDE covers its
+whole function, including a constant table the function branches over or
+keeps after its return, and those bytes are not reached. Code reached
+only through a jump table or an exception landing pad is not either, and
+is left alone with them. A call falls through only where <code>returns</code>
+proves the callee comes back; <a href="fn.data_extents.html" title="fn detcore::aarch64_lse::mapping::data_extents"><code>data_extents</code></a> takes back what the code
+addresses as data.</dd><dt><a class="fn" href="fn.symbol_table.html" title="fn detcore::aarch64_lse::mapping::symbol_table">symbol_<wbr>table</a></dt><dd>Where an ELF64 little-endian file’s symbol table and the string table it
+names are, as file ranges (offset, size), from its section header table.
+<code>None</code> when it has no symbol table (a stripped file) or the table’s
+string table is not one.</dd><dt><a class="fn" href="fn.unsupported_mapping_symbols.html" title="fn detcore::aarch64_lse::mapping::unsupported_mapping_symbols">unsupported_<wbr>mapping_<wbr>symbols</a></dt><dd>The local, untyped symbols named like mapping symbols (a <code>$</code> name) that
+are neither <code>$x</code> nor <code>$d</code>, with or without a <code>.suffix</code>, as (section index,
+name), in table order: AArch32’s <code>$a</code> and <code>$t</code>, and any other <code>$</code> name,
+such as <code>$xyz</code> or <code>$dx</code>. They are reserved for mapping symbols, so this
+reader cannot say where they put code or data, and a section that has one
+is not proved by its mapping symbols: a <code>$a</code> after a <code>$x</code> would otherwise
+leave the code range running through it.</dd></dl></section></div></main></body></html>

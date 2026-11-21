@@ -1,0 +1,68 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Applying the exclusive-loop rewrite to the executable segments of an aarch64 ELF file."><title>detcore::aarch64_lse::elf - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module elf</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../detcore/index.html">detcore</a><span class="version">0.5.7</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module elf</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="../index.html">In detcore::<wbr>aarch64_<wbr>lse</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../index.html">detcore</a>::<wbr><a href="../index.html">aarch64_lse</a></div><h1>Module <span>elf</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../../src/detcore/aarch64_lse/elf.rs.html#9-3958">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Applying the exclusive-loop rewrite to the executable segments of an
+aarch64 ELF file.</p>
+<p>The rewrite is in place and the same length, so the output file is the
+input file with some instruction words replaced: every offset, segment,
+symbol, relocation and build id stays as it was, and the loader maps it
+exactly as it mapped the original.</p>
+<p>Only sections marked executable (<code>SHF_EXECINSTR</code>, so <code>.text</code>, <code>.plt</code>,
+<code>.init</code> and the like) are scanned for rewrites. Bytes an executable
+segment carries that no such section covers are never rewritten, but
+their literal and base readers are collected for protection, under
+their own refusal name (<code>gap-reader-inside-the-sequence</code>): gap
+bytes are not proved code, so data there (ordinary <code>.rodata</code> in a
+single R+X load, the GNU ld default) can decode as a reader it is
+not and refuse sequences only it would refuse. Unaligned gap ends
+are rounded outward and decoded; only a gap whose bytes run past
+the end of the file is refused by name. An executable <code>PT_LOAD</code> segment also
+carries the ELF header, the dynamic symbol and relocation tables and
+read-only data, and those bytes decode as instructions as readily as code
+does: measured on one Android test binary, scanning whole segments found
+69 “exclusive instructions” of which 66 were in data before <code>.text</code> even
+began. A file with no section headers is left alone and reported, because
+nothing in it can be told apart from data.</p>
+<p>Within those sections, only code is rewritten (<a href="../mapping/index.html" title="mod detcore::aarch64_lse::mapping"><code>super::mapping</code></a>). An
+executable section can hold data too (a literal pool, or OpenSSL’s
+constant tables in <code>.text</code>), and a table whose words happened to form a
+canonical loop would otherwise be rewritten, corrupting it. What is taken
+for code depends on what the file says, section by section:</p>
+<ul>
+<li>Mapping symbols: exactly the ranges they mark <code>$x</code>. The AArch64 ELF ABI
+has an assembler mark data <code>$d</code>, so data marked as the ABI says is never
+taken for code. This is the only evidence the rewrite accepts, because
+it is the only one that proves where code is. A section that also holds
+a mapping symbol of another kind (AArch32’s <code>$a</code> or <code>$t</code>, or a <code>$</code> name
+this reader does not know, such as <code>$xyz</code>) is not proved by them: its
+sequences are left alone as <code>unsupported-mapping-symbol</code>, naming the
+symbol.</li>
+<li>No mapping symbols: nothing, whatever the unwind table covers. Every
+exclusive sequence in such a section, as in every stripped file, is
+left alone as <code>no-mapping-symbols</code>, so the file is left unchanged and
+named, never silently. An FDE covers its whole function, including a
+table the function branches over or keeps after a call that does not
+return, so the unwind table cannot prove which of its bytes are code.</li>
+</ul>
+<p>Under any evidence, a sequence an <code>LDR</code> (literal) or <code>ADR</code> in the code
+reaches is refused (<code>literal-inside-the-sequence</code>): an object linked
+without mapping symbols after one with them inherits the earlier <code>$x</code>
+range. The branch analysis still reads every word of every executable
+section, so a word that might branch into a sequence still refuses it.
+Gap words contribute decoded direct-branch targets the same way, but
+they are exempt from the unknown-direct-branch rule section words
+trip: data in a gap can look like an unallocated branch, and applying
+that rule to it would refuse nearly every image with R+X data.</p>
+<p>A section in a segment that is both writable and executable is refused
+too: writable text is either a loader quirk or a runtime that rewrites
+itself, and rewriting it would race whatever writes it.</p>
+<p>A sequence any relocation points into is refused as well. Relocations are
+read as 64-bit little-endian, the only aarch64 ELF this rewriter handles. A relocation is
+the loader’s licence to change those bytes at load time, which would
+overwrite part of a rewritten sequence with something computed for the
+original one.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.FilePatch.html" title="struct detcore::aarch64_lse::elf::FilePatch">File<wbr>Patch</a></dt><dd>One rewritten sequence of a file: where it is, and its bytes before and
+after. Same length, so applying it moves nothing.</dd><dt><a class="struct" href="struct.FilePlan.html" title="struct detcore::aarch64_lse::elf::FilePlan">File<wbr>Plan</a></dt><dd>What <a href="fn.plan_bytes.html" title="fn detcore::aarch64_lse::elf::plan_bytes"><code>plan_bytes</code></a> decided for one file: the report, and every
+replacement it would make.</dd><dt><a class="struct" href="struct.FileReport.html" title="struct detcore::aarch64_lse::elf::FileReport">File<wbr>Report</a></dt><dd>What a rewrite did to one file.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.plan_bytes.html" title="fn detcore::aarch64_lse::elf::plan_bytes">plan_<wbr>bytes</a></dt><dd>Decide the rewrite of <code>bytes</code> without applying it: the report
+<a href="fn.rewrite_bytes.html" title="fn detcore::aarch64_lse::elf::rewrite_bytes"><code>rewrite_bytes</code></a> gives, and each replacement as a <a href="struct.FilePatch.html" title="struct detcore::aarch64_lse::elf::FilePatch"><code>FilePatch</code></a>. A
+caller that applies the replacements somewhere other than the file (a
+process’s mapped pages) gets exactly the bytes a rewritten file would
+hold. Like <a href="fn.rewrite_bytes.html" title="fn detcore::aarch64_lse::elf::rewrite_bytes"><code>rewrite_bytes</code></a>, it rewrites only what mapping symbols
+prove is code.</dd><dt><a class="fn" href="fn.rewrite_bytes.html" title="fn detcore::aarch64_lse::elf::rewrite_bytes">rewrite_<wbr>bytes</a></dt><dd>Rewrite the executable segments of <code>bytes</code> in place.</dd></dl></section></div></main></body></html>

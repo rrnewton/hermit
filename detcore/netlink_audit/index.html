@@ -1,0 +1,56 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Determinize the volatile fields carried by `NETLINK_AUDIT` status replies, and classify audit request types for write containment."><title>detcore::netlink_audit - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module netlink_audit</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../detcore/index.html">detcore</a><span class="version">0.5.7</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module netlink_<wbr>audit</a></h2><h3><a href="#functions">Module Items</a></h3><ul class="block"><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate detcore</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">detcore</a></div><h1>Module <span>netlink_<wbr>audit</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/detcore/netlink_audit.rs.html#9-355">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Determinize the volatile fields carried by <code>NETLINK_AUDIT</code> status replies,
+and classify audit request types for write containment.</p>
+<p>libaudit (reached from PAM stacks, e.g. inside an rpmbuild guest) exchanges
+<code>AUDIT_GET</code> for an <code>audit_status</code> reply on a <code>NETLINK_AUDIT</code> raw socket.
+Nothing flagged audit sockets before this module, so the reply – 232 bytes
+measured in the pam rebuild under <code>--verify</code> (claude-provrepro p06) –
+reached the guest byte-for-byte. <code>audit_status</code> carries the host audit
+subsystem’s LIVE COUNTERS and the host auditd pid (linux/audit.h):</p>
+<div class="example-wrap"><pre class="language-text"><code>  audit_status field        offset  why it moves
+  pid                         12    host auditd&#39;s pid: host identity
+  lost                        24    records dropped: advances with host load
+  backlog                     28    messages queued right now
+  backlog_wait_time_actual    40    cumulative seconds of queue-wait</code></pre></div>
+<p>The differing bytes in the observed 232-byte reply were those fields: the
+two runs saw different backlog (716 vs 196) and lost (112 vs 100) counts.</p>
+<p>The volatile fields are ZEROED, the same “freeze, don’t virtualize” choice
+<code>crate::netlink_route</code> and <code>crate::sock_diag</code> make for their live counters
+and identities: a guest under Hermit has no deterministic clock or host
+audit daemon against which advancing host counters would mean anything.
+Configuration fields (enabled, failure mode, rate and backlog limits,
+feature bitmap) pass through untouched.</p>
+<p>Write containment is judged separately from reads: an AUDIT_SET or
+AUDIT_USER-class message is an instruction to the <em>host</em> audit subsystem.
+Whether the host kernel would honour it depends on capabilities the guest
+happens to hold (measured on this host: the kernel acks -ECONNREFUSED when
+no audit consumer is registered, and CAP_AUDIT_CONTROL in a child user
+namespace cannot reach the init namespace’s configuration) – but Detcore
+must not let that be the only barrier, so typed sends are classified here
+and mutating types are refused by name at the send entry points.</p>
+<p>Known residual, shared with <code>NETLINK_ROUTE</code>/<code>NETLINK_SOCK_DIAG</code>:
+sockets are flagged when Detcore sees them created, so an audit
+socket it did not see created (an inherited initial descriptor, or
+one adopted from outside the guest) is neither sanitized nor
+write-contained. Descriptors passed inside the guest join the
+sender’s open-file description and keep the flag.</p>
+</div></details><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.audit_request_mutates.html" title="fn detcore::netlink_audit::audit_request_mutates">audit_<wbr>request_<wbr>mutates</a></dt><dd>Whether an outgoing netlink message of this type only <em>reads</em> the
+audit subsystem and so may be sent on to the host kernel. Every other
+audit-domain type (1000 and above) either mutates host audit
+configuration (AUDIT_SET and family: rules, TTY/module/logging
+controls) or emits a record into the host audit log – the kernel’s
+user-message ranges 1100-1199 (<code>AUDIT_FIRST_USER_MSG..=LAST</code>) and
+2100-2999 (<code>..MSG2</code>) are record emission gated only by
+<code>CAP_AUDIT_WRITE</code> in <code>audit_netlink_ok</code>, and <code>AUDIT_USER_TTY</code> (1124)
+also drives <code>tty_audit_push()</code>. Unknown and kernel-record types are
+refused too: new write verbs must not acquire a pass-through by
+default. Types below 1000 are generic netlink control (<code>NLMSG_*</code>),
+never audit requests.</dd><dt><a class="fn" href="fn.audit_send_mutating_type.html" title="fn detcore::netlink_audit::audit_send_mutating_type">audit_<wbr>send_<wbr>mutating_<wbr>type</a></dt><dd>The first message type in an outgoing NETLINK_AUDIT buffer that would
+act on the host kernel’s audit subsystem, if any. Walks the buffer the
+way the kernel does – sequentially by <code>nlmsg_len</code> – so a mutating
+message cannot hide behind a read-only one; a malformed or truncated
+tail ends the walk, as it would the kernel’s parse.</dd><dt><a class="fn" href="fn.audit_sends_mutating_type.html" title="fn detcore::netlink_audit::audit_sends_mutating_type">audit_<wbr>sends_<wbr>mutating_<wbr>type</a></dt><dd>The first mutating message type across a batch of datagrams
+(<code>sendmmsg</code>). Each datagram is classified on its own: the kernel
+parses every skb independently (<code>nlmsg_ok</code>/<code>nlmsg_next</code> per skb in
+<code>audit_receive</code>), so concatenating a batch into one buffer would let
+padding or an overlong header in one datagram hide the next.</dd><dt><a class="fn" href="fn.sanitize_audit_reply.html" title="fn detcore::netlink_audit::sanitize_audit_reply">sanitize_<wbr>audit_<wbr>reply</a></dt><dd>Zero the volatile <code>audit_status</code> fields in a NETLINK_AUDIT GET reply,
+in place. Returns whether the buffer was modified.</dd></dl></section></div></main></body></html>

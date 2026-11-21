@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["PrepareError","ProducerIdentity"],"fn":["admit_identity","combined_identity","validate_run_clock"],"struct":["ClockSources","CommittedClock","ValidatedClock"]};

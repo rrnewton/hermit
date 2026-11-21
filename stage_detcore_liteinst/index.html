@@ -1,0 +1,171 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Finalize the ordinary packaged Detcore preload after the outer Cargo build. This executable must never be called by a Cargo build script."><title>stage_detcore_liteinst - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../" data-static-root-path="../static.files/" data-current-crate="stage_detcore_liteinst" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../static.files/storage-41dd4d93.js"></script><script defer src="../crates.js"></script><script defer src="../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../static.files/favicon-044be391.svg"></head><body class="rustdoc mod crate"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Crate stage_detcore_liteinst</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../stage_detcore_liteinst/index.html">stage_<wbr>detcore_<wbr>liteinst</a><span class="version">0.5.7</span></h2></div><div class="sidebar-elems"><ul class="block"><li><a id="all-types" href="all.html">All Items</a></li></ul><section id="rustdoc-toc"><h3><a href="#structs">Crate Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#enums" title="Enums">Enums</a></li><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1>Crate <span>stage_<wbr>detcore_<wbr>liteinst</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../src/stage_detcore_liteinst/stage-detcore-liteinst.rs.html#1-2033">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Finalize the ordinary packaged Detcore preload after the outer Cargo build.
+This executable must never be called by a Cargo build script.</p>
+<p><code>--prebuilt &lt;so&gt;</code> stages an existing runtime file instead of the Cargo
+output, but only after the unchanged fixed build and qualification have
+run and the prebuilt bytes prove identical to the qualified artifact.
+Any other bytes are refused: this receipt attests the fixed
+<code>liteinst-runtime</code> build, and no second provenance can be recorded in it.</p>
+<p><code>--buck</code> qualifies a supplied Buck <code>.so</code> directly against Buck-declared
+sources and publishes the <code>builder=buck2</code> receipt arm that
+<code>ci/verify-packaged-detcore.py</code> pins. This fbsource build compiles
+<code>reverie-liteinst-artifact</code> from the sibling <code>//hermetic_infra/reverie</code>
+target, which carries the Buck declared-content authority
+(<code>resolve_buck</code> / <code>with_buck_build</code>), so <code>--buck</code> runs that sequence
+here; the Hermit-pinned git build still refuses by name until a Reverie
+pin bump carries the authority there. Like the Cargo arm runs cargo,
+<code>--buck</code> runs the one pinned buck2 build itself, through the retained
+command runner with <code>--show-full-output</code>, and <code>with_buck_build</code>
+binds the runner’s own last retained record of that run — there is
+no command or digest parameter a caller could fill in: the ELF path
+is parsed from the retained buck2 stdout and its digest computed
+from the stdout-derived file inside <code>with_buck_build</code> (this process
+computes the same digest again only for the receipt). A context that cannot run buck2 — for example a
+Buck genrule action, which buck2 is already driving — cannot use this
+mode; the genrule keeps the Cargo <code>--prebuilt</code> gate and its by-name
+refusal instead. Still PLUMBING ONLY and
+unqualified: the D1c-2/D1c-6 machine-code recipes refuse the real
+Buck-built ELF by name inside qualification, and the fbcode profile
+does not yet deliver its pinned rustc flags to the closure (see
+<code>require_profile_flags_applied</code>), so no Buck receipt has ever been
+emitted.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.BuckArgs.html" title="struct stage_detcore_liteinst::BuckArgs">Buck<wbr>Args</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>Explicit Buck-mode inputs. Buck mode derives nothing from
+<code>CARGO_MANIFEST_DIR</code> or any <code>Cargo.toml</code>: the roots, pins, profile,
+target literals and declared source file lists are arguments, so the
+fbsource import (which drops every manifest) can spell them all. The
+artifact path and digest are not arguments: the finalizer runs the
+pinned buck2 build itself in <code>--buck-cwd</code>, parses the ELF path from
+the retained <code>--show-full-output</code> stdout, and computes the digest
+from those bytes.</dd><dt><a class="struct" href="struct.BuckReceiptSections.html" title="struct stage_detcore_liteinst::BuckReceiptSections">Buck<wbr>Receipt<wbr>Sections</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The produced sections of the <code>builder=buck2</code> receipt: the qualification
+evidence plus the publication outcome (the installed identity and the
+executed <code>commands</code> — the <code>buck2</code> producer run and the qualifier’s
+readelf/objdump runs, which the verifier binds exactly).</dd></dl><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.Mode.html" title="enum stage_detcore_liteinst::Mode">Mode</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>One finalizer invocation: either a Cargo mode (<code>--git</code> / <code>--source-copy</code>,
+optionally staging byte-identical <code>--prebuilt</code> output) or the <code>--buck</code>
+mode for a supplied Buck <code>.so</code>, qualified directly against Buck-declared
+sources. The modes never mix: the byte-identity gate belongs to
+<code>--prebuilt</code> Cargo mode only, and Buck mode never runs a Cargo build.</dd></dl><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.BUCK_CONSTRAINTS.html" title="constant stage_detcore_liteinst::BUCK_CONSTRAINTS">BUCK_<wbr>CONSTRAINTS</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dt><a class="constant" href="constant.BUCK_PLATFORM.html" title="constant stage_detcore_liteinst::BUCK_PLATFORM">BUCK_<wbr>PLATFORM</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dt><a class="constant" href="constant.BUCK_PROFILE_RELATIVE.html" title="constant stage_detcore_liteinst::BUCK_PROFILE_RELATIVE">BUCK_<wbr>PROFILE_<wbr>RELATIVE</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dt><a class="constant" href="constant.BUCK_RUSTC_FLAGS.html" title="constant stage_detcore_liteinst::BUCK_RUSTC_FLAGS">BUCK_<wbr>RUSTC_<wbr>FLAGS</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The reviewed Buck <code>liteinst-runtime</code> flag set: release opt 3 with debug
+assertions and overflow checks on, and no <code>-Clto</code> at all (matching the
+Cargo profile’s <code>lto = false</code>, which also passes no flag).</dd><dt><a class="constant" href="constant.BUCK_TARGET.html" title="constant stage_detcore_liteinst::BUCK_TARGET">BUCK_<wbr>TARGET</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>Buck literals pinned with exact equality by the verifier’s Buck arm in
+<code>ci/verify-packaged-detcore.py</code>. The finalizer refuses any other spelling
+rather than emitting a receipt its own reader would reject. The target
+is the profiled <code>detcore-liteinst-liteinst-runtime</code> alias at its
+<code>[cdylib]</code> output; the constraints, sorted, are the runtime target’s
+declared cpu/os compatibility plus that alias’s opt build-mode
+constraint (<code>fb-only/liteinst-runtime-profile.bzl</code>).</dd><dt><a class="constant" href="constant.BUCK_WORKSPACE_BUCK_FILE.html" title="constant stage_detcore_liteinst::BUCK_WORKSPACE_BUCK_FILE">BUCK_<wbr>WORKSPACE_<wbr>BUCK_<wbr>FILE</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>Workspace-relative entries <code>resolve_buck</code> requires in the pinned
+workspace inventory beyond the CLI-declared sources: the declaring
+<code>BUCK</code> file and the runtime profile, hashed from the pinned workspace
+tree (never from the <code>--profile-bzl</code> argument).</dd><dt><a class="constant" href="constant.DF_BIND_NOW.html" title="constant stage_detcore_liteinst::DF_BIND_NOW">DF_<wbr>BIND_<wbr>NOW</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dt><a class="constant" href="constant.DF_TEXTREL.html" title="constant stage_detcore_liteinst::DF_TEXTREL">DF_<wbr>TEXTREL</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd><code>DT_FLAGS</code> bits this finalizer names before qualification, so a
+loader-contract refusal says which flag failed instead of only that
+the flags were unsupported. <code>DF_TEXTREL</code> (0x4) with <code>DF_BIND_NOW</code>
+(0x8) is <code>0xc</code>, the real fbcode-built ELF’s value.</dd><dt><a class="constant" href="constant.FORBIDDEN_NEEDED.html" title="constant stage_detcore_liteinst::FORBIDDEN_NEEDED">FORBIDDEN_<wbr>NEEDED</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd><code>DT_NEEDED</code> sonames the loader contract never admits on this runtime:
+the cxx-driver and sysroot baggage the Rust closure does not
+reference (libstdc++, libatomic, libmvec) and, since the <code>-u</code>
+extraction from static libgcc, libgcc_s. <code>libm</code>/<code>libc</code>/<code>ld-linux</code>
+are genuinely referenced and stay.</dd><dt><a class="constant" href="constant.REVERIE_GIT_REPOSITORY.html" title="constant stage_detcore_liteinst::REVERIE_GIT_REPOSITORY">REVERIE_<wbr>GIT_<wbr>REPOSITORY</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The one named Reverie repository this staging build’s
+compiled-source qualification expects (see the same-named
+constant in liteinst-runtime-build).</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.buck_argv.html" title="fn stage_detcore_liteinst::buck_argv">buck_<wbr>argv</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The one buck2 invocation <code>--buck</code> runs and the receipt may attest:
+the pinned build subcommand, target and platform, with
+<code>--show-full-output</code> so the ELF is selected from the retained stdout
+(<code>parse_buck_output</code>) rather than named by any caller. This list is a
+validation pin for the retained runner record, never a synthesized
+witness: the record bound into qualification is the runner’s own.</dd><dt><a class="fn" href="fn.buck_artifact.html" title="fn stage_detcore_liteinst::buck_artifact">buck_<wbr>artifact</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The <code>buck_artifact</code> mirror of the Cargo receipt’s artifact record: the
+ordinary (empty) feature mode, the exact compiler profile the Buck flag
+set produces, the synthesized leaf package, and the Buck output path the
+qualification proof must name. There is no <code>fresh</code>: Buck has no such
+notion to report honestly.</dd><dt><a class="fn" href="fn.buck_profile_objects.html" title="fn stage_detcore_liteinst::buck_profile_objects">buck_<wbr>profile_<wbr>objects</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dt><a class="fn" href="fn.buck_receipt.html" title="fn stage_detcore_liteinst::buck_receipt">buck_<wbr>receipt</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The complete <code>builder=buck2</code> receipt body, including the installed
+identity, the executed commands and the source-close outcome. It
+carries no <code>cargo_*</code> key and synthesizes no Cargo value;
+<code>profile_inputs</code> is the profile <code>.bzl</code> identity, which is also the Buck
+compiled-sources manifest slot, and <code>rustc_version</code> is the ELF
+<code>.comment</code> identity read at qualification time. <code>buck_argv</code> is the
+retained runner record’s program plus its arguments, and
+<code>buck_output_sha256</code> the digest this process computed from the ELF
+the retained stdout named; the verifier binds both to the installed
+bytes.</dd><dt><a class="fn" href="fn.buck_rustc_version.html" title="fn stage_detcore_liteinst::buck_rustc_version">buck_<wbr>rustc_<wbr>version</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The single <code>rustc version ...</code> identity in an ELF <code>.comment</code> dump
+(<code>readelf -p .comment</code>): the compiler that produced the Buck artifact,
+read from its bytes rather than from this host’s <code>rustc</code>. Zero or
+several distinct identities refuse by name.</dd><dt><a class="fn" href="fn.close.html" title="fn stage_detcore_liteinst::close">close</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dt><a class="fn" href="fn.consumer_source_declaration.html" title="fn stage_detcore_liteinst::consumer_source_declaration">consumer_<wbr>source_<wbr>declaration</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>This consumer’s declared workspace facts for the compiled-source
+factories: the Reverie tree’s relative path, the leaf package, the
+producer packages and their lockfile, and both workspace
+inventories, spelled exactly as this tree’s manifests name them.</dd><dt><a class="fn" href="fn.dt_flags_from_readelf.html" title="fn stage_detcore_liteinst::dt_flags_from_readelf">dt_<wbr>flags_<wbr>from_<wbr>readelf</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd><code>DT_FLAGS</code> from a <code>readelf -d</code> dump: the <code>(FLAGS)</code> entry’s symbolic
+names mapped back to their bits. No <code>(FLAGS)</code> entry is zero flags; a
+names list this cannot read still yields the bits it does name, so a
+TEXTREL spelling is never lost.</dd><dt><a class="fn" href="fn.dt_flags_refusal.html" title="fn stage_detcore_liteinst::dt_flags_refusal">dt_<wbr>flags_<wbr>refusal</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The refusal for a <code>DT_FLAGS</code> value, if any: TEXTREL names itself.
+This only ever refuses earlier and more specifically; the shared
+qualifier’s loader contract still decides admission.</dd><dt><a class="fn" href="fn.is_full_sha.html" title="fn stage_detcore_liteinst::is_full_sha">is_<wbr>full_<wbr>sha</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dt><a class="fn" href="fn.main.html" title="fn stage_detcore_liteinst::main">main</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dt><a class="fn" href="fn.needed_from_readelf.html" title="fn stage_detcore_liteinst::needed_from_readelf">needed_<wbr>from_<wbr>readelf</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The <code>DT_NEEDED</code> sonames in a <code>readelf -d</code> dump, in dump order: the
+<code>[soname]</code> of each <code>(NEEDED)</code> entry. An entry this cannot read
+yields no soname for that line, never a fabricated one.</dd><dt><a class="fn" href="fn.needed_refusal.html" title="fn stage_detcore_liteinst::needed_refusal">needed_<wbr>refusal</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The refusal for a <code>DT_NEEDED</code> list, if any: each forbidden soname
+names itself. Like <code>dt_flags_refusal</code>, this only ever refuses
+earlier and more specifically; the shared qualifier’s loader
+contract still decides admission.</dd><dt><a class="fn" href="fn.parse_args.html" title="fn stage_detcore_liteinst::parse_args">parse_<wbr>args</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The arguments after the program name: the mode, the target directory, and
+the mode’s own inputs.</dd><dt><a class="fn" href="fn.parse_buck_args.html" title="fn stage_detcore_liteinst::parse_buck_args">parse_<wbr>buck_<wbr>args</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dt><a class="fn" href="fn.parse_buck_output.html" title="fn stage_detcore_liteinst::parse_buck_output">parse_<wbr>buck_<wbr>output</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The single ELF path a retained <code>buck2 build --show-full-output</code> stdout
+names for the pinned target: exactly one nonempty line, of the form
+<code>&lt;target&gt; &lt;absolute output path&gt;</code>, where the target is the pinned
+literal (buck2 may print it cell-qualified, <code>fbcode//...</code>). Anything
+else — no output, several outputs, another target, a relative path —
+refuses by name; the ELF is never taken from a caller argument.</dd><dt><a class="fn" href="fn.parse_reverie_pin.html" title="fn stage_detcore_liteinst::parse_reverie_pin">parse_<wbr>reverie_<wbr>pin</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>Extract the single Reverie revision a manifest pins, or <code>None</code> if the
+manifest names zero revisions, more than one distinct revision, or names
+Reverie on a line whose revision cannot be parsed.</dd><dt><a class="fn" href="fn.pin_full_sha.html" title="fn stage_detcore_liteinst::pin_full_sha">pin_<wbr>full_<wbr>sha</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dt><a class="fn" href="fn.pin_git.html" title="fn stage_detcore_liteinst::pin_git">pin_git</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dt><a class="fn" href="fn.pinned_workspace_files.html" title="fn stage_detcore_liteinst::pinned_workspace_files">pinned_<wbr>workspace_<wbr>files</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>Pinned expectation digests for <code>resolve_buck</code>: the CLI
+<code>--workspace-file</code> list, with <code>BUCK</code> and
+<code>fb-only/liteinst-runtime-profile.bzl</code> appended if absent (dedup,
+preserving order), each hashed from the pinned workspace tree. The
+profile entry is hashed from <code>workspace_root</code>, never from the
+<code>--profile-bzl</code> argument, so <code>resolve_buck</code> can tie that argument’s
+identity to this inventory entry and refuse a mismatch there.</dd><dt><a class="fn" href="fn.profile_bzl_flags.html" title="fn stage_detcore_liteinst::profile_bzl_flags">profile_<wbr>bzl_<wbr>flags</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The <code>LITEINST_RUNTIME_RUSTC_FLAGS</code> string list a profile <code>.bzl</code> actually
+defines: the quoted literals of its first <code>[...]</code> list after that name.
+Anything else — no such definition, or a list this cannot read — refuses
+by name rather than trusting the file’s name alone.</dd><dt><a class="fn" href="fn.require.html" title="fn stage_detcore_liteinst::require">require</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dt><a class="fn" href="fn.require_profile_flags_applied.html" title="fn stage_detcore_liteinst::require_profile_flags_applied">require_<wbr>profile_<wbr>flags_<wbr>applied</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>A receipt may list <code>LITEINST_RUNTIME_RUSTC_FLAGS</code> only when the
+supplied profile actually delivers them to the transitive closure.
+The profile <code>.bzl</code> states this as <code>LITEINST_RUNTIME_FLAGS_APPLIED</code>:
+the fbcode profile sets it <code>False</code> — <code>fbcode_configured_alias</code>
+transitions platform and constraints only, it has no rustc-flags
+parameter, and no fbcode build-mode constraint encodes this flag
+list (the Reverie authority also pins exactly the alias’s three
+constraints, so none can be added here) — while the OSS shim profile,
+whose toolchain select applies the list, sets it <code>True</code>. Checked at
+receipt publication, where the flags would be listed: anything but
+an explicit <code>True</code> refuses by name and no receipt is emitted.</dd><dt><a class="fn" href="fn.reverie_checkout_head.html" title="fn stage_detcore_liteinst::reverie_checkout_head">reverie_<wbr>checkout_<wbr>head</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The submodule checkout’s HEAD: the Reverie sources a build in this
+tree actually compiles. Requires an initialized submodule
+(<code>reverie/.git</code> present, so Git cannot discover the superproject
+instead and answer for the wrong repository).</dd><dt><a class="fn" href="fn.reverie_gitlink_pin.html" title="fn stage_detcore_liteinst::reverie_gitlink_pin">reverie_<wbr>gitlink_<wbr>pin</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The Reverie revision recorded by the <code>reverie</code> submodule gitlink of the
+checkout rooted at <code>root</code>, or <code>None</code> when it cannot be read: the index
+entry when an advance is staged, else HEAD’s tree entry — the same
+pair <code>scripts/check-reverie-pin.rs</code> reads. Fallback only (see
+<code>reverie_pin_at</code>): provenance for trees with no submodule checkout
+and no marker (tarballs, uninitialized submodules), where the value
+degrades to <code>"unknown"</code> at callers exactly as an unparseable
+manifest did.</dd><dt><a class="fn" href="fn.reverie_is_path_sourced.html" title="fn stage_detcore_liteinst::reverie_is_path_sourced">reverie_<wbr>is_<wbr>path_<wbr>sourced</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>Whether the root manifest spells its Reverie dependencies by path
+(<code>true</code>) or by git revision (<code>false</code>); both or neither refuses.</dd><dt><a class="fn" href="fn.reverie_layout.html" title="fn stage_detcore_liteinst::reverie_layout">reverie_<wbr>layout</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The compiled-source layout for this workspace, selecting the pin
+proof and the recorded inventory: the content-only
+<code>PathCheckout</code> layout only for a gitless path-sourced Reverie root;
+a root carrying its own Git metadata takes <code>GitlinkCheckout</code> even when
+the manifests spell path dependencies, so the content factory’s
+pin proof (HEAD and gitlink equal to the pin) always runs for a
+real checkout. The manifest spelling is a separate fact: the
+factory observes it from fresh metadata and binds each spelling
+exactly.</dd><dt><a class="fn" href="fn.reverie_marker_pin.html" title="fn stage_detcore_liteinst::reverie_marker_pin">reverie_<wbr>marker_<wbr>pin</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The pin recorded by the Eden/Sapling marker, <code>reverie.submodule.txt</code>
+holding exactly <code>Subproject commit &lt;40-hex&gt;</code> on one line — the only
+spelling CodeSync produces or consumes. Anything else yields <code>None</code>
+(fall through), never a partial read.</dd><dt><a class="fn" href="fn.reverie_pin_at.html" title="fn stage_detcore_liteinst::reverie_pin_at">reverie_<wbr>pin_<wbr>at</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The Reverie pin of the checkout rooted at <code>root</code>, in the order the
+build actually sees the sources: submodule checkout HEAD, Eden
+marker, recorded gitlink, pre-migration manifest. <code>None</code> renders
+as <code>"unknown"</code> at callers.</dd><dt><a class="fn" href="fn.reverie_repository.html" title="fn stage_detcore_liteinst::reverie_repository">reverie_<wbr>repository</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dt><a class="fn" href="fn.reverie_root_has_git_metadata.html" title="fn stage_detcore_liteinst::reverie_root_has_git_metadata">reverie_<wbr>root_<wbr>has_<wbr>git_<wbr>metadata</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>Whether the Reverie root carries its own Git metadata: a <code>.git</code>
+directory or file at the Reverie root itself, the same test the
+content factory’s pin proof uses for its canonical root. No
+parent-directory discovery: a gitless copy nested in an unrelated
+checkout must not inherit that checkout’s metadata.</dd><dt><a class="fn" href="fn.run.html" title="fn stage_detcore_liteinst::run">run</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dt><a class="fn" href="fn.run_buck.html" title="fn stage_detcore_liteinst::run_buck">run_<wbr>buck</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>Buck mode: run the pinned buck2 build and qualify its ELF directly
+against Buck-declared sources — no Cargo build and no byte-identity
+gate. The buck2 invocation runs through the retained-command runner
+with <code>--show-full-output</code>; <code>with_buck_build(&amp;runner, elf)</code> binds the
+runner’s own last retained record of that run and computes the ELF
+digest from the stdout-derived file itself. No caller-filled
+command, artifact path or hash reaches qualification. Then
+<code>qualify_detcore_constructor_with_sources</code>, and stage + publish
+<a href="fn.buck_receipt.html" title="fn stage_detcore_liteinst::buck_receipt"><code>buck_receipt</code></a> exactly as the Cargo arm publishes its receipt. The
+sibling fbcode <code>reverie-liteinst-artifact</code> this binary compiles
+against carries that authority; the D1c-2/D1c-6 machine-code recipes
+still refuse the real Buck-built ELF by name inside qualification,
+before anything is staged.</dd><dt><a class="fn" href="fn.validate_buck_args.html" title="fn stage_detcore_liteinst::validate_buck_args">validate_<wbr>buck_<wbr>args</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>Argument checks that need no source authority and no filesystem: the pins
+are full lowercase-hex SHAs, the Buck literals are exactly the verifier’s,
+the profile input names the reviewed <code>.bzl</code>, and the declared file lists
+are nonempty logical relative paths naming at least the leaf and the
+qualifier sources the closed factory will hash.</dd><dt><a class="fn" href="fn.validate_profile_bzl.html" title="fn stage_detcore_liteinst::validate_profile_bzl">validate_<wbr>profile_<wbr>bzl</a><span title="Restricted Visibility">&nbsp;🔒</span> </dt><dd>The supplied profile must define exactly the pinned flag list, in order.</dd></dl></section></div></main></body></html>

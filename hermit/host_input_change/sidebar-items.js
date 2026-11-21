@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["explains_divergence","find_pattern_difference","open_position","open_position_for_path","read_host_inputs"],"struct":["HostInputs","PatternDifference"]};

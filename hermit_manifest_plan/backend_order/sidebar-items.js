@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["EXCEPTIONS_PATH","EXCEPTIONS_SCHEMA"],"enum":["OrderRule"],"fn":["check","check_checkout","parse_exceptions","prerequisite","required_cells","summary","violations"],"struct":["Exception","Violation"]};

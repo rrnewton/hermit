@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["FAILURE_SUBCATEGORIES"],"enum":["Kind"],"fn":["emit","failure_signature","retry_attempts_from_rollup"],"struct":["GitLedgerConnector","Record"],"trait":["Connector"]};

@@ -1,0 +1,30 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="The evidence that `history`, the finished attempts of `cell` after its retries, measured nothing about Hermit: this host’s own program interpreter refused the CPU Hermit presented, in every run of every attempt, and another host could have run it. `None` keeps the cell’s result. All of these must hold:"><title>interpreter_refusal_evidence in hermit_manifest_plan::runner - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="hermit_manifest_plan" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc fn"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">interpreter_refusal_evidence</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../hermit_manifest_plan/index.html">hermit_<wbr>manifest_<wbr>plan</a><span class="version">0.5.7</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In hermit_<wbr>manifest_<wbr>plan::<wbr>runner</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">hermit_manifest_plan</a>::<wbr><a href="index.html">runner</a></div><h1>Function <span class="fn">interpreter_<wbr>refusal_<wbr>evidence</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/hermit_manifest_plan/runner.rs.html#10316-10364">Source</a> </span></div><pre class="rust item-decl"><code>pub fn interpreter_refusal_evidence(
+    cell: &amp;<a class="struct" href="struct.SelectedCell.html" title="struct hermit_manifest_plan::runner::SelectedCell">SelectedCell</a>,
+    history: &amp;[<a class="struct" href="struct.CellResult.html" title="struct hermit_manifest_plan::runner::CellResult">CellResult</a>],
+) -&gt; <a class="enum" href="https://doc.rust-lang.org/1.97.1/core/option/enum.Option.html" title="enum core::option::Option">Option</a>&lt;<a class="struct" href="struct.InterpreterRefusalEvidence.html" title="struct hermit_manifest_plan::runner::InterpreterRefusalEvidence">InterpreterRefusalEvidence</a>&gt;</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>The evidence that <code>history</code>, the finished attempts of <code>cell</code> after its
+retries, measured nothing about Hermit: this host’s own program
+interpreter refused the CPU Hermit presented, in every run of every
+attempt, and another host could have run it. <code>None</code> keeps the cell’s
+result. All of these must hold:</p>
+<ul>
+<li><code>cell</code> declares no image, so the interpreter is this host’s;</li>
+<li>every attempt is a FAIL with runs, and no run ran inside an image
+(<code>runs_inside_an_image</code>): no v2 retry ran, because the cell was not
+eligible for it or the run had no rootfs. A v2 retry refused before
+launch (<a href="fn.is_v2_retry_refusal.html" title="fn hermit_manifest_plan::runner::is_v2_retry_refusal"><code>is_v2_retry_refusal</code></a>) is an ERROR row with no runs, so it
+keeps the cell’s result too;</li>
+<li>every run of every attempt is a loader rejection whose evidence names
+the level its interpreter needs and the CPU profile Hermit presented
+and why (<code>attempt_interpreter_refusal</code>), and every run names the same
+level, profile and reason;</li>
+<li>that refusal is one another host could avoid
+(<code>host_dependent_refusal_error</code>): the level is above the presented
+profile’s and no higher than x86-64-v3, and the host chose the profile.</li>
+</ul>
+<p>A level that is not above the presented one (glibc naming x86-64-v2 under
+x86-64-v2: Hermit presented a CPU short of its own profile), a profile the
+evidence does not name, a profile chosen for another reason than the host
+(an <code>explicit</code> x86-64-v2, say), any run whose guest started, or a v2 retry
+keeps the FAIL. Requiring this of every attempt, not only the last, keeps
+a failure an earlier attempt measured.</p>
+</div></details></section></div></main></body></html>

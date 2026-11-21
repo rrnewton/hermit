@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["PostCrashCause","PostCrashEvent"],"fn":["admission_refusal","is_crash_signal"],"struct":["PostCrashState","PostCrashSwitch"]};

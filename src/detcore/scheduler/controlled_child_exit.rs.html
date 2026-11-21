@@ -1,0 +1,406 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `detcore/src/scheduler/controlled_child_exit.rs`."><title>controlled_child_exit.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../static.files/src-script-813739b1.js"></script><script defer src="../../../src-files.js"></script><script defer src="../../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">detcore/scheduler/</div>controlled_child_exit.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="comment">/*
+<a href=#2 id=2 data-nosnippet>2</a> * Copyright (c) Meta Platforms, Inc. and affiliates.
+<a href=#3 id=3 data-nosnippet>3</a> * All rights reserved.
+<a href=#4 id=4 data-nosnippet>4</a> *
+<a href=#5 id=5 data-nosnippet>5</a> * This source code is licensed under the BSD-style license found in the
+<a href=#6 id=6 data-nosnippet>6</a> * LICENSE file in the root directory of this source tree.
+<a href=#7 id=7 data-nosnippet>7</a> */
+<a href=#8 id=8 data-nosnippet>8</a>
+<a href=#9 id=9 data-nosnippet>9</a></span><span class="doccomment">//! The child-exit `SIGCHLD` of a controlled exit, decided by the scheduler
+<a href=#10 id=10 data-nosnippet>10</a>//! (SIGSHARE S4, single-threaded parents; design
+<a href=#11 id=11 data-nosnippet>11</a>//! `ai_docs/2026-10-29-kvm-sigshare-design.md`, sections 7.3, 8.4 and 10).
+<a href=#12 id=12 data-nosnippet>12</a>//!
+<a href=#13 id=13 data-nosnippet>13</a>//! On a backend that owns signal delivery (`provides_process_signal_control`,
+<a href=#14 id=14 data-nosnippet>14</a>//! KVM) every exit is `Controlled`: the backend publishes the child's exit to
+<a href=#15 id=15 data-nosnippet>15</a>//! its parent itself, inside the child-exit reservation the exit grant
+<a href=#16 id=16 data-nosnippet>16</a>//! installs (`signal_control.rs`), and before this module Detcore took no
+<a href=#17 id=17 data-nosnippet>17</a>//! decision of its own. ptrace's parent instead gets the scheduler's
+<a href=#18 id=18 data-nosnippet>18</a>//! decision: a classification at the child's `Exit` grant
+<a href=#19 id=19 data-nosnippet>19</a>//! (`classify_child_exit_notification`), a `ChildExit` timer one nanosecond
+<a href=#20 id=20 data-nosnippet>20</a>//! after it, and at the timer's pop the same send path as any scheduler
+<a href=#21 id=21 data-nosnippet>21</a>//! signal (`fire_child_exit_alarm` -&gt; `fire_alarm_at` -&gt; `send_guest_signal`),
+<a href=#22 id=22 data-nosnippet>22</a>//! which logs the decision and wakes a parked parent.
+<a href=#23 id=23 data-nosnippet>23</a>//!
+<a href=#24 id=24 data-nosnippet>24</a>//! Here a controlled exit whose parent has one live thread takes that same
+<a href=#25 id=25 data-nosnippet>25</a>//! path. Only the physical act differs, the design's "sink": the backend's
+<a href=#26 id=26 data-nosnippet>26</a>//! publication is the physical send, and it has already happened when the
+<a href=#27 id=27 data-nosnippet>27</a>//! timer pops, because the reservation is a control barrier and the timer
+<a href=#28 id=28 data-nosnippet>28</a>//! pops only at a maintenance step, which the controlled turn loop runs only
+<a href=#29 id=29 data-nosnippet>29</a>//! with the barrier down (`do_a_turn_blocking`). So `send_guest_signal` sends
+<a href=#30 id=30 data-nosnippet>30</a>//! nothing on such a backend; it takes the publication's effect instead
+<a href=#31 id=31 data-nosnippet>31</a>//! ([`Scheduler::child_exit_sink`]):
+<a href=#32 id=32 data-nosnippet>32</a>//! - `Queued`: the copy is pending. The parent is woken as on ptrace when
+<a href=#33 id=33 data-nosnippet>33</a>//!   the copy interrupts its wait (unblocked, and caught or default-fatal);
+<a href=#34 id=34 data-nosnippet>34</a>//!   an unblocked ignored copy is logged as ptrace's discard, and a blocked
+<a href=#35 id=35 data-nosnippet>35</a>//!   one wakes nothing ([`Scheduler::queued_sigchld_fate`]);
+<a href=#36 id=36 data-nosnippet>36</a>//! - `Coalesced`: Linux does not queue a standard signal already pending
+<a href=#37 id=37 data-nosnippet>37</a>//!   (`legacy_queue`), so no thread is woken, as `note_group_send` decides on
+<a href=#38 id=38 data-nosnippet>38</a>//!   ptrace;
+<a href=#39 id=39 data-nosnippet>39</a>//! - `SuppressedExplicitIgnore` or `DiscardedByDispositionChange`: Linux sent
+<a href=#40 id=40 data-nosnippet>40</a>//!   nothing, logged as the discarded-at-send record does on ptrace, and no
+<a href=#41 id=41 data-nosnippet>41</a>//!   thread is woken.
+<a href=#42 id=42 data-nosnippet>42</a>//!
+<a href=#43 id=43 data-nosnippet>43</a>//! The decision and the effect are checked against each other when the
+<a href=#44 id=44 data-nosnippet>44</a>//! publication completes ([`Scheduler::check_child_exit_publication`]). A
+<a href=#45 id=45 data-nosnippet>45</a>//! disagreement Linux cannot produce ends the run by name
+<a href=#46 id=46 data-nosnippet>46</a>//! (`sigchld-decision-mismatch`), never a silent difference. One disagreement
+<a href=#47 id=47 data-nosnippet>47</a>//! is expected and allowed: a default-ignored, unblocked `SIGCHLD`, which
+<a href=#48 id=48 data-nosnippet>48</a>//! Linux discards at generation (`Discard`), is queued by the backend
+<a href=#49 id=49 data-nosnippet>49</a>//! (design G8; S0 correction 2).
+<a href=#50 id=50 data-nosnippet>50</a>//!
+<a href=#51 id=51 data-nosnippet>51</a>//! A parent with more than one live thread takes the same path where the
+<a href=#52 id=52 data-nosnippet>52</a>//! scheduler models signal targets (SIGSHARE S3b): the timer's send goes to
+<a href=#53 id=53 data-nosnippet>53</a>//! the thread Linux's `complete_signal` chooses (`kernel_sigchld_target`),
+<a href=#54 id=54 data-nosnippet>54</a>//! which is woken and resumed first (`sigchld_takers`). Elsewhere it keeps the
+<a href=#55 id=55 data-nosnippet>55</a>//! backend's decision, as before.
+<a href=#56 id=56 data-nosnippet>56</a>
+<a href=#57 id=57 data-nosnippet>57</a></span><span class="kw">use </span>std::collections::BTreeMap;
+<a href=#58 id=58 data-nosnippet>58</a>
+<a href=#59 id=59 data-nosnippet>59</a><span class="kw">use </span>reverie::ChildExitPublication;
+<a href=#60 id=60 data-nosnippet>60</a><span class="kw">use </span>reverie::ChildExitPublicationEffect;
+<a href=#61 id=61 data-nosnippet>61</a><span class="kw">use </span>tracing::info;
+<a href=#62 id=62 data-nosnippet>62</a>
+<a href=#63 id=63 data-nosnippet>63</a><span class="kw">use </span><span class="kw">super</span>::ChildExitNotification;
+<a href=#64 id=64 data-nosnippet>64</a><span class="kw">use </span><span class="kw">super</span>::Scheduler;
+<a href=#65 id=65 data-nosnippet>65</a><span class="kw">use </span><span class="kw">super</span>::signal_control::ExitReserveMode;
+<a href=#66 id=66 data-nosnippet>66</a><span class="kw">use </span><span class="kw">crate</span>::syscalls::reads_signal_state_from_backend;
+<a href=#67 id=67 data-nosnippet>67</a><span class="kw">use </span><span class="kw">crate</span>::types::DetPid;
+<a href=#68 id=68 data-nosnippet>68</a><span class="kw">use </span><span class="kw">crate</span>::types::DetTid;
+<a href=#69 id=69 data-nosnippet>69</a>
+<a href=#70 id=70 data-nosnippet>70</a><span class="doccomment">/// The scheduler's child-exit decisions for controlled exits, from the
+<a href=#71 id=71 data-nosnippet>71</a>/// child's `Exit` grant to its `ChildExit` timer's pop.
+<a href=#72 id=72 data-nosnippet>72</a>///
+<a href=#73 id=73 data-nosnippet>73</a>/// Every entry is made and removed at a committed point under the scheduler
+<a href=#74 id=74 data-nosnippet>74</a>/// mutex: the grant, the publication's completion (inside the reservation's
+<a href=#75 id=75 data-nosnippet>75</a>/// control barrier, before any later turn), and the timer's pop.
+<a href=#76 id=76 data-nosnippet>76</a></span><span class="attr">#[derive(Debug, Default)]
+<a href=#77 id=77 data-nosnippet>77</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">struct </span>ControlledChildExits {
+<a href=#78 id=78 data-nosnippet>78</a>    <span class="doccomment">/// The decision at each child's `Exit` grant, until its publication
+<a href=#79 id=79 data-nosnippet>79</a>    /// completes.
+<a href=#80 id=80 data-nosnippet>80</a>    </span>decisions: BTreeMap&lt;DetPid, ChildExitNotification&gt;,
+<a href=#81 id=81 data-nosnippet>81</a>    <span class="doccomment">/// The publication effect of each child whose `ChildExit` timer has yet to
+<a href=#82 id=82 data-nosnippet>82</a>    /// pop.
+<a href=#83 id=83 data-nosnippet>83</a>    </span>effects: BTreeMap&lt;DetPid, ChildExitPublicationEffect&gt;,
+<a href=#84 id=84 data-nosnippet>84</a>    <span class="doccomment">/// The child whose `ChildExit` timer is sending its `SIGCHLD` right now
+<a href=#85 id=85 data-nosnippet>85</a>    /// (`send_guest_signal`).
+<a href=#86 id=86 data-nosnippet>86</a>    </span>sending: <span class="prelude-ty">Option</span>&lt;DetPid&gt;,
+<a href=#87 id=87 data-nosnippet>87</a>    <span class="doccomment">/// A decision and an effect that disagree: the run is refused.
+<a href=#88 id=88 data-nosnippet>88</a>    </span>refusal: <span class="prelude-ty">Option</span>&lt;String&gt;,
+<a href=#89 id=89 data-nosnippet>89</a>}
+<a href=#90 id=90 data-nosnippet>90</a>
+<a href=#91 id=91 data-nosnippet>91</a><span class="doccomment">/// What a queued child-exit `SIGCHLD` does to its receiver's parked wait
+<a href=#92 id=92 data-nosnippet>92</a>/// (`Scheduler::queued_sigchld_fate`).
+<a href=#93 id=93 data-nosnippet>93</a></span><span class="attr">#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+<a href=#94 id=94 data-nosnippet>94</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">enum </span>QueuedSigchld {
+<a href=#95 id=95 data-nosnippet>95</a>    <span class="doccomment">/// Unblocked and caught (or its state unreadable): it ends the wait.
+<a href=#96 id=96 data-nosnippet>96</a>    </span>Interrupts,
+<a href=#97 id=97 data-nosnippet>97</a>    <span class="doccomment">/// Unblocked and ignored, explicitly or by default: Linux discards it at
+<a href=#98 id=98 data-nosnippet>98</a>    /// generation.
+<a href=#99 id=99 data-nosnippet>99</a>    </span>DiscardedAtGeneration,
+<a href=#100 id=100 data-nosnippet>100</a>    <span class="doccomment">/// Blocked: it stays pending, and the wait goes on.
+<a href=#101 id=101 data-nosnippet>101</a>    </span>StaysPending,
+<a href=#102 id=102 data-nosnippet>102</a>}
+<a href=#103 id=103 data-nosnippet>103</a>
+<a href=#104 id=104 data-nosnippet>104</a><span class="doccomment">/// Whether a child-exit publication's effect (and its waitability) agrees
+<a href=#105 id=105 data-nosnippet>105</a>/// with the scheduler's decision at the exit grant. `None` if it does,
+<a href=#106 id=106 data-nosnippet>106</a>/// otherwise why not.
+<a href=#107 id=107 data-nosnippet>107</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>child_exit_effect_mismatch(
+<a href=#108 id=108 data-nosnippet>108</a>    decision: ChildExitNotification,
+<a href=#109 id=109 data-nosnippet>109</a>    effect: ChildExitPublicationEffect,
+<a href=#110 id=110 data-nosnippet>110</a>    waitable: bool,
+<a href=#111 id=111 data-nosnippet>111</a>) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span><span class="lifetime">'static </span>str&gt; {
+<a href=#112 id=112 data-nosnippet>112</a>    <span class="kw">use </span>ChildExitNotification <span class="kw">as </span>N;
+<a href=#113 id=113 data-nosnippet>113</a>    <span class="kw">use </span>ChildExitPublicationEffect <span class="kw">as </span>E;
+<a href=#114 id=114 data-nosnippet>114</a>    <span class="kw">match </span>(decision, effect) {
+<a href=#115 id=115 data-nosnippet>115</a>        <span class="comment">// Linux sends nothing under an explicit SIG_IGN, and reaps the child
+<a href=#116 id=116 data-nosnippet>116</a>        // itself (`do_notify_parent`): no status remains to wait for.
+<a href=#117 id=117 data-nosnippet>117</a>        </span>(N::None, E::SuppressedExplicitIgnore) <span class="kw">if </span>!waitable =&gt; <span class="prelude-val">None</span>,
+<a href=#118 id=118 data-nosnippet>118</a>        (N::None, E::SuppressedExplicitIgnore) =&gt; {
+<a href=#119 id=119 data-nosnippet>119</a>            <span class="prelude-val">Some</span>(<span class="string">"the parent ignores SIGCHLD, but the child stayed waitable"</span>)
+<a href=#120 id=120 data-nosnippet>120</a>        }
+<a href=#121 id=121 data-nosnippet>121</a>        (N::None, <span class="kw">_</span>) =&gt; <span class="prelude-val">Some</span>(<span class="string">"the parent ignores SIGCHLD, but the backend did not suppress it"</span>),
+<a href=#122 id=122 data-nosnippet>122</a>        <span class="comment">// Linux discards a default-ignored, unblocked SIGCHLD at generation;
+<a href=#123 id=123 data-nosnippet>123</a>        // the backend queues it (design G8), which no wake follows.
+<a href=#124 id=124 data-nosnippet>124</a>        </span>(N::Discard, E::Queued | E::Coalesced) =&gt; <span class="prelude-val">None</span>,
+<a href=#125 id=125 data-nosnippet>125</a>        (N::Discard, <span class="kw">_</span>) =&gt; {
+<a href=#126 id=126 data-nosnippet>126</a>            <span class="prelude-val">Some</span>(<span class="string">"SIGCHLD is default-ignored, but the backend reports an explicit ignore"</span>)
+<a href=#127 id=127 data-nosnippet>127</a>        }
+<a href=#128 id=128 data-nosnippet>128</a>        (N::Deliver, E::Queued | E::Coalesced) =&gt; <span class="prelude-val">None</span>,
+<a href=#129 id=129 data-nosnippet>129</a>        (N::Deliver, <span class="kw">_</span>) =&gt; <span class="prelude-val">Some</span>(<span class="string">"SIGCHLD is delivered, but the backend did not queue it"</span>),
+<a href=#130 id=130 data-nosnippet>130</a>        (N::Undecided, <span class="kw">_</span>) =&gt; <span class="prelude-val">None</span>,
+<a href=#131 id=131 data-nosnippet>131</a>    }
+<a href=#132 id=132 data-nosnippet>132</a>}
+<a href=#133 id=133 data-nosnippet>133</a>
+<a href=#134 id=134 data-nosnippet>134</a><span class="attr">#[cfg(test)]
+<a href=#135 id=135 data-nosnippet>135</a></span><span class="kw">impl </span>ControlledChildExits {
+<a href=#136 id=136 data-nosnippet>136</a>    <span class="doccomment">/// The run's refusal, if one was made, without taking it.
+<a href=#137 id=137 data-nosnippet>137</a>    </span><span class="kw">pub</span>(<span class="kw">super</span>) <span class="kw">fn </span>refusal_for_test(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt; {
+<a href=#138 id=138 data-nosnippet>138</a>        <span class="self">self</span>.refusal.as_deref()
+<a href=#139 id=139 data-nosnippet>139</a>    }
+<a href=#140 id=140 data-nosnippet>140</a>}
+<a href=#141 id=141 data-nosnippet>141</a>
+<a href=#142 id=142 data-nosnippet>142</a><span class="kw">impl </span>Scheduler {
+<a href=#143 id=143 data-nosnippet>143</a>    <span class="doccomment">/// The decision recorded at `child`'s controlled exit grant, until its
+<a href=#144 id=144 data-nosnippet>144</a>    /// publication completes.
+<a href=#145 id=145 data-nosnippet>145</a>    </span><span class="attr">#[cfg(test)]
+<a href=#146 id=146 data-nosnippet>146</a>    </span><span class="kw">pub</span>(<span class="kw">super</span>) <span class="kw">fn </span>controlled_child_exits_decision(
+<a href=#147 id=147 data-nosnippet>147</a>        <span class="kw-2">&amp;</span><span class="self">self</span>,
+<a href=#148 id=148 data-nosnippet>148</a>        child: DetPid,
+<a href=#149 id=149 data-nosnippet>149</a>    ) -&gt; <span class="prelude-ty">Option</span>&lt;ChildExitNotification&gt; {
+<a href=#150 id=150 data-nosnippet>150</a>        <span class="self">self</span>.controlled_child_exits.decisions.get(<span class="kw-2">&amp;</span>child).copied()
+<a href=#151 id=151 data-nosnippet>151</a>    }
+<a href=#152 id=152 data-nosnippet>152</a>
+<a href=#153 id=153 data-nosnippet>153</a>    <span class="doccomment">/// Whether the scheduler decides the child-exit `SIGCHLD` of a controlled
+<a href=#154 id=154 data-nosnippet>154</a>    /// exit (`reserve_mode`) of `child` to `parent`: on a backend whose signal
+<a href=#155 id=155 data-nosnippet>155</a>    /// state Detcore reads from the backend, outside the in-guest delivery
+<a href=#156 id=156 data-nosnippet>156</a>    /// gate, for a child whose exit reserved its publication (the parent is
+<a href=#157 id=157 data-nosnippet>157</a>    /// live), when the parent has exactly one live thread, or when the
+<a href=#158 id=158 data-nosnippet>158</a>    /// scheduler models signal targets (`models_signal_targets`, SIGSHARE
+<a href=#159 id=159 data-nosnippet>159</a>    /// S3b), so that it chooses which of the parent's threads takes the
+<a href=#160 id=160 data-nosnippet>160</a>    /// signal as Linux's `complete_signal` does (`kernel_sigchld_target`).
+<a href=#161 id=161 data-nosnippet>161</a>    </span><span class="kw">pub</span>(<span class="kw">super</span>) <span class="kw">fn </span>decides_controlled_child_exit(
+<a href=#162 id=162 data-nosnippet>162</a>        <span class="kw-2">&amp;</span><span class="self">self</span>,
+<a href=#163 id=163 data-nosnippet>163</a>        reserve_mode: ExitReserveMode,
+<a href=#164 id=164 data-nosnippet>164</a>        child: DetPid,
+<a href=#165 id=165 data-nosnippet>165</a>        parent: DetPid,
+<a href=#166 id=166 data-nosnippet>166</a>    ) -&gt; bool {
+<a href=#167 id=167 data-nosnippet>167</a>        reserve_mode == ExitReserveMode::Controlled
+<a href=#168 id=168 data-nosnippet>168</a>            &amp;&amp; reads_signal_state_from_backend(<span class="kw-2">&amp;</span><span class="self">self</span>.backend)
+<a href=#169 id=169 data-nosnippet>169</a>            &amp;&amp; !<span class="self">self</span>.in_guest_signal_delivery
+<a href=#170 id=170 data-nosnippet>170</a>            &amp;&amp; <span class="self">self</span>.child_exit_reserved(child)
+<a href=#171 id=171 data-nosnippet>171</a>            &amp;&amp; (<span class="self">self</span>.models_signal_targets || <span class="self">self</span>.process_signal_targets(parent).len() == <span class="number">1</span>)
+<a href=#172 id=172 data-nosnippet>172</a>    }
+<a href=#173 id=173 data-nosnippet>173</a>
+<a href=#174 id=174 data-nosnippet>174</a>    <span class="doccomment">/// Record the scheduler's decision at the controlled `Exit` grant of
+<a href=#175 id=175 data-nosnippet>175</a>    /// `child`.
+<a href=#176 id=176 data-nosnippet>176</a>    </span><span class="kw">pub</span>(<span class="kw">super</span>) <span class="kw">fn </span>record_controlled_child_exit(
+<a href=#177 id=177 data-nosnippet>177</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#178 id=178 data-nosnippet>178</a>        child: DetPid,
+<a href=#179 id=179 data-nosnippet>179</a>        decision: ChildExitNotification,
+<a href=#180 id=180 data-nosnippet>180</a>    ) {
+<a href=#181 id=181 data-nosnippet>181</a>        <span class="self">self</span>.controlled_child_exits
+<a href=#182 id=182 data-nosnippet>182</a>            .decisions
+<a href=#183 id=183 data-nosnippet>183</a>            .insert(child, decision);
+<a href=#184 id=184 data-nosnippet>184</a>    }
+<a href=#185 id=185 data-nosnippet>185</a>
+<a href=#186 id=186 data-nosnippet>186</a>    <span class="doccomment">/// Check a committed child-exit publication against the scheduler's
+<a href=#187 id=187 data-nosnippet>187</a>    /// decision at the exit grant, if it took one, and keep its effect for the
+<a href=#188 id=188 data-nosnippet>188</a>    /// `ChildExit` timer. Called when the publication completes, under the
+<a href=#189 id=189 data-nosnippet>189</a>    /// scheduler mutex, while the reservation's control barrier still holds
+<a href=#190 id=190 data-nosnippet>190</a>    /// every turn and every maintenance step.
+<a href=#191 id=191 data-nosnippet>191</a>    </span><span class="kw">pub</span>(<span class="kw">super</span>) <span class="kw">fn </span>check_child_exit_publication(<span class="kw-2">&amp;mut </span><span class="self">self</span>, receipt: <span class="kw-2">&amp;</span>ChildExitPublication) {
+<a href=#192 id=192 data-nosnippet>192</a>        <span class="kw">let </span>child = DetPid::from_raw(receipt.completion.child.tgid.as_raw());
+<a href=#193 id=193 data-nosnippet>193</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(decision) = <span class="self">self</span>.controlled_child_exits.decisions.remove(<span class="kw-2">&amp;</span>child) <span class="kw">else </span>{
+<a href=#194 id=194 data-nosnippet>194</a>            <span class="kw">return</span>;
+<a href=#195 id=195 data-nosnippet>195</a>        };
+<a href=#196 id=196 data-nosnippet>196</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(why) =
+<a href=#197 id=197 data-nosnippet>197</a>            child_exit_effect_mismatch(decision, receipt.effect, receipt.completion.waitable)
+<a href=#198 id=198 data-nosnippet>198</a>        {
+<a href=#199 id=199 data-nosnippet>199</a>            <span class="kw">let </span>reason = <span class="macro">format!</span>(
+<a href=#200 id=200 data-nosnippet>200</a>                <span class="string">"HERMIT_REFUSAL sigchld-decision-mismatch: the exit of child {} decided {:?} \
+<a href=#201 id=201 data-nosnippet>201</a>                 at its grant, and the backend published {:?} (waitable: {}): {}"</span>,
+<a href=#202 id=202 data-nosnippet>202</a>                child, decision, receipt.effect, receipt.completion.waitable, why
+<a href=#203 id=203 data-nosnippet>203</a>            );
+<a href=#204 id=204 data-nosnippet>204</a>            <span class="macro">tracing::error!</span>(<span class="string">"{}"</span>, reason);
+<a href=#205 id=205 data-nosnippet>205</a>            <span class="self">self</span>.controlled_child_exits.refusal.get_or_insert(reason);
+<a href=#206 id=206 data-nosnippet>206</a>            <span class="kw">return</span>;
+<a href=#207 id=207 data-nosnippet>207</a>        }
+<a href=#208 id=208 data-nosnippet>208</a>        <span class="kw">if </span><span class="macro">matches!</span>(
+<a href=#209 id=209 data-nosnippet>209</a>            decision,
+<a href=#210 id=210 data-nosnippet>210</a>            ChildExitNotification::Deliver | ChildExitNotification::Undecided
+<a href=#211 id=211 data-nosnippet>211</a>        ) {
+<a href=#212 id=212 data-nosnippet>212</a>            <span class="self">self</span>.controlled_child_exits
+<a href=#213 id=213 data-nosnippet>213</a>                .effects
+<a href=#214 id=214 data-nosnippet>214</a>                .insert(child, receipt.effect);
+<a href=#215 id=215 data-nosnippet>215</a>        }
+<a href=#216 id=216 data-nosnippet>216</a>    }
+<a href=#217 id=217 data-nosnippet>217</a>
+<a href=#218 id=218 data-nosnippet>218</a>    <span class="doccomment">/// Take the run's `sigchld-decision-mismatch` refusal, if one was made.
+<a href=#219 id=219 data-nosnippet>219</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>take_sigchld_decision_refusal(<span class="kw-2">&amp;mut </span><span class="self">self</span>) -&gt; <span class="prelude-ty">Option</span>&lt;String&gt; {
+<a href=#220 id=220 data-nosnippet>220</a>        <span class="self">self</span>.controlled_child_exits.refusal.take()
+<a href=#221 id=221 data-nosnippet>221</a>    }
+<a href=#222 id=222 data-nosnippet>222</a>
+<a href=#223 id=223 data-nosnippet>223</a>    <span class="doccomment">/// Run `fire` with `child` named as the child whose `ChildExit` timer is
+<a href=#224 id=224 data-nosnippet>224</a>    /// sending (`child_exit_sink`), where a signal control is installed. The
+<a href=#225 id=225 data-nosnippet>225</a>    /// timer's effect is consumed by its pop either way: a timer whose parent
+<a href=#226 id=226 data-nosnippet>226</a>    /// is gone sends nothing, and its effect must not stand for a later child
+<a href=#227 id=227 data-nosnippet>227</a>    /// that reuses the PID.
+<a href=#228 id=228 data-nosnippet>228</a>    </span><span class="kw">pub</span>(<span class="kw">super</span>) <span class="kw">fn </span>sending_controlled_child_exit&lt;R&gt;(
+<a href=#229 id=229 data-nosnippet>229</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#230 id=230 data-nosnippet>230</a>        child: DetPid,
+<a href=#231 id=231 data-nosnippet>231</a>        fire: <span class="kw">impl </span>FnOnce(<span class="kw-2">&amp;mut </span><span class="self">Self</span>) -&gt; R,
+<a href=#232 id=232 data-nosnippet>232</a>    ) -&gt; R {
+<a href=#233 id=233 data-nosnippet>233</a>        <span class="kw">if </span>!<span class="self">self</span>.signal_control_installed() {
+<a href=#234 id=234 data-nosnippet>234</a>            <span class="kw">return </span>fire(<span class="self">self</span>);
+<a href=#235 id=235 data-nosnippet>235</a>        }
+<a href=#236 id=236 data-nosnippet>236</a>        <span class="kw">let </span>previous = <span class="self">self</span>.controlled_child_exits.sending.replace(child);
+<a href=#237 id=237 data-nosnippet>237</a>        <span class="kw">let </span>result = fire(<span class="self">self</span>);
+<a href=#238 id=238 data-nosnippet>238</a>        <span class="self">self</span>.controlled_child_exits.sending = previous;
+<a href=#239 id=239 data-nosnippet>239</a>        <span class="self">self</span>.controlled_child_exits.effects.remove(<span class="kw-2">&amp;</span>child);
+<a href=#240 id=240 data-nosnippet>240</a>        result
+<a href=#241 id=241 data-nosnippet>241</a>    }
+<a href=#242 id=242 data-nosnippet>242</a>
+<a href=#243 id=243 data-nosnippet>243</a>    <span class="doccomment">/// What the `SIGCHLD` a child-exit publication queued for `dettid` does to
+<a href=#244 id=244 data-nosnippet>244</a>    /// the wait `dettid` is parked in. `Queued` says only that the backend
+<a href=#245 id=245 data-nosnippet>245</a>    /// queued a copy, not that it interrupts anything. Linux wakes a waiting
+<a href=#246 id=246 data-nosnippet>246</a>    /// task for a signal only when the signal is unblocked and acted on
+<a href=#247 id=247 data-nosnippet>247</a>    /// (caught, or default-fatal; `signal_wake_up` from `complete_signal`,
+<a href=#248 id=248 data-nosnippet>248</a>    /// past `sig_ignored` and `wants_signal`). A blocked copy stays pending
+<a href=#249 id=249 data-nosnippet>249</a>    /// and wakes nothing. An unblocked one that is ignored, explicitly or by
+<a href=#250 id=250 data-nosnippet>250</a>    /// default, is discarded at generation (`sig_ignored`), which the backend
+<a href=#251 id=251 data-nosnippet>251</a>    /// does not model (design G8, S0 correction 2): ptrace's send records that
+<a href=#252 id=252 data-nosnippet>252</a>    /// discard, so this does too.
+<a href=#253 id=253 data-nosnippet>253</a>    ///
+<a href=#254 id=254 data-nosnippet>254</a>    /// The receiver's sets are the backend's (`backend_signal_state`, S2a),
+<a href=#255 id=255 data-nosnippet>255</a>    /// under the mask the guest published while Detcore holds a private one
+<a href=#256 id=256 data-nosnippet>256</a>    /// (`under_published_mask`), or under the temporary mask Linux holds
+<a href=#257 id=257 data-nosnippet>257</a>    /// installed for a call the receiver waits in where there is one
+<a href=#258 id=258 data-nosnippet>258</a>    /// (`controlled_temporary_mask`: a `ppoll`, a `pselect6`, a parked or
+<a href=#259 id=259 data-nosnippet>259</a>    /// woken `rt_sigsuspend`; `set_user_sigmask` and `sigsuspend`,
+<a href=#260 id=260 data-nosnippet>260</a>    /// kernel/signal.c:3272 and 4833 at v6.17), as the receiver was chosen
+<a href=#261 id=261 data-nosnippet>261</a>    /// (`Scheduler::kernel_sent_signal_mask`), filtered as the drain filters
+<a href=#262 id=262 data-nosnippet>262</a>    /// a restartable poll (`poll_wake_signals`). A temporary mask the request
+<a href=#263 id=263 data-nosnippet>263</a>    /// says is unknown leaves the mask as before. Read under the thread's own
+<a href=#264 id=264 data-nosnippet>264</a>    /// mask, a creator chosen for the `SIGCHLD` its `ppoll` lets in was left
+<a href=#265 id=265 data-nosnippet>265</a>    /// waiting, the copy pending (the Codex review of
+<a href=#266 id=266 data-nosnippet>266</a>    /// &lt;https://github.com/rrnewton/hermit/pull/5259&gt;, P1). They are read at the timer's pop, a
+<a href=#267 id=267 data-nosnippet>267</a>    /// committed point where no guest thread holds the turn, so the answer is
+<a href=#268 id=268 data-nosnippet>268</a>    /// a function of the schedule. An unreadable state wakes the thread, as
+<a href=#269 id=269 data-nosnippet>269</a>    /// before this filter.
+<a href=#270 id=270 data-nosnippet>270</a>    ///
+<a href=#271 id=271 data-nosnippet>271</a>    /// Without this, a parked `nanosleep` (a wait the grant leaves Undecided)
+<a href=#272 id=272 data-nosnippet>272</a>    /// was woken for a blocked or default-ignored `SIGCHLD` and answered EINTR
+<a href=#273 id=273 data-nosnippet>273</a>    /// on KVM, where the sleep cannot judge the wake itself (`signal_sleep`;
+<a href=#274 id=274 data-nosnippet>274</a>    /// the revastra2 review of https://github.com/rrnewton/hermit/pull/5192,
+<a href=#275 id=275 data-nosnippet>275</a>    /// F1).
+<a href=#276 id=276 data-nosnippet>276</a>    </span><span class="kw">pub</span>(<span class="kw">super</span>) <span class="kw">fn </span>queued_sigchld_fate(<span class="kw-2">&amp;</span><span class="self">self</span>, dettid: DetTid) -&gt; QueuedSigchld {
+<a href=#277 id=277 data-nosnippet>277</a>        <span class="kw">let </span>bit = <span class="kw">super</span>::kernel_signal_bit(libc::SIGCHLD);
+<a href=#278 id=278 data-nosnippet>278</a>        <span class="kw">match </span><span class="self">self</span>.backend_signal_state(dettid) {
+<a href=#279 id=279 data-nosnippet>279</a>            <span class="prelude-val">Some</span>(<span class="prelude-val">Ok</span>(state)) =&gt; {
+<a href=#280 id=280 data-nosnippet>280</a>                <span class="kw">let </span>state = <span class="kw">match </span><span class="self">self</span>.controlled_temporary_mask(dettid) {
+<a href=#281 id=281 data-nosnippet>281</a>                    <span class="prelude-val">Ok</span>(<span class="prelude-val">Some</span>(temporary)) =&gt; <span class="kw">crate</span>::syscalls::KernelSignalState {
+<a href=#282 id=282 data-nosnippet>282</a>                        blocked: temporary,
+<a href=#283 id=283 data-nosnippet>283</a>                        ..state
+<a href=#284 id=284 data-nosnippet>284</a>                    },
+<a href=#285 id=285 data-nosnippet>285</a>                    <span class="prelude-val">Ok</span>(<span class="prelude-val">None</span>) | <span class="prelude-val">Err</span>(<span class="kw">_</span>) =&gt; <span class="self">self</span>.under_published_mask(dettid, state),
+<a href=#286 id=286 data-nosnippet>286</a>                };
+<a href=#287 id=287 data-nosnippet>287</a>                <span class="comment">// The pop is the copy's generation, so its discard is decided
+<a href=#288 id=288 data-nosnippet>288</a>                // here, from the dispositions read now, before the wake: where
+<a href=#289 id=289 data-nosnippet>289</a>                // the scheduler models signal targets the drain's filter
+<a href=#290 id=290 data-nosnippet>290</a>                // (`poll_wake_signals`) admits every unblocked standard signal,
+<a href=#291 id=291 data-nosnippet>291</a>                // since an ordinary send's discard was already decided in its
+<a href=#292 id=292 data-nosnippet>292</a>                // sender's turn, and this copy has had no such turn.
+<a href=#293 id=293 data-nosnippet>293</a>                </span><span class="kw">if </span>state.discarded_at_generation() &amp; bit != <span class="number">0 </span>{
+<a href=#294 id=294 data-nosnippet>294</a>                    QueuedSigchld::DiscardedAtGeneration
+<a href=#295 id=295 data-nosnippet>295</a>                } <span class="kw">else if </span><span class="kw">super</span>::poll_wake_signals(<span class="kw-2">&amp;</span>state, <span class="self">self</span>.models_signal_targets) &amp; bit != <span class="number">0 </span>{
+<a href=#296 id=296 data-nosnippet>296</a>                    QueuedSigchld::Interrupts
+<a href=#297 id=297 data-nosnippet>297</a>                } <span class="kw">else </span>{
+<a href=#298 id=298 data-nosnippet>298</a>                    QueuedSigchld::StaysPending
+<a href=#299 id=299 data-nosnippet>299</a>                }
+<a href=#300 id=300 data-nosnippet>300</a>            }
+<a href=#301 id=301 data-nosnippet>301</a>            <span class="prelude-val">Some</span>(<span class="prelude-val">Err</span>(<span class="kw">_</span>)) | <span class="prelude-val">None </span>=&gt; QueuedSigchld::Interrupts,
+<a href=#302 id=302 data-nosnippet>302</a>        }
+<a href=#303 id=303 data-nosnippet>303</a>    }
+<a href=#304 id=304 data-nosnippet>304</a>
+<a href=#305 id=305 data-nosnippet>305</a>    <span class="doccomment">/// Commit a child-exit `SIGCHLD` Linux discarded: ptrace's
+<a href=#306 id=306 data-nosnippet>306</a>    /// discarded-at-send record, no delivery, and a wake that commits no
+<a href=#307 id=307 data-nosnippet>307</a>    /// `InboundSignal` (`wake_signaled_guest_as`).
+<a href=#308 id=308 data-nosnippet>308</a>    </span><span class="kw">fn </span>discard_child_exit_sigchld(
+<a href=#309 id=309 data-nosnippet>309</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#310 id=310 data-nosnippet>310</a>        dettid: DetTid,
+<a href=#311 id=311 data-nosnippet>311</a>        signal: nix::sys::signal::Signal,
+<a href=#312 id=312 data-nosnippet>312</a>        named: DetTid,
+<a href=#313 id=313 data-nosnippet>313</a>    ) {
+<a href=#314 id=314 data-nosnippet>314</a>        <span class="macro">info!</span>(
+<a href=#315 id=315 data-nosnippet>315</a>            target: <span class="string">"detcore::scheduler"</span>,
+<a href=#316 id=316 data-nosnippet>316</a>            <span class="string">"[dtid {}] signal {} is one Linux discards as sent to {}; committing no wake."</span>,
+<a href=#317 id=317 data-nosnippet>317</a>            dettid, signal, named
+<a href=#318 id=318 data-nosnippet>318</a>        );
+<a href=#319 id=319 data-nosnippet>319</a>        <span class="comment">// No delivery follows to consume the process's mark
+<a href=#320 id=320 data-nosnippet>320</a>        // (`dispatch_timed_signal_at`).
+<a href=#321 id=321 data-nosnippet>321</a>        </span><span class="kw">let </span>process = <span class="self">self</span>.sigchld_process(dettid);
+<a href=#322 id=322 data-nosnippet>322</a>        <span class="self">self</span>.blocked.sigchld_ready.remove(<span class="kw-2">&amp;</span>process);
+<a href=#323 id=323 data-nosnippet>323</a>        <span class="kw">if </span><span class="self">self</span>.send_wakes(dettid) {
+<a href=#324 id=324 data-nosnippet>324</a>            <span class="self">self</span>.wake_signaled_guest_as(dettid, signal, <span class="bool-val">true</span>);
+<a href=#325 id=325 data-nosnippet>325</a>        }
+<a href=#326 id=326 data-nosnippet>326</a>    }
+<a href=#327 id=327 data-nosnippet>327</a>
+<a href=#328 id=328 data-nosnippet>328</a>    <span class="doccomment">/// `send_guest_signal`'s physical step where a signal control is
+<a href=#329 id=329 data-nosnippet>329</a>    /// installed: the backend's child-exit publication already made it, so
+<a href=#330 id=330 data-nosnippet>330</a>    /// the scheduler acts on its effect. A send of anything else, or of a
+<a href=#331 id=331 data-nosnippet>331</a>    /// `SIGCHLD` no publication made, would reach a host process that is not
+<a href=#332 id=332 data-nosnippet>332</a>    /// the guest's: it is refused by name instead.
+<a href=#333 id=333 data-nosnippet>333</a>    ///
+<a href=#334 id=334 data-nosnippet>334</a>    /// `dettid` is the receiving thread and `named` the thread Linux names
+<a href=#335 id=335 data-nosnippet>335</a>    /// (`fire_child_exit_alarm`).
+<a href=#336 id=336 data-nosnippet>336</a>    </span><span class="kw">pub</span>(<span class="kw">super</span>) <span class="kw">fn </span>child_exit_sink(
+<a href=#337 id=337 data-nosnippet>337</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#338 id=338 data-nosnippet>338</a>        dettid: DetTid,
+<a href=#339 id=339 data-nosnippet>339</a>        signal: nix::sys::signal::Signal,
+<a href=#340 id=340 data-nosnippet>340</a>        named: DetTid,
+<a href=#341 id=341 data-nosnippet>341</a>    ) {
+<a href=#342 id=342 data-nosnippet>342</a>        <span class="kw">let </span>effect = <span class="self">self
+<a href=#343 id=343 data-nosnippet>343</a>            </span>.controlled_child_exits
+<a href=#344 id=344 data-nosnippet>344</a>            .sending
+<a href=#345 id=345 data-nosnippet>345</a>            .filter(|<span class="kw">_</span>| signal == nix::sys::signal::Signal::SIGCHLD)
+<a href=#346 id=346 data-nosnippet>346</a>            .and_then(|child| <span class="self">self</span>.controlled_child_exits.effects.remove(<span class="kw-2">&amp;</span>child));
+<a href=#347 id=347 data-nosnippet>347</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(effect) = effect <span class="kw">else </span>{
+<a href=#348 id=348 data-nosnippet>348</a>            <span class="kw">let </span>reason = <span class="macro">format!</span>(
+<a href=#349 id=349 data-nosnippet>349</a>                <span class="string">"HERMIT_REFUSAL sigchld-decision-mismatch: the scheduler would send signal {} \
+<a href=#350 id=350 data-nosnippet>350</a>                 to dettid {} on a backend that owns signal delivery, with no publication \
+<a href=#351 id=351 data-nosnippet>351</a>                 standing for it"</span>,
+<a href=#352 id=352 data-nosnippet>352</a>                signal, dettid
+<a href=#353 id=353 data-nosnippet>353</a>            );
+<a href=#354 id=354 data-nosnippet>354</a>            <span class="macro">tracing::error!</span>(<span class="string">"{}"</span>, reason);
+<a href=#355 id=355 data-nosnippet>355</a>            <span class="self">self</span>.controlled_child_exits.refusal.get_or_insert(reason);
+<a href=#356 id=356 data-nosnippet>356</a>            <span class="self">self</span>.guest_send_landed = <span class="prelude-val">Some</span>(<span class="bool-val">false</span>);
+<a href=#357 id=357 data-nosnippet>357</a>            <span class="kw">return</span>;
+<a href=#358 id=358 data-nosnippet>358</a>        };
+<a href=#359 id=359 data-nosnippet>359</a>        <span class="self">self</span>.note_scheduler_signal_sent(dettid, signal <span class="kw">as </span>libc::c_int);
+<a href=#360 id=360 data-nosnippet>360</a>        <span class="self">self</span>.guest_send_landed = <span class="prelude-val">Some</span>(<span class="bool-val">true</span>);
+<a href=#361 id=361 data-nosnippet>361</a>        <span class="kw">match </span>effect {
+<a href=#362 id=362 data-nosnippet>362</a>            ChildExitPublicationEffect::Queued =&gt; <span class="kw">match </span><span class="self">self</span>.queued_sigchld_fate(dettid) {
+<a href=#363 id=363 data-nosnippet>363</a>                QueuedSigchld::Interrupts =&gt; {
+<a href=#364 id=364 data-nosnippet>364</a>                    <span class="kw">if </span><span class="self">self</span>.send_wakes(dettid) {
+<a href=#365 id=365 data-nosnippet>365</a>                        <span class="self">self</span>.wake_signaled_guest_as(dettid, signal, <span class="bool-val">false</span>);
+<a href=#366 id=366 data-nosnippet>366</a>                    }
+<a href=#367 id=367 data-nosnippet>367</a>                }
+<a href=#368 id=368 data-nosnippet>368</a>                <span class="comment">// Decided from the receiver's sets, so it marks no walk: the
+<a href=#369 id=369 data-nosnippet>369</a>                // walk is suppressed only when the thread the send names
+<a href=#370 id=370 data-nosnippet>370</a>                // discards it at generation (`sig_ignored` at send), which
+<a href=#371 id=371 data-nosnippet>371</a>                // `commit_kernel_signal_walk` checks (`discarded_when_sent_to`).
+<a href=#372 id=372 data-nosnippet>372</a>                // A creator that blocks it has the copy queued, and
+<a href=#373 id=373 data-nosnippet>373</a>                // `complete_signal` moves `curr_target` to the receiver,
+<a href=#374 id=374 data-nosnippet>374</a>                // which then discards it as it dequeues it
+<a href=#375 id=375 data-nosnippet>375</a>                // (`default-child-curr` in tests/c/process_signal_target.c).
+<a href=#376 id=376 data-nosnippet>376</a>                </span>QueuedSigchld::DiscardedAtGeneration =&gt; {
+<a href=#377 id=377 data-nosnippet>377</a>                    <span class="self">self</span>.discard_child_exit_sigchld(dettid, signal, named);
+<a href=#378 id=378 data-nosnippet>378</a>                }
+<a href=#379 id=379 data-nosnippet>379</a>                QueuedSigchld::StaysPending =&gt; {
+<a href=#380 id=380 data-nosnippet>380</a>                    <span class="macro">info!</span>(
+<a href=#381 id=381 data-nosnippet>381</a>                        target: <span class="string">"detcore::scheduler"</span>,
+<a href=#382 id=382 data-nosnippet>382</a>                        <span class="string">"[dtid {}] SIGCHLD blocked by its receiver stays pending; waking no thread."</span>,
+<a href=#383 id=383 data-nosnippet>383</a>                        dettid
+<a href=#384 id=384 data-nosnippet>384</a>                    );
+<a href=#385 id=385 data-nosnippet>385</a>                }
+<a href=#386 id=386 data-nosnippet>386</a>            },
+<a href=#387 id=387 data-nosnippet>387</a>            ChildExitPublicationEffect::Coalesced =&gt; {
+<a href=#388 id=388 data-nosnippet>388</a>                <span class="self">self</span>.guest_send_reached_no_walk = <span class="bool-val">true</span>;
+<a href=#389 id=389 data-nosnippet>389</a>                <span class="macro">info!</span>(
+<a href=#390 id=390 data-nosnippet>390</a>                    target: <span class="string">"detcore::scheduler"</span>,
+<a href=#391 id=391 data-nosnippet>391</a>                    <span class="string">"[dtid {}] SIGCHLD coalesced into the one pending in its process's shared queue; waking no thread."</span>,
+<a href=#392 id=392 data-nosnippet>392</a>                    dettid
+<a href=#393 id=393 data-nosnippet>393</a>                );
+<a href=#394 id=394 data-nosnippet>394</a>            }
+<a href=#395 id=395 data-nosnippet>395</a>            <span class="comment">// Linux sent nothing (`do_notify_parent` sets no signal for an
+<a href=#396 id=396 data-nosnippet>396</a>            // explicit SIG_IGN), or discarded the copy: no `complete_signal`,
+<a href=#397 id=397 data-nosnippet>397</a>            // so no receiver walk (`fire_child_exit_alarm`).
+<a href=#398 id=398 data-nosnippet>398</a>            </span>ChildExitPublicationEffect::SuppressedExplicitIgnore
+<a href=#399 id=399 data-nosnippet>399</a>            | ChildExitPublicationEffect::DiscardedByDispositionChange =&gt; {
+<a href=#400 id=400 data-nosnippet>400</a>                <span class="self">self</span>.guest_send_reached_no_walk = <span class="bool-val">true</span>;
+<a href=#401 id=401 data-nosnippet>401</a>                <span class="self">self</span>.discard_child_exit_sigchld(dettid, signal, named);
+<a href=#402 id=402 data-nosnippet>402</a>            }
+<a href=#403 id=403 data-nosnippet>403</a>        }
+<a href=#404 id=404 data-nosnippet>404</a>    }
+<a href=#405 id=405 data-nosnippet>405</a>}
+</code></pre></div></section></main></body></html>

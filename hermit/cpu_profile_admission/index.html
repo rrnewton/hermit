@@ -1,0 +1,130 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Admission for intercepted CPU profiles: v3 binds qualified host XSTATE facts; host-no-rdrand requires CPUID faulting without the v3 qualification."><title>hermit::cpu_profile_admission - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="hermit" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module cpu_profile_admission</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../hermit/index.html">hermit</a><span class="version">0.5.7</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module cpu_<wbr>profile_<wbr>admission</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#enums" title="Enums">Enums</a></li><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#traits" title="Traits">Traits</a></li><li><a href="#functions" title="Functions">Functions</a></li><li><a href="#types" title="Type Aliases">Type Aliases</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate hermit</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">hermit</a></div><h1>Module <span>cpu_<wbr>profile_<wbr>admission</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/hermit/cpu_profile_admission.rs.html#9-3905">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Admission for intercepted CPU profiles: v3 binds qualified host XSTATE
+facts; host-no-rdrand requires CPUID faulting without the v3 qualification.</p>
+<p>Every class the v3 startup qualification cannot cover is refused by name.
+Neither nondefault profile, once named, silently falls back to v2 or
+native CPUID. auto, the default, presents x86-64-v2 where this run or host
+cannot carry x86-64-v3, and says why (<a href="fn.choose_auto.html" title="fn hermit::cpu_profile_admission::choose_auto"><code>choose_auto</code></a>).</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.AdmissionRequest.html" title="struct hermit::cpu_profile_admission::AdmissionRequest">Admission<wbr>Request</a></dt><dd>What the run asks for, as far as admission is concerned.</dd><dt><a class="struct" href="struct.AutoChoice.html" title="struct hermit::cpu_profile_admission::AutoChoice">Auto<wbr>Choice</a></dt><dd>What auto chose for a <code>hermit run</code>: the choice, and what to say of it in the
+run’s log, never on stderr, which a default run leaves to its guest: the
+qualification’s announcement when this process qualified the host, and a
+line saying so when a check that can change from one run to the next (the
+XINUSE probe, its counters, its deadline), not a fixed fact of the host,
+took x86-64-v3 away. The run’s manifest records the choice itself.</dd><dt><a class="struct" href="struct.CpuProfileRefusal.html" title="struct hermit::cpu_profile_admission::CpuProfileRefusal">CpuProfile<wbr>Refusal</a></dt><dd>A refused CPU profile, carried as an error so that it
+crosses the container boundary as a policy refusal (exit 122).</dd><dt><a class="struct" href="struct.NativeCpuid.html" title="struct hermit::cpu_profile_admission::NativeCpuid">Native<wbr>Cpuid</a></dt><dd>The CPUID instruction of the host this process runs on.</dd><dt><a class="struct" href="struct.ProfileChoice.html" title="struct hermit::cpu_profile_admission::ProfileChoice">Profile<wbr>Choice</a></dt><dd>The profile a run presents and why: the <code>cpu_profile</code> of its manifest.</dd></dl><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.ProfileReason.html" title="enum hermit::cpu_profile_admission::ProfileReason">Profile<wbr>Reason</a></dt><dd>Why a run presents the CPU profile it does. A run’s manifest records it
+beside the profile (<a href="struct.ProfileChoice.html" title="struct hermit::cpu_profile_admission::ProfileChoice"><code>ProfileChoice</code></a>).</dd></dl><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.AUTO_HOST_TEST_ENV.html" title="constant hermit::cpu_profile_admission::AUTO_HOST_TEST_ENV">AUTO_<wbr>HOST_<wbr>TEST_<wbr>ENV</a></dt><dd>A test-only variable that forces the host’s answer for auto, so that the
+x86-64-v2 paths can be tested on a host that qualifies:
+<code>hypervisor</code> (the hypervisor bit, through the same branch as a reported
+one), <code>qualification-refused</code> or <code>qualification-refused-dynamic</code> (each a
+refusal that stands whether or not the host reports a hypervisor).
+It can only take x86-64-v3 away from a program that needs no more than
+x86-64-v2; a program that declares x86-64-v3 is admitted, or refused, as
+an explicit x86-64-v3 is. Unset in every real run.</dd><dt><a class="constant" href="constant.CPUID_FAULTING_VM_SCRIPT.html" title="constant hermit::cpu_profile_admission::CPUID_FAULTING_VM_SCRIPT">CPUID_<wbr>FAULTING_<wbr>VM_<wbr>SCRIPT</a></dt><dd>The source-tree script that loads a module turning on CPUID faulting in a
+KVM guest whose hypervisor offers it but whose pre-6.17 kernel probes it
+only on Intel vCPU models.</dd><dt><a class="constant" href="constant.LIBC_V3_DETAIL.html" title="constant hermit::cpu_profile_admission::LIBC_V3_DETAIL">LIBC_<wbr>V3_<wbr>DETAIL</a></dt><dd>What a choice made for the program’s C library declares x86-64-v3
+says (<code>detail</code>), in a manifest, a resolution line and a refusal.</dd></dl><h2 id="traits" class="section-header">Traits<a href="#traits" class="anchor">§</a></h2><dl class="item-table"><dt><a class="trait" href="trait.HostCpuid.html" title="trait hermit::cpu_profile_admission::HostCpuid">Host<wbr>Cpuid</a></dt><dd>A host CPUID reader, so tests can supply a host.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.admit.html" title="fn hermit::cpu_profile_admission::admit">admit</a></dt><dd>Admits a v3 run on this host, or names why not. On success the probe report
+and the host facts to bind are returned, and this process’s ptrace
+floating-point register writes are refused from then on. The request’s own
+refusals are checked every time; the host qualification runs once per
+process.</dd><dt><a class="fn" href="fn.admit_announcing_to.html" title="fn hermit::cpu_profile_admission::admit_announcing_to">admit_<wbr>announcing_<wbr>to</a></dt><dd><a href="fn.admit.html" title="fn hermit::cpu_profile_admission::admit"><code>admit</code></a> with the qualification’s announcement (that it takes seconds, and
+where a pass is cached) sent to <code>announce</code> instead of stderr: auto, the
+default, leaves a run’s stderr to its guest and logs it.</dd><dt><a class="fn" href="fn.admit_host_no_rdrand.html" title="fn hermit::cpu_profile_admission::admit_host_no_rdrand">admit_<wbr>host_<wbr>no_<wbr>rdrand</a></dt><dd>Select the lowest allowed CPU before the CLI’s container can randomly
+narrow affinity. Probe that CPU, restore the caller’s mask, and return the
+source to carry in Config::cpu_profile_source. The launch guard pins the
+actual tracer thread; this also works with a pre-existing library worker.
+Repeat runs require the same allowed CPU set and host configuration.</dd><dt><a class="fn" href="fn.admit_into_log.html" title="fn hermit::cpu_profile_admission::admit_into_log">admit_<wbr>into_<wbr>log</a></dt><dd><a href="fn.admit.html" title="fn hermit::cpu_profile_admission::admit"><code>admit</code></a> for an x86-64-v3 that <code>--cpu-profile auto</code> resolved because the
+program declares it: the qualification’s announcement goes to <code>log</code>, as
+auto keeps it (<a href="fn.choose_auto.html" title="fn hermit::cpu_profile_admission::choose_auto"><code>choose_auto</code></a>), and never to stderr. Only a run that
+finds no cached pass makes the announcement, so on stderr it would make
+two runs of one default command differ, and a default run’s stderr is its
+guest’s. A named x86-64-v3 still announces it on stderr (<a href="fn.admit.html" title="fn hermit::cpu_profile_admission::admit"><code>admit</code></a>).</dd><dt><a class="fn" href="fn.check_host_cpuid.html" title="fn hermit::cpu_profile_admission::check_host_cpuid">check_<wbr>host_<wbr>cpuid</a></dt><dd>The host checks that need only CPUID, in the order they are checked:
+every advertised v3 feature bit natively, OSXSAVE, not a hybrid part, and
+not an AMD part without XSAVEERPTR (where Linux runs <code>fnclex; emms; fildl</code>
+before every FPU restore, a path no host here can exercise).</dd><dt><a class="fn" href="fn.check_host_no_rdrand_request.html" title="fn hermit::cpu_profile_admission::check_host_no_rdrand_request">check_<wbr>host_<wbr>no_<wbr>rdrand_<wbr>request</a></dt><dd>The host profile must intercept CPUID and TSC on ptrace. Unlike v3, it
+retains host XSAVE behavior and does not claim the XSTATE qualification.</dd><dt><a class="fn" href="fn.check_kernel.html" title="fn hermit::cpu_profile_admission::check_kernel">check_<wbr>kernel</a></dt><dd>Linux 5.16 is the first with the <code>ARCH_*_XCOMP_*</code> queries the profile
+answers from the host; before it they return EINVAL.</dd><dt><a class="fn" href="fn.check_record.html" title="fn hermit::cpu_profile_admission::check_record">check_<wbr>record</a></dt><dd>Recording (not replay) refuses the legacy v2 table: it exists
+so recordings and documents from before the psABI split keep
+the CPU they saved, and a new recording on it would silently
+extend the leaky table’s life
+(facebookexperimental/hermit#124). Everything
+<a href="fn.check_record_or_replay.html" title="fn hermit::cpu_profile_admission::check_record_or_replay"><code>check_record_or_replay</code></a> refuses is refused here too.</dd><dt><a class="fn" href="fn.check_record_or_replay.html" title="fn hermit::cpu_profile_admission::check_record_or_replay">check_<wbr>record_<wbr>or_<wbr>replay</a></dt><dd>A recording currently binds only the v3 host facts, not a complete native
+CPUID snapshot. Refuse host mode before writing metadata or launching a
+guest rather than accidentally treating it as v3.</dd><dt><a class="fn" href="fn.check_recorded_table_digest.html" title="fn hermit::cpu_profile_admission::check_recorded_table_digest">check_<wbr>recorded_<wbr>table_<wbr>digest</a></dt><dd>A recording on the psABI x86-64-v2 table binds that table’s digest;
+replay refuses a recording whose digest is absent or not the one
+this replayer computes, so a future table change cannot silently
+replay it against a different CPU (the hole the legacy split
+closes going forward). Legacy-table recordings carry no digest
+and are not checked here.</dd><dt><a class="fn" href="fn.check_request.html" title="fn hermit::cpu_profile_admission::check_request">check_<wbr>request</a></dt><dd>The refusals that need no host probe, in the order they are checked.</dd><dt><a class="fn" href="fn.choose_auto.html" title="fn hermit::cpu_profile_admission::choose_auto">choose_<wbr>auto</a></dt><dd>The profile <code>hermit run</code> presents under auto for a program whose
+executable and interpreter ask for <code>needs</code> (<a href="fn.resolve_auto.html" title="fn hermit::cpu_profile_admission::resolve_auto"><code>resolve_auto</code></a>) and
+whose C library beside a glibc interpreter does or does not
+declare x86-64-v3 (<code>libc_v3</code>, <a href="fn.libc_needs_v3.html" title="fn hermit::cpu_profile_admission::libc_needs_v3"><code>libc_needs_v3</code></a>), for <code>request</code>:</dd><dt><a class="fn" href="fn.choose_record_auto.html" title="fn hermit::cpu_profile_admission::choose_record_auto">choose_<wbr>record_<wbr>auto</a></dt><dd>The profile <code>hermit record start</code> records under <code>--cpu-profile auto</code>,
+for a program whose declarations ask for <code>needs</code> (<a href="fn.resolve_auto.html" title="fn hermit::cpu_profile_admission::resolve_auto"><code>resolve_auto</code></a>)
+and whose C library does or does not declare x86-64-v3 (<code>libc_v3</code>,
+<a href="fn.libc_needs_v3.html" title="fn hermit::cpu_profile_admission::libc_needs_v3"><code>libc_needs_v3</code></a>): always <code>declared</code>, so the recording does not
+depend on the host – <code>needs</code> itself, or x86-64-v3 with
+<a href="constant.LIBC_V3_DETAIL.html" title="constant hermit::cpu_profile_admission::LIBC_V3_DETAIL"><code>LIBC_V3_DETAIL</code></a> where only the C library declares it (a
+recording always presents a virtual CPU,
+<a href="fn.record_or_replay_request.html" title="fn hermit::cpu_profile_admission::record_or_replay_request"><code>record_or_replay_request</code></a>). A declared x86-64-v3 is admitted
+afterwards as an explicit one is, so a host that cannot carry it
+refuses the recording by name instead of recording a guest its
+own glibc refuses.</dd><dt><a class="fn" href="fn.cpuid_faulting_vm_pointer.html" title="fn hermit::cpu_profile_admission::cpuid_faulting_vm_pointer">cpuid_<wbr>faulting_<wbr>vm_<wbr>pointer</a></dt><dd>A pointer to <a href="constant.CPUID_FAULTING_VM_SCRIPT.html" title="constant hermit::cpu_profile_admission::CPUID_FAULTING_VM_SCRIPT"><code>CPUID_FAULTING_VM_SCRIPT</code></a> when <code>host</code> reports a hypervisor
+(CPUID leaf 1 ECX bit 31) and <code>release</code> is older than Linux 6.17, the only
+hosts the module can help; <code>None</code> otherwise.</dd><dt><a class="fn" href="fn.first_difference.html" title="fn hermit::cpu_profile_admission::first_difference">first_<wbr>difference</a></dt><dd>The first host fact in which <code>replay</code> differs from <code>recorded</code>, by name, or
+<code>None</code> when they are equal.</dd><dt><a class="fn" href="fn.kernel_version.html" title="fn hermit::cpu_profile_admission::kernel_version">kernel_<wbr>version</a></dt><dd>Linux’s version as (major, minor), from a <code>uname -r</code> release string.</dd><dt><a class="fn" href="fn.libc_needs_v3.html" title="fn hermit::cpu_profile_admission::libc_needs_v3">libc_<wbr>needs_<wbr>v3</a></dt><dd>Whether the C library of the image <code>program</code> execs first declares that it
+needs x86-64-v3 or above, where its own and its interpreter’s
+declarations do not need to say so (<a href="fn.resolve_auto.html" title="fn hermit::cpu_profile_admission::resolve_auto"><code>resolve_auto</code></a>). This is the <code>libc.so.6</code> in the
+directory of that image’s glibc program interpreter, after the symlinks
+of the interpreter’s own name, and then after the symlinks of its own.</dd><dt><a class="fn" href="fn.missing_cpuid_faulting_note.html" title="fn hermit::cpu_profile_admission::missing_cpuid_faulting_note">missing_<wbr>cpuid_<wbr>faulting_<wbr>note</a></dt><dd>The note to print after an error whose chain reports missing CPUID
+faulting, on a host where the script may help, unless a message already
+carries the pointer.</dd><dt><a class="fn" href="fn.precheck_replay.html" title="fn hermit::cpu_profile_admission::precheck_replay">precheck_<wbr>replay</a></dt><dd>Refuses a v3 replay before the qualification probe runs when the recording
+carries no host facts, when this host differs in one of the facts it bound
+(the qualification itself aside), or when its CPUID table digest is not the
+one this replayer computes from them. The probe costs seconds of CPU, and a
+replay on a different CPU, or of an altered recording, needs none of it to
+be refused. Returns the recorded facts.</dd><dt><a class="fn" href="fn.qualify_host.html" title="fn hermit::cpu_profile_admission::qualify_host">qualify_<wbr>host</a></dt><dd>The host half of <a href="fn.admit.html" title="fn hermit::cpu_profile_admission::admit"><code>admit</code></a>, run once per process: the kernel, the
+every-bit CPUID check, the dynamic-feature refusal, the probe and the host
+facts. <code>hermit host-capabilities --cpu-profile x86-64-v3</code> runs it alone.
+It always measures and never reads or writes the cache <a href="fn.admit.html" title="fn hermit::cpu_profile_admission::admit"><code>admit</code></a> uses.</dd><dt><a class="fn" href="fn.qualify_host_no_rdrand.html" title="fn hermit::cpu_profile_admission::qualify_host_no_rdrand">qualify_<wbr>host_<wbr>no_<wbr>rdrand</a></dt><dd>Probe the Linux CPUID-faulting API in a child. Disabling CPUID in the
+tracer would also fault Rust’s and libc’s own feature detection, so only
+the forked child changes its state. After fork the child uses only libc
+syscalls and <code>_exit</code>, without allocation, locks or unwinding.</dd><dt><a class="fn" href="fn.qualify_kvm_fixed_guest.html" title="fn hermit::cpu_profile_admission::qualify_kvm_fixed_guest">qualify_<wbr>kvm_<wbr>fixed_<wbr>guest</a></dt><dd>Qualify the fixed KVM guest machine’s xstate behavior on this host,
+through the per-host cache: Reverie-KVM’s in-guest probe records
+XGETBV/XSAVE before and after forced VM exits (one trial reinstalling
+the image through the signal-frame codec at the exit) and this returns
+its measurement when every comparison is stable. This is evidence for
+admission to consume; it admits nothing by itself, and
+<a href="fn.check_request.html" title="fn hermit::cpu_profile_admission::check_request"><code>check_request</code></a> still refuses x86-64-v3 on the KVM backend until the
+admission slice lands.</dd><dt><a class="fn" href="fn.record_or_replay_request.html" title="fn hermit::cpu_profile_admission::record_or_replay_request">record_<wbr>or_<wbr>replay_<wbr>request</a></dt><dd>The admission request of a recording or replay, which always runs on the
+ptrace backend with virtual CPUID.</dd><dt><a class="fn" href="fn.refuse_unadmitted_launch.html" title="fn hermit::cpu_profile_admission::refuse_unadmitted_launch">refuse_<wbr>unadmitted_<wbr>launch</a></dt><dd>Refuses a nondefault profile launch that this process did not admit.
+Hermit’s library launch functions call this before any backend starts.
+Host mode requires its faulting proof and interception options; v3 also
+requires exactly the host facts <a href="fn.admit.html" title="fn hermit::cpu_profile_admission::admit"><code>admit</code></a> bound after qualification and
+its floating-point register write ban.</dd><dt><a class="fn" href="fn.resolve_auto.html" title="fn hermit::cpu_profile_admission::resolve_auto">resolve_<wbr>auto</a></dt><dd>The named profile <code>--cpu-profile auto</code> resolves to for a guest program
+at host path <code>program</code>, with why (<a href="../../detcore/exec_record/fn.auto_profile.html" title="fn detcore::exec_record::auto_profile"><code>detcore::exec_record::auto_profile</code></a>):
+from the declarations of the image it execs first and of that image’s
+program interpreter, where <code>to_host</code> gives the host path of a path as
+the guest names it, or <code>None</code> where a mount with no source hides it in
+the launch view: a hidden interpreter refuses, rather than reading the
+host file its mount target shadows. <code>program</code> is the program in the
+launch’s completed view (its mounts, binds and image rootfs already
+applied by the caller), and every script hop is mapped through
+<code>to_host</code> the same way. A script’s interpreter is followed as the
+kernel follows it
+(Detcore’s <code>script_interpreter</code>, the <code>load_script</code> rules: the line
+and the path end where the kernel ends them, at a newline and at a
+space, tab or NUL), through a bounded chain of scripts to the image
+the kernel would exec. Evidence is read strictly: a declaration
+beside a scan state that could not be decided refuses, rather than
+selecting from a lower bound. This chooses the profile before
+launch; Detcore’s check of each executed image and interpreter
+(<code>Detcore::isa_refusal</code>) is still what refuses a run whose actual
+objects need more, so a pathname read here can never admit one.</dd><dt><a class="fn" href="fn.resolve_launch_auto.html" title="fn hermit::cpu_profile_admission::resolve_launch_auto">resolve_<wbr>launch_<wbr>auto</a></dt><dd>Resolve a configuration’s auto profile for a library launch of <code>command</code>
+(<a href="fn.resolve_auto.html" title="fn hermit::cpu_profile_admission::resolve_auto"><code>resolve_auto</code></a> of the program it names, found as the launch finds it),
+before <a href="fn.refuse_unadmitted_launch.html" title="fn hermit::cpu_profile_admission::refuse_unadmitted_launch"><code>refuse_unadmitted_launch</code></a>. <code>hermit run</code> and <code>hermit record start</code> resolve it earlier, before qualification; a configuration naming a
+profile is left as it is. A resolved x86-64-v3 is then admitted only as
+an explicit one is, so a library launch that never qualified the host
+refuses it by name.</dd><dt><a class="fn" href="fn.under_hypervisor.html" title="fn hermit::cpu_profile_admission::under_hypervisor">under_<wbr>hypervisor</a></dt><dd>Whether this host reports a hypervisor (CPUID leaf 1, ECX bit 31), where
+auto presents x86-64-v2 without qualifying the host.</dd><dt><a class="fn" href="fn.v3_libc_path.html" title="fn hermit::cpu_profile_admission::v3_libc_path">v3_<wbr>libc_<wbr>path</a></dt><dd>The C library beside the glibc program interpreter of the image
+<code>program</code> execs first, where it declares that it needs x86-64-v3
+(<a href="fn.libc_needs_v3.html" title="fn hermit::cpu_profile_admission::libc_needs_v3"><code>libc_needs_v3</code></a>): its host path in the launch’s view, so a
+refusal can name the file that decided it.</dd></dl><h2 id="types" class="section-header">Type Aliases<a href="#types" class="anchor">§</a></h2><dl class="item-table"><dt><a class="type" href="type.AdmissionRefusal.html" title="type hermit::cpu_profile_admission::AdmissionRefusal">Admission<wbr>Refusal</a></dt><dd>Why a profile is refused, after <code>--cpu-profile &lt;profile&gt; refused: </code>.</dd><dt><a class="type" href="type.Qualification.html" title="type hermit::cpu_profile_admission::Qualification">Qualification</a></dt><dd>What a host qualification yields: the XSTATE probe’s report and the host
+facts a v3 run binds.</dd></dl></section></div></main></body></html>

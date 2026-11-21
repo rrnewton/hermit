@@ -1,0 +1,48 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Rewriting aarch64 load/store-exclusive retry loops to FEAT_LSE atomics."><title>detcore::aarch64_lse - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module aarch64_lse</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../detcore/index.html">detcore</a><span class="version">0.5.7</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module aarch64_<wbr>lse</a></h2><h3><a href="#modules">Module Items</a></h3><ul class="block"><li><a href="#modules" title="Modules">Modules</a></li><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate detcore</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">detcore</a></div><h1>Module <span>aarch64_<wbr>lse</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/detcore/aarch64_lse/mod.rs.html#9-80">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Rewriting aarch64 load/store-exclusive retry loops to FEAT_LSE atomics.</p>
+<p>On aarch64 an <code>LDXR</code>/<code>STXR</code> pair retries whenever the local exclusive
+monitor is cleared between the two, which any exception does: a timer tick,
+an IPI, a page fault, a PMU overflow, a ptrace stop. Each retry retires the
+loop’s branches again, so the retired-branch count of identical guest work
+depends on host interrupt timing, and Hermit’s branch-counted schedule
+cannot be replayed exactly. A single LSE atomic cannot retry, so a program
+whose exclusive loops have been rewritten retires a fixed number of
+branches for the same work.</p>
+<p><a href="insn/index.html" title="mod detcore::aarch64_lse::insn"><code>insn</code></a> holds the decoder and the encoders; <a href="rewrite/index.html" title="mod detcore::aarch64_lse::rewrite"><code>rewrite</code></a> holds the idioms
+and the in-place replacement; <a href="elf/index.html" title="mod detcore::aarch64_lse::elf"><code>elf</code></a> applies them to the code of an ELF
+file’s executable sections, which <a href="mapping/index.html" title="mod detcore::aarch64_lse::mapping"><code>mapping</code></a> tells from the data those
+sections can also hold. All four are pure functions of their input and
+compile on every architecture, so their tests run everywhere.
+<code>hermit-cli</code> writes rewritten files with them; Detcore applies the same
+rewrite to a guest’s mapped pages.</p>
+</div></details><h2 id="modules" class="section-header">Modules<a href="#modules" class="anchor">§</a></h2><dl class="item-table"><dt><a class="mod" href="elf/index.html" title="mod detcore::aarch64_lse::elf">elf</a></dt><dd>Applying the exclusive-loop rewrite to the executable segments of an
+aarch64 ELF file.</dd><dt><a class="mod" href="insn/index.html" title="mod detcore::aarch64_lse::insn">insn</a></dt><dd>The subset of A64 this rewriter decodes, and the instructions it emits.</dd><dt><a class="mod" href="mapping/index.html" title="mod detcore::aarch64_lse::mapping">mapping</a></dt><dd>Telling code from data in an aarch64 ELF file’s executable sections, by
+the file’s mapping symbols.</dd><dt><a class="mod" href="rewrite/index.html" title="mod detcore::aarch64_lse::rewrite">rewrite</a></dt><dd>Rewriting canonical load/store-exclusive retry loops into single FEAT_LSE
+atomics, in place and at the same length.</dd></dl><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.REWRITE_FORMAT_VERSION.html" title="constant detcore::aarch64_lse::REWRITE_FORMAT_VERSION">REWRITE_<wbr>FORMAT_<wbr>VERSION</a></dt><dd>Bumped whenever the rewrite’s output for the same input can change. It is
+part of the overlay cache key, so a cached artifact from an older
+rewriter is never reused, and it is the algorithm identity a preemption
+record states for its run’s rewrite (<code>crate::preemptions</code>), so a replay
+under another version is refused rather than retiring other
+instructions. 3: only code is rewritten, as <a href="mapping/index.html" title="mod detcore::aarch64_lse::mapping"><code>mapping</code></a> tells it from
+data; none of the changes since 2 had bumped it, though the canonical
+shapes the refusal census added, the conditional compare-and-swap
+refusal, the direct-entry decoding and the positive allow-list each
+changed what the rewrite writes. 4: a sequence a known entry (the
+loader’s entry, a defined function symbol or an FDE start) points into
+is refused, as is a sub-word compare whose head is one. 5: literal loads
+of an FDE entry protect its instruction bytes from rewriting; only ADR
+address-taking can use the function-entry exemption. 6: literal readers
+in unknown executable ranges protect the bytes they reference, including
+bytes in other sections; only proven data is excluded from that scan.
+7: so do the reads through an <code>ADRP</code>’s page or an <code>ADR</code>’s address: an
+access the instruction bounds protects those bytes, and any other use,
+or the address held where the scan stops, every executable byte.
+8: a UDF #imm16 word, which traps and never branches, no longer refuses
+the image. 9: nor does a word of the SVE encodings, which hold no branch.
+10: flag-setting read-modify-write loops retain the original ALU
+instruction after the LSE atomic so their outgoing flags are preserved.
+11: literal and base readers in executable segment bytes no
+executable section covers protect the bytes they read, under
+their own refusal name, and direct branches out of those bytes
+count as branch targets. 12: a file whose executable section ends past
+the top of the address space is refused whole, and a relocation’s
+covered range saturates at the top instead of wrapping.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.host_has_lse_atomics.html" title="fn detcore::aarch64_lse::host_has_lse_atomics">host_<wbr>has_<wbr>lse_<wbr>atomics</a></dt><dd>Whether this host executes the FEAT_LSE atomics the rewrite emits.</dd></dl></section></div></main></body></html>

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hermit compatibility website builds</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 64rem; padding: 0 1rem; line-height: 1.5; color: #1f2328; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border-bottom: 1px solid #d0d7de; padding: 0.4rem 0.6rem; text-align: left; }
+td.number { text-align: right; }
+code { font-size: 0.95em; }
+</style>
+</head>
+<body>
+<p><a href="../../">Hermetic Infra</a> &middot; <a href="../latest/">Latest compatibility scorecard</a></p>
+<h1>Compatibility website builds</h1>
+<p>This site keeps 2 compatibility website builds, newest first. Each one is a complete copy of the website as it was published, and together they hold 916.2 MB.</p>
+<p>Retention rule: Keep the newest N builds published at or after not_before, where N = min(max_builds, floor(budget_bytes / file_bytes of the latest build)), and at least 1. The latest build is always kept and counts toward N. Every build stays downloadable as its GitHub release asset.</p>
+<p>Here the budget is 1000.0 MB, max_builds is 100, and the latest build holds 458.7 MB, so N = 2. N uses only the latest build's size, so the kept builds together can hold more or less than the budget, and the extra <a href="../latest/">latest</a> copy of the newest build is not counted. Apart from the latest build, builds published before 2026-10-26 09:16 ET are not kept here.</p>
+<p>All 105 builds, including those not kept here, are listed in <a href="../releases.json">releases.json</a> and stay downloadable from <a href="https://github.com/rrnewton/hermit/releases">the GitHub releases</a>.</p>
+<table>
+<thead><tr><th>Published</th><th>Hermit main</th><th>Size</th><th>Files</th><th>Build</th><th>Release</th></tr></thead>
+<tbody>
+<tr><td>2026-11-21 16:50 ET</td><td><a href="https://github.com/rrnewton/hermit/commit/cc650e862e6c86cd910bc49cb39ffac650a53bad"><code>cc650e862e6c</code></a></td><td class="number">458.7 MB</td><td class="number">5,348</td><td><a href="../c938603380d14e76b890fff22dd4fd2a933fc5eb466dbbca14675aa3171e5d26/"><code>c938603380d1</code></a> (latest)</td><td><a href="https://github.com/rrnewton/hermit/releases/tag/compatibility-website-c938603380d14e76b890fff22dd4fd2a933fc5eb466dbbca14675aa3171e5d26">release</a></td></tr>
+<tr><td>2026-11-21 13:53 ET</td><td><a href="https://github.com/rrnewton/hermit/commit/63f7344f73328fdf63cecc870aba21616f33679d"><code>63f7344f7332</code></a></td><td class="number">457.5 MB</td><td class="number">5,344</td><td><a href="../e7e59e00c8b2f22eb36f52fca8d3205260c11cee433240af493d1a8a903545d8/"><code>e7e59e00c8b2</code></a></td><td><a href="https://github.com/rrnewton/hermit/releases/tag/compatibility-website-e7e59e00c8b2f22eb36f52fca8d3205260c11cee433240af493d1a8a903545d8">release</a></td></tr>
+</tbody>
+</table>
+</body>
+</html>

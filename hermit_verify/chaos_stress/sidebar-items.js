@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["HERMIT_OUTCOMES","SKID_ATTEMPTS","SKID_OVERSHOOT_REFUSAL_PREFIX"],"enum":["RunOutcome"],"fn":["classify","is_skid_refusal"],"struct":["ChaosStressOpts"]};

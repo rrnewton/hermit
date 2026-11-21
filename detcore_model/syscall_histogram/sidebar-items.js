@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["SYSCALL_TABLE_SIZE"],"enum":["SyscallObservationGap","SyscallObservationScope","SyscallOutcome"],"fn":["pinned_syscall_table","raw_syscall_number_key"],"struct":["CompactSyscallHistogram","SparseSyscallHistogram","SyscallHistogram","SyscallHistogramEntry","SyscallHistogramSummary","SyscallOutcomes"]};

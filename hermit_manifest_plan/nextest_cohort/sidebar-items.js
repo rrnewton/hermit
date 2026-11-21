@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["PINNED_PROOF_PATH"],"fn":["capture","cpu_set","verify"]};
