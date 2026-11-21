@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["WatchStatus"],"fn":["adopt","hit_refusal","rearm_after_exec","specs","try_adopt"],"struct":["WatchOrder","WatchThread"]};

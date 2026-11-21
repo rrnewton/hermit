@@ -1,0 +1,57 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="The post-crash timeslice switch (`Config::post_crash_timeslice`)."><title>detcore::post_crash - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module post_crash</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../detcore/index.html">detcore</a><span class="version">0.5.7</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module post_<wbr>crash</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#enums" title="Enums">Enums</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate detcore</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">detcore</a></div><h1>Module <span>post_<wbr>crash</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/detcore/post_crash.rs.html#9-946">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>The post-crash timeslice switch (<code>Config::post_crash_timeslice</code>).</p>
+<p>A race that needs fine slices (<code>--max-timeslice</code> of 1000 to 10000) often
+reaches its crash in seconds and then spends minutes in the crash path:
+Android’s debuggerd handler starts <code>crash_dump</code>, which ptrace-attaches every
+thread of the crashed process, reads its registers and memory and unwinds
+it, and every branch of that is sliced. Once a guest process has crashed,
+the switch raises the slice bound of that process and of every process it
+goes on to create to the configured post-crash bound, for the rest of the
+run. Other processes (a harness that runs trials as children, a shell)
+keep their bound.</p>
+<p>A crash is a fatal signal on its way to ending a process
+(<a href="fn.is_crash_signal.html" title="fn detcore::post_crash::is_crash_signal"><code>is_crash_signal</code></a>). Every step below happens at a point the schedule
+orders, so it is taken at the same point of every run and replay that
+reaches it:</p>
+<ul>
+<li>a crash signal’s delivery that takes the default action switches at
+once, for the crashed process;</li>
+<li>one the guest catches arms the switch for that thread. The processes
+that thread’s process creates while it is armed (debuggerd’s
+pseudothread, and <code>crash_dump</code> before its exec) belong to its crash;</li>
+<li>a successful <code>execve</code> by a thread of such a process takes the switch for
+an armed crash of its own lineage whose handler is still running:
+Android’s crash handler starts <code>crash_dump</code> that way, from inside the
+handler. Crashes in unrelated processes keep separate lineages, and each
+crash in a process not yet switched takes a switch of its own. A switch
+applies to its whole process: every crash armed in it switches with it,
+and those crashes’ lineages take the bound too;</li>
+<li>an armed thread’s handler has returned once the kernel no longer blocks
+its crash signal for it (<code>signal_blocked</code>). That is read only where the
+armed thread itself is stopped at a point of its own: each syscall entry,
+before the call runs; each syscall exit or trap, after it completes and
+before the thread can give up its turn there; each end of one of its
+slices; each later signal delivery to it, before the kernel installs that
+handler’s mask. A thread gives up its turn only at such a point, and with
+threads serialized no other thread runs in between, so the state known
+at another thread’s <code>execve</code> is the armed thread’s own. A handler that resumes the faulting
+code (ART’s and JVMs’ implicit null checks) is disarmed at its thread’s
+next stop, and never switches.</li>
+</ul>
+<p>The scheduler keeps the <a href="struct.PostCrashState.html" title="struct detcore::post_crash::PostCrashState"><code>PostCrashState</code></a>; a thread of a crashed process
+learns the bound from the answer to its own step and from every later reply
+that resumes it from a grant (<code>GlobalResponse::WithPostCrashBound</code>), so it
+uses the bound from its first slice after the switch.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.PostCrashState.html" title="struct detcore::post_crash::PostCrashState">Post<wbr>Crash<wbr>State</a></dt><dd>The scheduler’s state of the switch.</dd><dt><a class="struct" href="struct.PostCrashSwitch.html" title="struct detcore::post_crash::PostCrashSwitch">Post<wbr>Crash<wbr>Switch</a></dt><dd>Where the switch was taken: recorded in a preemption record and reported
+in the run summary.</dd></dl><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.PostCrashCause.html" title="enum detcore::post_crash::PostCrashCause">Post<wbr>Crash<wbr>Cause</a></dt><dd>Why the switch was taken.</dd><dt><a class="enum" href="enum.PostCrashEvent.html" title="enum detcore::post_crash::PostCrashEvent">Post<wbr>Crash<wbr>Event</a></dt><dd>One step of the switch, sent by a guest thread
+(<code>GlobalRequest::PostCrash</code>).</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.admission_refusal.html" title="fn detcore::post_crash::admission_refusal">admission_<wbr>refusal</a></dt><dd>The refusal, by name, of a run whose <code>--post-crash-timeslice</code> switch is
+in effect on a backend that cannot see a caught crash’s handler return
+(<code>reads_handler_masks</code>): the switch would then take the default-action
+crashes and silently ignore every caught one, and the same guest would
+switch on ptrace and not there. Detcore has no handler-lifetime record of
+its own that a backend could share instead, so the run is refused before
+the guest starts (<code>GlobalState::initialize</code>), as unsupported options are.
+<code>None</code> when the switch is off or the backend reads the guests’ masks.</dd><dt><a class="fn" href="fn.is_crash_signal.html" title="fn detcore::post_crash::is_crash_signal">is_<wbr>crash_<wbr>signal</a></dt><dd>Whether <code>signal</code>, delivered with <code>si_code</code> (<code>None</code> when it could not be
+read), is a crash: SIGABRT however it was sent (<code>abort</code> sends it with
+<code>tgkill</code>), or SIGSEGV, SIGBUS, SIGILL, SIGFPE or SIGSYS raised by the
+kernel (<code>si_code &gt; 0</code>; a <code>kill</code>, <code>tgkill</code> or <code>sigqueue</code> sends them with
+<code>si_code &lt;= 0</code>, and a fault is the only kernel source of these).</dd></dl></section></div></main></body></html>

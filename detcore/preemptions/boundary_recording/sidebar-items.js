@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Recording"],"fn":["history_identity_from_json","history_identity_to_json"],"struct":["BoundaryRecording","Inspection","ThreadInspection"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["BASE_MOUNTPOINTS"],"fn":["assign_installed_rows","autofs_mountpoints","check_installed_rows","owned_mounts","parse_container_mounts","unescape_mountinfo_path"],"struct":["ContainerMount","ContainerMountTable","Installation"]};

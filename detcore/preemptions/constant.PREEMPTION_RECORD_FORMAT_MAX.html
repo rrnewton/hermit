@@ -1,0 +1,43 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="The newest preemption-record format this Hermit writes and reads (`PreemptionRecord::format_version`), one counter for every format change: a record of format N has every property of the formats before it."><title>PREEMPTION_RECORD_FORMAT_MAX in detcore::preemptions - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc constant"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">PREEMPTION_RECORD_FORMAT_MAX</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../detcore/index.html">detcore</a><span class="version">0.5.7</span></h2></div><div class="sidebar-elems"><div id="rustdoc-modnav"><h2><a href="index.html">In detcore::<wbr>preemptions</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">detcore</a>::<wbr><a href="index.html">preemptions</a></div><h1>Constant <span class="constant">PREEMPTION_<wbr>RECORD_<wbr>FORMAT_<wbr>MAX</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/detcore/preemptions.rs.html#540">Source</a> </span></div><pre class="rust item-decl"><code>pub const PREEMPTION_RECORD_FORMAT_MAX: <a class="primitive" href="https://doc.rust-lang.org/1.97.1/std/primitive.u32.html">u32</a> = INSTRUCTION_OFFSET_FORMAT; // 7u32</code></pre><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>The newest preemption-record format this Hermit writes and reads
+(<code>PreemptionRecord::format_version</code>), one counter for every format change:
+a record of format N has every property of the formats before it.</p>
+<ul>
+<li>Format 1 has no version field: every record written before the field
+existed.</li>
+<li>Format 2 (<a href="constant.TIME_SKIPS_FORMAT.html" title="constant detcore::preemptions::TIME_SKIPS_FORMAT"><code>TIME_SKIPS_FORMAT</code></a>) lists every jump of global time its run
+made (<code>time_skips</code>, absent when there was none).</li>
+<li>Format 3 (<a href="constant.SWITCH_IN_CHARGE_FORMAT.html" title="constant detcore::preemptions::SWITCH_IN_CHARGE_FORMAT"><code>SWITCH_IN_CHARGE_FORMAT</code></a>) was written by a run that charged
+every stretch of guest code a turn, so its replay charges a replayed
+switch-in under which guest code runs.</li>
+<li>Format 4 (<a href="constant.BACKGROUND_STARTS_FORMAT.html" title="constant detcore::preemptions::BACKGROUND_STARTS_FORMAT"><code>BACKGROUND_STARTS_FORMAT</code></a>) notes every background start its
+run took (<code>background_starts</code>), so its schedule replay begins each
+kernel-run call where the recording did.</li>
+<li>Format 5 (<a href="constant.STOPLESS_SLICE_ENDS_FORMAT.html" title="constant detcore::preemptions::STOPLESS_SLICE_ENDS_FORMAT"><code>STOPLESS_SLICE_ENDS_FORMAT</code></a>) may mark a Branch event
+<code>stopless</code>: a lone thread’s timeslice end its run took without a stop,
+so the event has no <code>end_rip</code>, and a replay takes that end without a stop
+where its thread runs alone.</li>
+<li>Format 6 (<a href="constant.INSTRUCTION_OFFSET_ROWS_FORMAT.html" title="constant detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT"><code>INSTRUCTION_OFFSET_ROWS_FORMAT</code></a>) may hold
+<code>--chaos-instruction-offset</code> decisions in its rows. Rows alone
+(<code>PreemptionRecord::rows_alone</code>) follow format 1’s timing rules
+(<code>PreemptionRecord::timing_format</code>).</li>
+</ul>
+<p>A record that drops one feature’s data while it keeps a later feature’s
+follows one rule. A feature that can be lowered without breaking replay
+is lowered, its data cleared with it: a record that notes no background
+starts holds no <code>stopless</code> marks
+(<code>PreemptionRecord::forget_stopless_marks_below_their_format</code>). One that
+cannot be lowered keeps its number and marks the earlier feature’s data
+absent with an explicit flag instead of clearing it: rows with
+instruction offsets keep format 6 and say that they note no background
+starts (<code>PreemptionRecord::background_starts_unnoted</code>), as rows alone say
+they hold no schedule trace (<code>PreemptionRecord::rows_alone</code>). So a reader
+decides what a record holds by its format and those flags together
+(<code>PreemptionRecord::notes_background_starts</code>,
+<code>PreemptionRecord::timing_format</code>), never by the number alone, and a
+Hermit that reads only older formats still refuses the record by its
+number.</p>
+<p>A record of a newer format is refused (<code>PreemptionRecord::validate_format</code>),
+so a Hermit that reads only formats 1 to 4 refuses a record with such
+marks rather than replay it with a stop it would not find at those ends, and
+one that reads only formats 1 to 5 refuses a record with offset rows.</p>
+</div></details></section></div></main></body></html>

@@ -1,0 +1,852 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `hermit-cli/src/bin/hermit/analyze/types.rs`."><title>types.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../../../../" data-static-root-path="../../../../../static.files/" data-current-crate="hermit" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../../../static.files/src-script-813739b1.js"></script><script defer src="../../../../../src-files.js"></script><script defer src="../../../../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">hermit/bin/hermit/analyze/</div>types.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-3"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="comment">/*
+<a href=#2 id=2 data-nosnippet>2</a> * Copyright (c) Meta Platforms, Inc. and affiliates.
+<a href=#3 id=3 data-nosnippet>3</a> * All rights reserved.
+<a href=#4 id=4 data-nosnippet>4</a> *
+<a href=#5 id=5 data-nosnippet>5</a> * This source code is licensed under the BSD-style license found in the
+<a href=#6 id=6 data-nosnippet>6</a> * LICENSE file in the root directory of this source tree.
+<a href=#7 id=7 data-nosnippet>7</a> */
+<a href=#8 id=8 data-nosnippet>8</a>
+<a href=#9 id=9 data-nosnippet>9</a></span><span class="doccomment">//! A mode for analyzing a hermit run.
+<a href=#10 id=10 data-nosnippet>10</a>
+<a href=#11 id=11 data-nosnippet>11</a></span><span class="kw">use </span>std::num::NonZeroU64;
+<a href=#12 id=12 data-nosnippet>12</a><span class="kw">use </span>std::path::PathBuf;
+<a href=#13 id=13 data-nosnippet>13</a><span class="kw">use </span>std::str::FromStr;
+<a href=#14 id=14 data-nosnippet>14</a><span class="kw">use </span>std::time::Duration;
+<a href=#15 id=15 data-nosnippet>15</a>
+<a href=#16 id=16 data-nosnippet>16</a><span class="kw">use </span>clap::Parser;
+<a href=#17 id=17 data-nosnippet>17</a><span class="kw">use </span>regex::Regex;
+<a href=#18 id=18 data-nosnippet>18</a><span class="kw">use </span>reverie::PrettyBacktrace;
+<a href=#19 id=19 data-nosnippet>19</a><span class="kw">use </span>reverie::process::ExitStatus;
+<a href=#20 id=20 data-nosnippet>20</a><span class="kw">use </span>serde::Deserialize;
+<a href=#21 id=21 data-nosnippet>21</a><span class="kw">use </span>serde::Serialize;
+<a href=#22 id=22 data-nosnippet>22</a><span class="kw">use </span>tracing::metadata::LevelFilter;
+<a href=#23 id=23 data-nosnippet>23</a>
+<a href=#24 id=24 data-nosnippet>24</a><span class="kw">use </span><span class="kw">crate</span>::app::analyze::budget::Budget;
+<a href=#25 id=25 data-nosnippet>25</a><span class="kw">use </span><span class="kw">crate</span>::app::analyze::budget::BudgetKind;
+<a href=#26 id=26 data-nosnippet>26</a><span class="kw">use </span><span class="kw">crate</span>::app::analyze::budget::TimeBudget;
+<a href=#27 id=27 data-nosnippet>27</a><span class="kw">use </span><span class="kw">crate</span>::app::analyze::budget::TrialBudget;
+<a href=#28 id=28 data-nosnippet>28</a><span class="kw">use </span><span class="kw">crate</span>::app::analyze::checkpoint::BisectInterval;
+<a href=#29 id=29 data-nosnippet>29</a><span class="kw">use </span><span class="kw">crate</span>::app::analyze::checkpoint::Journal;
+<a href=#30 id=30 data-nosnippet>30</a><span class="kw">use </span><span class="kw">crate</span>::app::analyze::checkpoint::Phase;
+<a href=#31 id=31 data-nosnippet>31</a><span class="kw">use </span><span class="kw">crate</span>::app::analyze::checkpoint::PrefixBracket;
+<a href=#32 id=32 data-nosnippet>32</a><span class="kw">use </span><span class="kw">crate</span>::app::analyze::checkpoint::Progress;
+<a href=#33 id=33 data-nosnippet>33</a><span class="kw">use </span><span class="kw">crate</span>::app::analyze::checkpoint::ProgressHandle;
+<a href=#34 id=34 data-nosnippet>34</a><span class="kw">use </span><span class="kw">crate</span>::app::analyze::races::RacingAccesses;
+<a href=#35 id=35 data-nosnippet>35</a><span class="kw">use </span><span class="kw">crate</span>::app::analyze::rundata::HermitRun;
+<a href=#36 id=36 data-nosnippet>36</a><span class="kw">use </span><span class="kw">crate</span>::app::analyze::rundata::TrialRunner;
+<a href=#37 id=37 data-nosnippet>37</a><span class="kw">use </span><span class="kw">crate</span>::app::analyze::verdict::Verdict;
+<a href=#38 id=38 data-nosnippet>38</a><span class="kw">use </span><span class="kw">crate</span>::app::analyze::verdict::VerdictReason;
+<a href=#39 id=39 data-nosnippet>39</a>
+<a href=#40 id=40 data-nosnippet>40</a><span class="doccomment">/// Repeat a run multiple times in a controlled search to find concurrency bugs.
+<a href=#41 id=41 data-nosnippet>41</a>///
+<a href=#42 id=42 data-nosnippet>42</a>/// Hermit analyze searches over runs of `hermit run`, and its primary input is a set of CLI flags
+<a href=#43 id=43 data-nosnippet>43</a>/// that constitute a hermit run, i.e., ARGS in `hermit run ARGS`.  These arguments are passed to
+<a href=#44 id=44 data-nosnippet>44</a>/// all runs that analyze considers (but some options may be overwritten by the settings varied by
+<a href=#45 id=45 data-nosnippet>45</a>/// analyze's search process).
+<a href=#46 id=46 data-nosnippet>46</a>///
+<a href=#47 id=47 data-nosnippet>47</a>/// The analyzer is interested in programs with some *target* property (such as non-zero exit code
+<a href=#48 id=48 data-nosnippet>48</a>/// due to crashing).  Analyze must have, or find, a `hermit run` execution that exhibits this
+<a href=#49 id=49 data-nosnippet>49</a>/// target property. If the target "run1" is not explicitly provided, the tool can search for it
+<a href=#50 id=50 data-nosnippet>50</a>/// (--search).
+<a href=#51 id=51 data-nosnippet>51</a>///
+<a href=#52 id=52 data-nosnippet>52</a>/// Analyze must also have a second (baseline) one that does not. If a "run2" is not provided,
+<a href=#53 id=53 data-nosnippet>53</a>/// analyze assumes that a hermit run without chaos is the baseline.
+<a href=#54 id=54 data-nosnippet>54</a>///
+<a href=#55 id=55 data-nosnippet>55</a>/// Finally, given a target and a baseline run, the job of analyze is to search between them and
+<a href=#56 id=56 data-nosnippet>56</a>/// find the critical events: instructions which, when reordered, cause the target property to hold
+<a href=#57 id=57 data-nosnippet>57</a>/// or not.  This is evidence of an order violation or race condition bug, and means the the program
+<a href=#58 id=58 data-nosnippet>58</a>/// has at least one concurrency bug.
+<a href=#59 id=59 data-nosnippet>59</a>///
+<a href=#60 id=60 data-nosnippet>60</a>/// The critical events are identified to the user by printing their stack traces, optionally into a
+<a href=#61 id=61 data-nosnippet>61</a>/// separate report file.
+<a href=#62 id=62 data-nosnippet>62</a></span><span class="attr">#[derive(Debug, Parser, Clone)]
+<a href=#63 id=63 data-nosnippet>63</a></span><span class="kw">pub struct </span>AnalyzeOpts {
+<a href=#64 id=64 data-nosnippet>64</a>    <span class="doccomment">/// Target: Analyze runs that have collected stdout output matching this regular expression.
+<a href=#65 id=65 data-nosnippet>65</a>    </span><span class="attr">#[clap(long, value_name = <span class="string">"REGEX"</span>)]
+<a href=#66 id=66 data-nosnippet>66</a>    </span><span class="kw">pub </span>target_stdout: <span class="prelude-ty">Option</span>&lt;Regex&gt;,
+<a href=#67 id=67 data-nosnippet>67</a>
+<a href=#68 id=68 data-nosnippet>68</a>    <span class="doccomment">/// Target: Analyze runs that have collected stderr output matching this regular expression.
+<a href=#69 id=69 data-nosnippet>69</a>    </span><span class="attr">#[clap(long, value_name = <span class="string">"REGEX"</span>)]
+<a href=#70 id=70 data-nosnippet>70</a>    </span><span class="kw">pub </span>target_stderr: <span class="prelude-ty">Option</span>&lt;Regex&gt;,
+<a href=#71 id=71 data-nosnippet>71</a>
+<a href=#72 id=72 data-nosnippet>72</a>    <span class="doccomment">/// Target: Analyze runs that have the specified exit code, 0 to 255, as a shell reports it:
+<a href=#73 id=73 data-nosnippet>73</a>    /// the guest's own, or 128 plus the signal number when a signal killed it (134 for SIGABRT,
+<a href=#74 id=74 data-nosnippet>74</a>    /// which also matches a guest that exits 134).  Accepts "nonzero" for all nonzero exit codes.
+<a href=#75 id=75 data-nosnippet>75</a>    /// Accepts "none" or "any" for no filter at all (accepts any exit code).  The default is
+<a href=#76 id=76 data-nosnippet>76</a>    /// "nonzero" because it's very common to analyze a bug that causes the program to crash or
+<a href=#77 id=77 data-nosnippet>77</a>    /// error.
+<a href=#78 id=78 data-nosnippet>78</a>    </span><span class="attr">#[clap(long, default_value = <span class="string">"nonzero"</span>, value_name = <span class="string">"NUM|nonzero|any"</span>)]
+<a href=#79 id=79 data-nosnippet>79</a>    </span><span class="kw">pub </span>target_exit_code: ExitStatusConstraint,
+<a href=#80 id=80 data-nosnippet>80</a>
+<a href=#81 id=81 data-nosnippet>81</a>    <span class="doccomment">/// The trials' log level, as --trial-log sets it, which wins when both are given. This
+<a href=#82 id=82 data-nosnippet>82</a>    /// also accepts `error` and `trace`; a level above warn writes each trial's log into its
+<a href=#83 id=83 data-nosnippet>83</a>    /// own file in the workspace. Errors are kept at `off` too, as with --trial-log=off.
+<a href=#84 id=84 data-nosnippet>84</a>    </span><span class="attr">#[clap(short, long, value_name = <span class="string">"LEVEL"</span>, env = <span class="string">"HERMIT_LOG"</span>)]
+<a href=#85 id=85 data-nosnippet>85</a>    </span><span class="kw">pub </span>guest_log: <span class="prelude-ty">Option</span>&lt;LevelFilter&gt;,
+<a href=#86 id=86 data-nosnippet>86</a>
+<a href=#87 id=87 data-nosnippet>87</a>    <span class="doccomment">/// Whether `guest_log` came from its environment variable, HERMIT_LOG, which the
+<a href=#88 id=88 data-nosnippet>88</a>    /// workspace's retention names.
+<a href=#89 id=89 data-nosnippet>89</a>    </span><span class="attr">#[clap(skip)]
+<a href=#90 id=90 data-nosnippet>90</a>    </span><span class="kw">pub </span>guest_log_from_env: bool,
+<a href=#91 id=91 data-nosnippet>91</a>
+<a href=#92 id=92 data-nosnippet>92</a>    <span class="doccomment">/// Insist on perfect determinism before proceeding with the analysis.
+<a href=#93 id=93 data-nosnippet>93</a>    </span><span class="attr">#[clap(long)]
+<a href=#94 id=94 data-nosnippet>94</a>    </span><span class="kw">pub </span>selfcheck: bool,
+<a href=#95 id=95 data-nosnippet>95</a>
+<a href=#96 id=96 data-nosnippet>96</a>    <span class="doccomment">/// If the first run doesn't match the target criteria, search for one that does.
+<a href=#97 id=97 data-nosnippet>97</a>    </span><span class="attr">#[clap(long)]
+<a href=#98 id=98 data-nosnippet>98</a>    </span><span class="kw">pub </span>search: bool,
+<a href=#99 id=99 data-nosnippet>99</a>
+<a href=#100 id=100 data-nosnippet>100</a>    <span class="doccomment">/// If the first run doesn't match the target criteria, search for one that does.
+<a href=#101 id=101 data-nosnippet>101</a>    </span><span class="attr">#[clap(long)]
+<a href=#102 id=102 data-nosnippet>102</a>    </span><span class="kw">pub </span>run_needleman: bool,
+<a href=#103 id=103 data-nosnippet>103</a>
+<a href=#104 id=104 data-nosnippet>104</a>    <span class="doccomment">/// Before searching, minimize the target run's chaos-mode interventions (its preemptions
+<a href=#105 id=105 data-nosnippet>105</a>    /// and priority changes) to those it needs to meet the target criteria, by knocking them out
+<a href=#106 id=106 data-nosnippet>106</a>    /// a batch at a time. This may accelerate the subsequent binary search.
+<a href=#107 id=107 data-nosnippet>107</a>    ///
+<a href=#108 id=108 data-nosnippet>108</a>    /// The baseline is then the minimized record with its latest intervention knocked out, and
+<a href=#109 id=109 data-nosnippet>109</a>    /// knocked out again while the replay still meets the target. When no intervention is left,
+<a href=#110 id=110 data-nosnippet>110</a>    /// there is no baseline to bisect against and the analysis ends with that error, as it does
+<a href=#111 id=111 data-nosnippet>111</a>    /// with the run's own error for a knocked-out run that does not finish; `--prefix-search`
+<a href=#112 id=112 data-nosnippet>112</a>    /// needs no baseline. So `--minimize` finds its own baseline and does not
+<a href=#113 id=113 data-nosnippet>113</a>    /// take `--run2-seed`, `--run2-preemptions` or `--run2-schedule`. To search between a given
+<a href=#114 id=114 data-nosnippet>114</a>    /// pair of runs, omit `--minimize`.
+<a href=#115 id=115 data-nosnippet>115</a>    </span><span class="attr">#[clap(
+<a href=#116 id=116 data-nosnippet>116</a>        long,
+<a href=#117 id=117 data-nosnippet>117</a>        conflicts_with = <span class="string">"run2_seed"</span>,
+<a href=#118 id=118 data-nosnippet>118</a>        conflicts_with = <span class="string">"run2_preemptions"</span>,
+<a href=#119 id=119 data-nosnippet>119</a>        conflicts_with = <span class="string">"run2_schedule"
+<a href=#120 id=120 data-nosnippet>120</a>    </span>)]
+<a href=#121 id=121 data-nosnippet>121</a>    </span><span class="kw">pub </span>minimize: bool,
+<a href=#122 id=122 data-nosnippet>122</a>
+<a href=#123 id=123 data-nosnippet>123</a>    <span class="doccomment">/// Search within the target run's schedule instead of between it and a baseline run.
+<a href=#124 id=124 data-nosnippet>124</a>    ///
+<a href=#125 id=125 data-nosnippet>125</a>    /// Each trial replays the first K events of the target schedule and then lets the
+<a href=#126 id=126 data-nosnippet>126</a>    /// scheduler continue without chaos. Replaying none of it gives the baseline outcome and
+<a href=#127 id=127 data-nosnippet>127</a>    /// replaying all of it the target outcome; a binary search finds the K at which the
+<a href=#128 id=128 data-nosnippet>128</a>    /// outcome flips. Event #K is the scheduling decision that commits the run to the target:
+<a href=#129 id=129 data-nosnippet>129</a>    /// the report shows the stack of the thread the target schedule runs there and of the
+<a href=#130 id=130 data-nosnippet>130</a>    /// thread the scheduler would run instead. Each stack is taken where the trial's replay
+<a href=#131 id=131 data-nosnippet>131</a>    /// consumes the recorded event at position K, however many polling retries the trial
+<a href=#132 id=132 data-nosnippet>132</a>    /// made before it.
+<a href=#133 id=133 data-nosnippet>133</a>    ///
+<a href=#134 id=134 data-nosnippet>134</a>    /// Unlike the default search, it needs no baseline schedule, so events that only one of
+<a href=#135 id=135 data-nosnippet>135</a>    /// two unrelated runs executed (timeslices that end at other points, iterations of a
+<a href=#136 id=136 data-nosnippet>136</a>    /// polling loop) cannot stop it. It takes about log2(schedule length) trials, two more for
+<a href=#137 id=137 data-nosnippet>137</a>    /// each continuation (`--continuation-timeslice`) it tries, and two to recheck the
+<a href=#138 id=138 data-nosnippet>138</a>    /// boundary.
+<a href=#139 id=139 data-nosnippet>139</a>    </span><span class="attr">#[clap(
+<a href=#140 id=140 data-nosnippet>140</a>        long,
+<a href=#141 id=141 data-nosnippet>141</a>        conflicts_with = <span class="string">"minimize"</span>,
+<a href=#142 id=142 data-nosnippet>142</a>        conflicts_with = <span class="string">"run2_seed"</span>,
+<a href=#143 id=143 data-nosnippet>143</a>        conflicts_with = <span class="string">"run2_preemptions"</span>,
+<a href=#144 id=144 data-nosnippet>144</a>        conflicts_with = <span class="string">"run2_schedule"</span>,
+<a href=#145 id=145 data-nosnippet>145</a>        conflicts_with = <span class="string">"run_needleman"
+<a href=#146 id=146 data-nosnippet>146</a>    </span>)]
+<a href=#147 id=147 data-nosnippet>147</a>    </span><span class="kw">pub </span>prefix_search: bool,
+<a href=#148 id=148 data-nosnippet>148</a>
+<a href=#149 id=149 data-nosnippet>149</a>    <span class="doccomment">/// The timeslice, in virtual nanoseconds, with which `--prefix-search` trials continue
+<a href=#150 id=150 data-nosnippet>150</a>    /// without chaos after their replayed prefix: `auto` (the default) or a number.
+<a href=#151 id=151 data-nosnippet>151</a>    ///
+<a href=#152 id=152 data-nosnippet>152</a>    /// A race found only at a short timeslice often shows without chaos at that timeslice too:
+<a href=#153 id=153 data-nosnippet>153</a>    /// the scheduler alone, replaying none of the target schedule, already meets the target,
+<a href=#154 id=154 data-nosnippet>154</a>    /// and the search has nothing to bisect against. With `auto` the search continues at the
+<a href=#155 id=155 data-nosnippet>155</a>    /// run's own `--max-timeslice`, and when that cannot serve (the scheduler alone meets the
+<a href=#156 id=156 data-nosnippet>156</a>    /// target, or replaying the whole schedule misses it) at hermit's default 200 ms. This also
+<a href=#157 id=157 data-nosnippet>157</a>    /// applies to the prefix search the default search falls back to. The report names the
+<a href=#158 id=158 data-nosnippet>158</a>    /// timeslice the search used.
+<a href=#159 id=159 data-nosnippet>159</a>    ///
+<a href=#160 id=160 data-nosnippet>160</a>    /// The value is the trials' `--max-timeslice`, which also ends the replayed prefix's
+<a href=#161 id=161 data-nosnippet>161</a>    /// slices that its schedule does not end, so it may not be shorter than the run's own, and
+<a href=#162 id=162 data-nosnippet>162</a>    /// a run whose arguments disable PMU timeslices takes none.
+<a href=#163 id=163 data-nosnippet>163</a>    </span><span class="attr">#[clap(long, value_name = <span class="string">"NANOS|auto"</span>, default_value = <span class="string">"auto"</span>)]
+<a href=#164 id=164 data-nosnippet>164</a>    </span><span class="kw">pub </span>continuation_timeslice: ContinuationTimeslice,
+<a href=#165 id=165 data-nosnippet>165</a>
+<a href=#166 id=166 data-nosnippet>166</a>    <span class="doccomment">/// Use `--imprecise-timers` during the (chaos) search phase. Only has an effect if search is
+<a href=#167 id=167 data-nosnippet>167</a>    /// enabled.
+<a href=#168 id=168 data-nosnippet>168</a>    </span><span class="attr">#[clap(long)]
+<a href=#169 id=169 data-nosnippet>169</a>    </span><span class="kw">pub </span>imprecise_search: bool,
+<a href=#170 id=170 data-nosnippet>170</a>
+<a href=#171 id=171 data-nosnippet>171</a>    <span class="doccomment">/// Identify the target execution by chaos seed (hermit run --seed).
+<a href=#172 id=172 data-nosnippet>172</a>    ///
+<a href=#173 id=173 data-nosnippet>173</a>    /// It is an error if this execution does not meet the indicated target criteria.
+<a href=#174 id=174 data-nosnippet>174</a>    </span><span class="attr">#[clap(
+<a href=#175 id=175 data-nosnippet>175</a>        long,
+<a href=#176 id=176 data-nosnippet>176</a>        conflicts_with = <span class="string">"run1_preemptions"</span>,
+<a href=#177 id=177 data-nosnippet>177</a>        conflicts_with = <span class="string">"run1_schedule"</span>,
+<a href=#178 id=178 data-nosnippet>178</a>        value_name = <span class="string">"NUM"
+<a href=#179 id=179 data-nosnippet>179</a>    </span>)]
+<a href=#180 id=180 data-nosnippet>180</a>    </span><span class="kw">pub </span>run1_seed: <span class="prelude-ty">Option</span>&lt;u64&gt;,
+<a href=#181 id=181 data-nosnippet>181</a>
+<a href=#182 id=182 data-nosnippet>182</a>    <span class="doccomment">/// Load target execution from hermit run --record-preemptions-to.
+<a href=#183 id=183 data-nosnippet>183</a>    ///
+<a href=#184 id=184 data-nosnippet>184</a>    /// Analyze replays the record as the target run. It is an error if that replay does not meet
+<a href=#185 id=185 data-nosnippet>185</a>    /// the indicated target criteria.
+<a href=#186 id=186 data-nosnippet>186</a>    </span><span class="attr">#[clap(
+<a href=#187 id=187 data-nosnippet>187</a>        long,
+<a href=#188 id=188 data-nosnippet>188</a>        conflicts_with = <span class="string">"run1_seed"</span>,
+<a href=#189 id=189 data-nosnippet>189</a>        conflicts_with = <span class="string">"run1_schedule"</span>,
+<a href=#190 id=190 data-nosnippet>190</a>        value_name = <span class="string">"PATH"
+<a href=#191 id=191 data-nosnippet>191</a>    </span>)]
+<a href=#192 id=192 data-nosnippet>192</a>    </span><span class="kw">pub </span>run1_preemptions: <span class="prelude-ty">Option</span>&lt;PathBuf&gt;,
+<a href=#193 id=193 data-nosnippet>193</a>
+<a href=#194 id=194 data-nosnippet>194</a>    <span class="doccomment">/// Not implemented: `hermit analyze` refuses this option (exit 122).
+<a href=#195 id=195 data-nosnippet>195</a>    /// Identify the target run with --run1-preemptions or --run1-seed.
+<a href=#196 id=196 data-nosnippet>196</a>    </span><span class="attr">#[clap(
+<a href=#197 id=197 data-nosnippet>197</a>        long,
+<a href=#198 id=198 data-nosnippet>198</a>        conflicts_with = <span class="string">"run1_seed"</span>,
+<a href=#199 id=199 data-nosnippet>199</a>        conflicts_with = <span class="string">"run1_preemptions"</span>,
+<a href=#200 id=200 data-nosnippet>200</a>        value_name = <span class="string">"PATH"
+<a href=#201 id=201 data-nosnippet>201</a>    </span>)]
+<a href=#202 id=202 data-nosnippet>202</a>    </span><span class="kw">pub </span>run1_schedule: <span class="prelude-ty">Option</span>&lt;PathBuf&gt;,
+<a href=#203 id=203 data-nosnippet>203</a>
+<a href=#204 id=204 data-nosnippet>204</a>    <span class="doccomment">/// Optionally use a second chaos seed to identify the baseline run that
+<a href=#205 id=205 data-nosnippet>205</a>    /// does NOT meet the target criteria.
+<a href=#206 id=206 data-nosnippet>206</a>    </span><span class="attr">#[clap(
+<a href=#207 id=207 data-nosnippet>207</a>        long,
+<a href=#208 id=208 data-nosnippet>208</a>        conflicts_with = <span class="string">"run2_preemptions"</span>,
+<a href=#209 id=209 data-nosnippet>209</a>        conflicts_with = <span class="string">"run2_schedule"</span>,
+<a href=#210 id=210 data-nosnippet>210</a>        value_name = <span class="string">"NUM"
+<a href=#211 id=211 data-nosnippet>211</a>    </span>)]
+<a href=#212 id=212 data-nosnippet>212</a>    </span><span class="kw">pub </span>run2_seed: <span class="prelude-ty">Option</span>&lt;u64&gt;,
+<a href=#213 id=213 data-nosnippet>213</a>
+<a href=#214 id=214 data-nosnippet>214</a>    <span class="doccomment">/// Load baseline execution from hermit run --record-preemptions-to.
+<a href=#215 id=215 data-nosnippet>215</a>    </span><span class="attr">#[clap(
+<a href=#216 id=216 data-nosnippet>216</a>        long,
+<a href=#217 id=217 data-nosnippet>217</a>        conflicts_with = <span class="string">"run2_seed"</span>,
+<a href=#218 id=218 data-nosnippet>218</a>        conflicts_with = <span class="string">"run2_schedule"</span>,
+<a href=#219 id=219 data-nosnippet>219</a>        value_name = <span class="string">"PATH"
+<a href=#220 id=220 data-nosnippet>220</a>    </span>)]
+<a href=#221 id=221 data-nosnippet>221</a>    </span><span class="kw">pub </span>run2_preemptions: <span class="prelude-ty">Option</span>&lt;PathBuf&gt;,
+<a href=#222 id=222 data-nosnippet>222</a>
+<a href=#223 id=223 data-nosnippet>223</a>    <span class="doccomment">/// Not implemented: `hermit analyze` refuses this option (exit 122).
+<a href=#224 id=224 data-nosnippet>224</a>    /// Identify the baseline run with --run2-preemptions or --run2-seed.
+<a href=#225 id=225 data-nosnippet>225</a>    </span><span class="attr">#[clap(
+<a href=#226 id=226 data-nosnippet>226</a>        long,
+<a href=#227 id=227 data-nosnippet>227</a>        conflicts_with = <span class="string">"run2_seed"</span>,
+<a href=#228 id=228 data-nosnippet>228</a>        conflicts_with = <span class="string">"run2_preemptions"</span>,
+<a href=#229 id=229 data-nosnippet>229</a>        value_name = <span class="string">"PATH"
+<a href=#230 id=230 data-nosnippet>230</a>    </span>)]
+<a href=#231 id=231 data-nosnippet>231</a>    </span><span class="kw">pub </span>run2_schedule: <span class="prelude-ty">Option</span>&lt;PathBuf&gt;,
+<a href=#232 id=232 data-nosnippet>232</a>
+<a href=#233 id=233 data-nosnippet>233</a>    <span class="doccomment">/// A path to write the final analyze result, showing the critical event stack traces.
+<a href=#234 id=234 data-nosnippet>234</a>    ///
+<a href=#235 id=235 data-nosnippet>235</a>    /// Otherwise it is written to stdout.
+<a href=#236 id=236 data-nosnippet>236</a>    </span><span class="attr">#[clap(long)]
+<a href=#237 id=237 data-nosnippet>237</a>    </span><span class="kw">pub </span>report_file: <span class="prelude-ty">Option</span>&lt;PathBuf&gt;,
+<a href=#238 id=238 data-nosnippet>238</a>
+<a href=#239 id=239 data-nosnippet>239</a>    <span class="doccomment">/// Leave out the report's "Racing accesses" section.
+<a href=#240 id=240 data-nosnippet>240</a>    ///
+<a href=#241 id=241 data-nosnippet>241</a>    /// By default the final replays on each side of the deciding event also record an access
+<a href=#242 id=242 data-nosnippet>242</a>    /// trace (`hermit run --record-access-trace-to`) from 20,000 events before it, analyze
+<a href=#243 id=243 data-nosnippet>243</a>    /// names the first pair of conflicting syscalls on two threads whose order flips between
+<a href=#244 id=244 data-nosnippet>244</a>    /// them, says whether any edge Hermit observes orders them, and one more replay takes both
+<a href=#245 id=245 data-nosnippet>245</a>    /// calls' stacks. When the evidence singles out no pair, it ranks up to three candidates,
+<a href=#246 id=246 data-nosnippet>246</a>    /// each saying what differs between the runs, and checks each by replaying one run with
+<a href=#247 id=247 data-nosnippet>247</a>    /// its order reversed beside an unedited control. A rank is not a verdict: a candidate is
+<a href=#248 id=248 data-nosnippet>248</a>    /// shown to decide the outcome only when its reversal changes the outcome and the control
+<a href=#249 id=249 data-nosnippet>249</a>    /// does not. The trace needs the ptrace backend and sequentialized threads; elsewhere the
+<a href=#250 id=250 data-nosnippet>250</a>    /// section says it is unavailable and why.
+<a href=#251 id=251 data-nosnippet>251</a>    </span><span class="attr">#[clap(long)]
+<a href=#252 id=252 data-nosnippet>252</a>    </span><span class="kw">pub </span>no_racing_accesses: bool,
+<a href=#253 id=253 data-nosnippet>253</a>
+<a href=#254 id=254 data-nosnippet>254</a>    <span class="doccomment">/// How many access-trace records after the deciding event the "Racing accesses" section
+<a href=#255 id=255 data-nosnippet>255</a>    /// reads from each replay; a trace that goes on past it is reported as truncated.
+<a href=#256 id=256 data-nosnippet>256</a>    </span><span class="attr">#[clap(long, value_name = <span class="string">"RECORDS"</span>, default_value = <span class="string">"50000"</span>)]
+<a href=#257 id=257 data-nosnippet>257</a>    </span><span class="kw">pub </span>race_window: usize,
+<a href=#258 id=258 data-nosnippet>258</a>
+<a href=#259 id=259 data-nosnippet>259</a>    <span class="comment">// TODO: run2_schedule
+<a href=#260 id=260 data-nosnippet>260</a>    //
+<a href=#261 id=261 data-nosnippet>261</a>    </span><span class="doccomment">/// Use to seed the PRNG that supplies randomness to the analyzer when it is making random
+<a href=#262 id=262 data-nosnippet>262</a>    /// decisions during search or minimization.  If unset, then system randomness is used.
+<a href=#263 id=263 data-nosnippet>263</a>    </span><span class="attr">#[clap(long)]
+<a href=#264 id=264 data-nosnippet>264</a>    </span><span class="kw">pub </span>analyze_seed: <span class="prelude-ty">Option</span>&lt;u64&gt;,
+<a href=#265 id=265 data-nosnippet>265</a>
+<a href=#266 id=266 data-nosnippet>266</a>    <span class="doccomment">/// Print quite a bit of extra information so that you can see exactly what is happening:
+<a href=#267 id=267 data-nosnippet>267</a>    /// every run's reproducer command, the guest's output and the search's steps.
+<a href=#268 id=268 data-nosnippet>268</a>    ///
+<a href=#269 id=269 data-nosnippet>269</a>    /// Analyze keeps the workspace when it exits, as --keep-tmp does, so that the files the
+<a href=#270 id=270 data-nosnippet>270</a>    /// reproducers name can be read. It does not raise the trials' log level: --trial-log
+<a href=#271 id=271 data-nosnippet>271</a>    /// does.
+<a href=#272 id=272 data-nosnippet>272</a>    </span><span class="attr">#[clap(long, short)]
+<a href=#273 id=273 data-nosnippet>273</a>    </span><span class="kw">pub </span>verbose: bool,
+<a href=#274 id=274 data-nosnippet>274</a>
+<a href=#275 id=275 data-nosnippet>275</a>    <span class="doccomment">/// How much each run analyze starts logs, and where: `warn` (the default), `off`, `info`
+<a href=#276 id=276 data-nosnippet>276</a>    /// or `debug`.
+<a href=#277 id=277 data-nosnippet>277</a>    ///
+<a href=#278 id=278 data-nosnippet>278</a>    /// At `warn` a run's warnings and errors go to analyze's stderr, as those of `hermit run`
+<a href=#279 id=279 data-nosnippet>279</a>    /// do, and `off` drops the warnings: errors still go there, since the reason Hermit gives
+<a href=#280 id=280 data-nosnippet>280</a>    /// when it refuses a trial is one. At `info` or `debug` each run writes its log, at that level,
+<a href=#281 id=281 data-nosnippet>281</a>    /// into a file of its own in the workspace (`&lt;run&gt;.log`, see --tmp-dir), and analyze keeps
+<a href=#282 id=282 data-nosnippet>282</a>    /// the workspace when it exits, as --keep-tmp does, so that the logs can be read. A debug
+<a href=#283 id=283 data-nosnippet>283</a>    /// log can grow to gigabytes per run and make the run several times slower, so a trial a
+<a href=#284 id=284 data-nosnippet>284</a>    /// bound stops then gets through less of the program. --selfcheck logs the runs whose logs
+<a href=#285 id=285 data-nosnippet>285</a>    /// it compares (the target run, the --search run that becomes it, the runs of --minimize
+<a href=#286 id=286 data-nosnippet>286</a>    /// and the target's replay) at debug or above, into their files, whatever this says.
+<a href=#287 id=287 data-nosnippet>287</a>    /// When this option is not given, --guest-log gives the level, if given.
+<a href=#288 id=288 data-nosnippet>288</a>    </span><span class="attr">#[clap(long, value_name = <span class="string">"LEVEL"</span>, value_enum)]
+<a href=#289 id=289 data-nosnippet>289</a>    </span><span class="kw">pub </span>trial_log: <span class="prelude-ty">Option</span>&lt;TrialLog&gt;,
+<a href=#290 id=290 data-nosnippet>290</a>
+<a href=#291 id=291 data-nosnippet>291</a>    <span class="doccomment">/// The maximum amount of schedule jitter (deviation) to tolerater while performing the bisection search.
+<a href=#292 id=292 data-nosnippet>292</a>    </span><span class="attr">#[clap(long)]
+<a href=#293 id=293 data-nosnippet>293</a>    </span><span class="kw">pub </span>jitter_dist: <span class="prelude-ty">Option</span>&lt;usize&gt;,
+<a href=#294 id=294 data-nosnippet>294</a>
+<a href=#295 id=295 data-nosnippet>295</a>    <span class="doccomment">/// Number of events to print before/after the critical events found, when showing the execution
+<a href=#296 id=296 data-nosnippet>296</a>    /// context along weth the analyze report.
+<a href=#297 id=297 data-nosnippet>297</a>    </span><span class="attr">#[clap(long, short, value_name = <span class="string">"EVTCNT"</span>, default_value = <span class="string">"5"</span>)]
+<a href=#298 id=298 data-nosnippet>298</a>    </span><span class="kw">pub </span>execution_context: usize,
+<a href=#299 id=299 data-nosnippet>299</a>
+<a href=#300 id=300 data-nosnippet>300</a>    <span class="doccomment">/// Directory under which the analysis creates its workspace of temporary artifacts
+<a href=#301 id=301 data-nosnippet>301</a>    /// (schedules, logs, reports of every run), created if missing.
+<a href=#302 id=302 data-nosnippet>302</a>    ///
+<a href=#303 id=303 data-nosnippet>303</a>    /// By default the workspace is created in the system's temporary directory: $TMPDIR, or
+<a href=#304 id=304 data-nosnippet>304</a>    /// /tmp when TMPDIR is unset. Analyze removes the workspace when it exits, unless
+<a href=#305 id=305 data-nosnippet>305</a>    /// --keep-tmp, --verbose, or --trial-log above warn, or an error ended it; this directory
+<a href=#306 id=306 data-nosnippet>306</a>    /// itself stays.
+<a href=#307 id=307 data-nosnippet>307</a>    </span><span class="attr">#[clap(long, value_name = <span class="string">"PATH"</span>)]
+<a href=#308 id=308 data-nosnippet>308</a>    </span><span class="kw">pub </span>tmp_dir: <span class="prelude-ty">Option</span>&lt;PathBuf&gt;,
+<a href=#309 id=309 data-nosnippet>309</a>
+<a href=#310 id=310 data-nosnippet>310</a>    <span class="doccomment">/// Wall-clock bound on each run after the initial target attempt (and, when explicit, on the
+<a href=#311 id=311 data-nosnippet>311</a>    /// replay of a `--run1-preemptions` record): a positive number of seconds, `auto` (the
+<a href=#312 id=312 data-nosnippet>312</a>    /// default), or `off`.
+<a href=#313 id=313 data-nosnippet>313</a>    ///
+<a href=#314 id=314 data-nosnippet>314</a>    /// With `auto`, the initial run and completed target/baseline endpoint runs are measured.
+<a href=#315 id=315 data-nosnippet>315</a>    /// Later runs are bounded at max(60 s, 10 times the slowest measured run), rounded up to
+<a href=#316 id=316 data-nosnippet>316</a>    /// whole seconds. With `--run1-preemptions`, the initial run is a replay of the record: it
+<a href=#317 id=317 data-nosnippet>317</a>    /// is measured like a seed's, and an explicit number bounds it too.
+<a href=#318 id=318 data-nosnippet>318</a>    /// A trial that reaches its bound stops analysis with exit 124: it establishes no outcome
+<a href=#319 id=319 data-nosnippet>319</a>    /// and cannot support a successful report. Retry with a larger bound if the guest can
+<a href=#320 id=320 data-nosnippet>320</a>    /// finish. A `--timeout` in the run arguments also bounds the initial run and wins wherever
+<a href=#321 id=321 data-nosnippet>321</a>    /// it is shorter. `off` removes only analyze's bounds, not the run arguments' timeout.
+<a href=#322 id=322 data-nosnippet>322</a>    ///
+<a href=#323 id=323 data-nosnippet>323</a>    /// The bound needs a backend on which `hermit run --timeout` is qualified; elsewhere `auto`
+<a href=#324 id=324 data-nosnippet>324</a>    /// gives no bound and an explicit number is refused. Use an outer timeout there.
+<a href=#325 id=325 data-nosnippet>325</a>    /// While trials are bounded, the log files they write under `--trial-log` above warn or
+<a href=#326 id=326 data-nosnippet>326</a>    /// `--selfcheck` are capped at max(64 MiB, 10 times the largest measured endpoint log),
+<a href=#327 id=327 data-nosnippet>327</a>    /// within HERMIT_LOG_MAX_BYTES.
+<a href=#328 id=328 data-nosnippet>328</a>    /// HERMIT_LOG_MAX_BYTES=0 lifts both file caps; `off` lifts analyze's file cap.
+<a href=#329 id=329 data-nosnippet>329</a>    </span><span class="attr">#[clap(long, value_name = <span class="string">"SECONDS|auto|off"</span>, default_value = <span class="string">"auto"</span>)]
+<a href=#330 id=330 data-nosnippet>330</a>    </span><span class="kw">pub </span>trial_timeout: TrialTimeout,
+<a href=#331 id=331 data-nosnippet>331</a>
+<a href=#332 id=332 data-nosnippet>332</a>    <span class="doccomment">/// The most memory analyze's own process may hold (the schedules and the
+<a href=#333 id=333 data-nosnippet>333</a>    /// search; each trial runs in a child process and is not counted): a size
+<a href=#334 id=334 data-nosnippet>334</a>    /// such as `16G` or `512M` (K, M, G and T are powers of 1024) or a byte
+<a href=#335 id=335 data-nosnippet>335</a>    /// count; `auto`, a quarter of the memory it may use (the host's, or its
+<a href=#336 id=336 data-nosnippet>336</a>    /// cgroup's limit if lower); or `off`. A watchdog thread reads the
+<a href=#337 id=337 data-nosnippet>337</a>    /// process's own memory, resident or swapped out, ten times a second and
+<a href=#338 id=338 data-nosnippet>338</a>    /// ends analyze with exit code 122 once it is over the budget, instead of
+<a href=#339 id=339 data-nosnippet>339</a>    /// letting it grow until the kernel kills it.
+<a href=#340 id=340 data-nosnippet>340</a>    </span><span class="attr">#[clap(long, value_name = <span class="string">"SIZE|auto|off"</span>, default_value = <span class="string">"auto"</span>)]
+<a href=#341 id=341 data-nosnippet>341</a>    </span><span class="kw">pub </span>max_memory: <span class="kw">super</span>::MemoryBudget,
+<a href=#342 id=342 data-nosnippet>342</a>
+<a href=#343 id=343 data-nosnippet>343</a>    <span class="doccomment">/// Keep the workspace (see --tmp-dir) when analyze exits.
+<a href=#344 id=344 data-nosnippet>344</a>    ///
+<a href=#345 id=345 data-nosnippet>345</a>    /// The workspace holds every run's schedules, logs, output and reproducer command, and the
+<a href=#346 id=346 data-nosnippet>346</a>    /// paths analyze prints name it. By default analyze removes it when it exits after its
+<a href=#347 id=347 data-nosnippet>347</a>    /// report, and when SIGTERM, SIGINT or SIGHUP stops it; after an error it keeps it, since
+<a href=#348 id=348 data-nosnippet>348</a>    /// the error can name trial files in it. A stop signal ends the run in progress and starts
+<a href=#349 id=349 data-nosnippet>349</a>    /// no other; analyze then removes the workspace and dies of that signal (a shell reports
+<a href=#350 id=350 data-nosnippet>350</a>    /// 128 plus its number, 143 for SIGTERM). --verbose, and --trial-log above warn, keep the
+<a href=#351 id=351 data-nosnippet>351</a>    /// workspace too. The report file (--report-file) is never removed. Without --keep-tmp, even
+<a href=#352 id=352 data-nosnippet>352</a>    /// with --verbose, a bisection trial's schedules are removed as soon as its outcome is read,
+<a href=#353 id=353 data-nosnippet>353</a>    /// and every run's recording with event times once analyze has written it without them.
+<a href=#354 id=354 data-nosnippet>354</a>    ///
+<a href=#355 id=355 data-nosnippet>355</a>    /// Analyze cannot clean up after SIGKILL, nor after a stop signal it does not handle: one it
+<a href=#356 id=356 data-nosnippet>356</a>    /// inherits as ignored stays ignored, and an analyze that is PID 1 of its PID namespace
+<a href=#357 id=357 data-nosnippet>357</a>    /// (`docker run IMAGE hermit analyze ...` without --init) leaves the stop signals at their
+<a href=#358 id=358 data-nosnippet>358</a>    /// default actions, which Linux discards for a namespace's init. Neither does it handle
+<a href=#359 id=359 data-nosnippet>359</a>    /// them, so that they kill it at once as before, when /proc is not its own PID namespace's
+<a href=#360 id=360 data-nosnippet>360</a>    /// (analyze started by another process inside `unshare -pf` without --mount-proc), when
+<a href=#361 id=361 data-nosnippet>361</a>    /// it inherited more than 64 children, or where it cannot open, signal through or wait on
+<a href=#362 id=362 data-nosnippet>362</a>    /// a pidfd (Linux before 5.4, or a seccomp filter), through which alone it signals the run.
+<a href=#363 id=363 data-nosnippet>363</a>    /// A stop it cannot pass on to the run (no file descriptor left) makes it die of the
+<a href=#364 id=364 data-nosnippet>364</a>    /// signal as without its handler, saying why; the run dies with it, and the workspace and
+<a href=#365 id=365 data-nosnippet>365</a>    /// the running trial's private temporary directory stay.
+<a href=#366 id=366 data-nosnippet>366</a>    </span><span class="attr">#[clap(long)]
+<a href=#367 id=367 data-nosnippet>367</a>    </span><span class="kw">pub </span>keep_tmp: bool,
+<a href=#368 id=368 data-nosnippet>368</a>
+<a href=#369 id=369 data-nosnippet>369</a>    <span class="doccomment">/// Wall-clock time this invocation may spend before it reports what it has found so far:
+<a href=#370 id=370 data-nosnippet>370</a>    /// `off` (the default), or a whole number of seconds, minutes or hours (`1800`, `30m`,
+<a href=#371 id=371 data-nosnippet>371</a>    /// `2h`).
+<a href=#372 id=372 data-nosnippet>372</a>    ///
+<a href=#373 id=373 data-nosnippet>373</a>    /// The budget is checked before every run, and each run's `--timeout` is shortened to the
+<a href=#374 id=374 data-nosnippet>374</a>    /// time left. A run the budget cuts short is thrown away, not counted as not meeting the
+<a href=#375 id=375 data-nosnippet>375</a>    /// target, so the budget decides only when analyze stops, never what it finds. When it runs
+<a href=#376 id=376 data-nosnippet>376</a>    /// out, analyze reports its best answer so far and exits 120 (a partial result): the
+<a href=#377 id=377 data-nosnippet>377</a>    /// default search's current pair of schedules, whose replays miss and meet the target, and
+<a href=#378 id=378 data-nosnippet>378</a>    /// the first event at which they differ; or `--prefix-search`'s bracket, the longest prefix
+<a href=#379 id=379 data-nosnippet>379</a>    /// known to miss the target and the shortest known to meet it. The report says that it is
+<a href=#380 id=380 data-nosnippet>380</a>    /// partial, why, and which phase was running, after the stderr line
+<a href=#381 id=381 data-nosnippet>381</a>    /// `HERMIT_ANALYZE_PARTIAL class=time-budget`. The workspace is then kept, even without
+<a href=#382 id=382 data-nosnippet>382</a>    /// --keep-tmp, and the report gives the command that continues the analysis (--resume).
+<a href=#383 id=383 data-nosnippet>383</a>    /// The default search's report replays its two schedules for their stacks only when two
+<a href=#384 id=384 data-nosnippet>384</a>    /// such runs fit min(120 s, 5% of the budget) after it ran out; the report says when they
+<a href=#385 id=385 data-nosnippet>385</a>    /// did not. A budget that runs out after the search finished, during its final replays,
+<a href=#386 id=386 data-nosnippet>386</a>    /// reports no decision: analyze names one only once those replays repeat the search's
+<a href=#387 id=387 data-nosnippet>387</a>    /// outcomes.
+<a href=#388 id=388 data-nosnippet>388</a>    /// Computation between runs (the default search's schedule distances) is not
+<a href=#389 id=389 data-nosnippet>389</a>    /// interrupted, so analyze may overrun the budget by that much; an outer kill bound should
+<a href=#390 id=390 data-nosnippet>390</a>    /// sit above the budget plus that grace, so that analyze stops itself first.
+<a href=#391 id=391 data-nosnippet>391</a>    </span><span class="attr">#[clap(long, value_name = <span class="string">"DURATION|off"</span>, default_value = <span class="string">"off"</span>)]
+<a href=#392 id=392 data-nosnippet>392</a>    </span><span class="kw">pub </span>time_budget: TimeBudget,
+<a href=#393 id=393 data-nosnippet>393</a>
+<a href=#394 id=394 data-nosnippet>394</a>    <span class="doccomment">/// How many runs this invocation may start before it reports what it has found so far:
+<a href=#395 id=395 data-nosnippet>395</a>    /// `off` (the default) or a number. Ends like --time-budget does
+<a href=#396 id=396 data-nosnippet>396</a>    /// (`HERMIT_ANALYZE_PARTIAL class=trial-budget`, exit 120). Runs a resumed analysis
+<a href=#397 id=397 data-nosnippet>397</a>    /// answers from its journal (--resume) do not count.
+<a href=#398 id=398 data-nosnippet>398</a>    </span><span class="attr">#[clap(long, value_name = <span class="string">"N|off"</span>, default_value = <span class="string">"off"</span>)]
+<a href=#399 id=399 data-nosnippet>399</a>    </span><span class="kw">pub </span>trial_budget: TrialBudget,
+<a href=#400 id=400 data-nosnippet>400</a>
+<a href=#401 id=401 data-nosnippet>401</a>    <span class="doccomment">/// Continue the analysis whose workspace this is, instead of starting a new one.
+<a href=#402 id=402 data-nosnippet>402</a>    ///
+<a href=#403 id=403 data-nosnippet>403</a>    /// Analyze writes, as it goes, every finished run's outcome into its workspace
+<a href=#404 id=404 data-nosnippet>404</a>    /// (analyze-journal.jsonl), with what the analysis is of (analyze-checkpoint.json) and the
+<a href=#405 id=405 data-nosnippet>405</a>    /// search's current interval or bracket (analyze-progress.json). A workspace a budget kept
+<a href=#406 id=406 data-nosnippet>406</a>    /// (see --time-budget), or that --keep-tmp kept or a SIGKILL left, can be resumed: pass the
+<a href=#407 id=407 data-nosnippet>407</a>    /// same arguments and --resume=WORKSPACE. The analysis then runs again from its start, and
+<a href=#408 id=408 data-nosnippet>408</a>    /// every run the journal holds takes its recorded outcome instead of running; the default
+<a href=#409 id=409 data-nosnippet>409</a>    /// search restarts at the pass whose interval the progress names, from that interval's two
+<a href=#410 id=410 data-nosnippet>410</a>    /// schedules. So it makes the same decisions as before and goes on from where it stopped:
+<a href=#411 id=411 data-nosnippet>411</a>    /// a resumed analysis reports what an uninterrupted one would. It refuses (exit 122) when
+<a href=#412 id=412 data-nosnippet>412</a>    /// the hermit binary, the guest program, the run arguments, the target criteria, the search
+<a href=#413 id=413 data-nosnippet>413</a>    /// options and --max-log-bytes, the record or schedule files given as runs, or
+<a href=#414 id=414 data-nosnippet>414</a>    /// --analyze-seed differ from the recorded ones, and names each difference. It is refused
+<a href=#415 id=415 data-nosnippet>415</a>    /// with an `--image` run (exit 122), as --time-budget and --trial-budget are: analyze
+<a href=#416 id=416 data-nosnippet>416</a>    /// cannot show an image's guest unchanged. --tmp-dir is not used. The workspace is removed or kept as for any analysis once the resumed
+<a href=#417 id=417 data-nosnippet>417</a>    /// analysis finishes; one that errors or is stopped keeps it.
+<a href=#418 id=418 data-nosnippet>418</a>    </span><span class="attr">#[clap(long, value_name = <span class="string">"WORKSPACE"</span>)]
+<a href=#419 id=419 data-nosnippet>419</a>    </span><span class="kw">pub </span>resume: <span class="prelude-ty">Option</span>&lt;PathBuf&gt;,
+<a href=#420 id=420 data-nosnippet>420</a>
+<a href=#421 id=421 data-nosnippet>421</a>    <span class="doccomment">/// Specify that analyze itself should return a non-zero exit code on success.
+<a href=#422 id=422 data-nosnippet>422</a>    /// This is needed under esoteric invocation scenarios. It is an exit status, 0 to 255, and
+<a href=#423 id=423 data-nosnippet>423</a>    /// 2 and 120 to 127 are refused: analyze exits 2 when its inputs do not give it what it
+<a href=#424 id=424 data-nosnippet>424</a>    /// needs, and Hermit reserves 120 to 127 for its own statuses.
+<a href=#425 id=425 data-nosnippet>425</a>    </span><span class="attr">#[clap(long, value_name = <span class="string">"STATUS"</span>, value_parser = parse_success_exit_code)]
+<a href=#426 id=426 data-nosnippet>426</a>    </span><span class="kw">pub </span>success_exit_code: <span class="prelude-ty">Option</span>&lt;i32&gt;,
+<a href=#427 id=427 data-nosnippet>427</a>
+<a href=#428 id=428 data-nosnippet>428</a>    <span class="doccomment">/// Additional arguments to pass through unmodified to the hermit run subcommand.  While
+<a href=#429 id=429 data-nosnippet>429</a>    /// arguments are passed through to hermit run even without this, this explicit flag is useful
+<a href=#430 id=430 data-nosnippet>430</a>    /// for intermixing flags `hermit run` among the analyze args, in spite of them starting with
+<a href=#431 id=431 data-nosnippet>431</a>    /// hyphens.
+<a href=#432 id=432 data-nosnippet>432</a>    </span><span class="attr">#[clap(long, short = <span class="string">'a'</span>)]
+<a href=#433 id=433 data-nosnippet>433</a>    </span><span class="kw">pub </span>run_arg: Vec&lt;String&gt;,
+<a href=#434 id=434 data-nosnippet>434</a>
+<a href=#435 id=435 data-nosnippet>435</a>    <span class="doccomment">/// A full set of CLI arguments for the original `hermit run` to analyze.
+<a href=#436 id=436 data-nosnippet>436</a>    </span><span class="attr">#[clap(value_name = <span class="string">"ARGS"</span>)]
+<a href=#437 id=437 data-nosnippet>437</a>    </span><span class="kw">pub </span>run_args: Vec&lt;String&gt;,
+<a href=#438 id=438 data-nosnippet>438</a>
+<a href=#439 id=439 data-nosnippet>439</a>    <span class="doccomment">/// The backend every trial runs on, taken from the global option
+<a href=#440 id=440 data-nosnippet>440</a>    /// (`hermit --backend &lt;BACKEND&gt; analyze ...`) by [`AnalyzeOpts::main`].
+<a href=#441 id=441 data-nosnippet>441</a>    /// `run` has no `--backend` of its own, so this is the only way to choose it.
+<a href=#442 id=442 data-nosnippet>442</a>    </span><span class="attr">#[clap(skip)]
+<a href=#443 id=443 data-nosnippet>443</a>    </span><span class="kw">pub </span>backend: <span class="prelude-ty">Option</span>&lt;hermit::Backend&gt;,
+<a href=#444 id=444 data-nosnippet>444</a>
+<a href=#445 id=445 data-nosnippet>445</a>    <span class="doccomment">/// The invocation's `--max-log-bytes` limit and its ONE shared budget,
+<a href=#446 id=446 data-nosnippet>446</a>    /// which every trial charges; taken from the global options by
+<a href=#447 id=447 data-nosnippet>447</a>    /// [`AnalyzeOpts::main`].
+<a href=#448 id=448 data-nosnippet>448</a>    </span><span class="attr">#[clap(skip)]
+<a href=#449 id=449 data-nosnippet>449</a>    </span><span class="kw">pub </span>max_log_bytes: <span class="prelude-ty">Option</span>&lt;u64&gt;,
+<a href=#450 id=450 data-nosnippet>450</a>    <span class="attr">#[clap(skip)]
+<a href=#451 id=451 data-nosnippet>451</a>    </span><span class="kw">pub </span>log_budget: <span class="prelude-ty">Option</span>&lt;<span class="kw">crate</span>::app::tracing::LogBudget&gt;,
+<a href=#452 id=452 data-nosnippet>452</a>
+<a href=#453 id=453 data-nosnippet>453</a>    <span class="doccomment">/// Why this host's retired-branch counter is inexact, if it is; handed to
+<a href=#454 id=454 data-nosnippet>454</a>    /// every trial's `RunOpts` for the `--strict` refusal and the warning
+<a href=#455 id=455 data-nosnippet>455</a>    /// without `--strict`. Tests replace it to reach both on a host whose
+<a href=#456 id=456 data-nosnippet>456</a>    /// counters pass.
+<a href=#457 id=457 data-nosnippet>457</a>    </span><span class="attr">#[clap(skip = <span class="kw">crate</span>::app::host_capabilities::host_inexact_branch_counter <span class="kw">as fn</span>() -&gt; <span class="prelude-ty">Option</span>&lt;String&gt;)]
+<a href=#458 id=458 data-nosnippet>458</a>    </span><span class="kw">pub </span>inexact_branch_counter: <span class="kw">fn</span>() -&gt; <span class="prelude-ty">Option</span>&lt;String&gt;,
+<a href=#459 id=459 data-nosnippet>459</a>
+<a href=#460 id=460 data-nosnippet>460</a>    <span class="doccomment">/// The branch-counter warning `admit_branch_counter` printed before the
+<a href=#461 id=461 data-nosnippet>461</a>    /// first trial, without its newline, for the final report to repeat
+<a href=#462 id=462 data-nosnippet>462</a>    /// (`Report::branch_counter_warning`); `None` when it printed none.
+<a href=#463 id=463 data-nosnippet>463</a>    </span><span class="attr">#[clap(skip)]
+<a href=#464 id=464 data-nosnippet>464</a>    </span><span class="kw">pub </span>branch_counter_warning: <span class="prelude-ty">Option</span>&lt;String&gt;,
+<a href=#465 id=465 data-nosnippet>465</a>
+<a href=#466 id=466 data-nosnippet>466</a>    <span class="doccomment">/// What the endpoint runs measured so far; the trials' bounds derive
+<a href=#467 id=467 data-nosnippet>467</a>    /// from it ([`AnalyzeOpts::trial_bound`]). Every `RunData` copies these
+<a href=#468 id=468 data-nosnippet>468</a>    /// options when it is created, so a run takes the bound of the endpoints
+<a href=#469 id=469 data-nosnippet>469</a>    /// measured before it.
+<a href=#470 id=470 data-nosnippet>470</a>    </span><span class="attr">#[clap(skip)]
+<a href=#471 id=471 data-nosnippet>471</a>    </span><span class="kw">pub </span>endpoints: EndpointMeasurements,
+<a href=#472 id=472 data-nosnippet>472</a>    <span class="doccomment">/// The jumps of global time of every recorded schedule this invocation
+<a href=#473 id=473 data-nosnippet>473</a>    /// read, which the trial schedules it writes carry
+<a href=#474 id=474 data-nosnippet>474</a>    /// (`crate::app::time_skip_carry`). Shared by every copy of these options.
+<a href=#475 id=475 data-nosnippet>475</a>    </span><span class="attr">#[clap(skip)]
+<a href=#476 id=476 data-nosnippet>476</a>    </span><span class="kw">pub </span>time_skip_sources: <span class="kw">crate</span>::app::time_skip_carry::SharedTimeSkipSources,
+<a href=#477 id=477 data-nosnippet>477</a>
+<a href=#478 id=478 data-nosnippet>478</a>    <span class="doccomment">/// Whether the analysis replays `--chaos-instruction-offset` decisions:
+<a href=#479 id=479 data-nosnippet>479</a>    /// its run arguments draw them, or a recording it starts from holds them
+<a href=#480 id=480 data-nosnippet>480</a>    /// (`AnalyzeOpts::adopt_instruction_offsets`). Its schedule replays then
+<a href=#481 id=481 data-nosnippet>481</a>    /// run without chaos (`RunData::with_schedule_replay_from`).
+<a href=#482 id=482 data-nosnippet>482</a>    </span><span class="attr">#[clap(skip)]
+<a href=#483 id=483 data-nosnippet>483</a>    </span><span class="kw">pub </span>replays_instruction_offsets: bool,
+<a href=#484 id=484 data-nosnippet>484</a>
+<a href=#485 id=485 data-nosnippet>485</a>    <span class="doccomment">/// The invocation's --time-budget and --trial-budget, counted from
+<a href=#486 id=486 data-nosnippet>486</a>    /// `AnalyzeOpts::main`; shared by every copy of these options.
+<a href=#487 id=487 data-nosnippet>487</a>    </span><span class="attr">#[clap(skip)]
+<a href=#488 id=488 data-nosnippet>488</a>    </span><span class="kw">pub </span>budget: Budget,
+<a href=#489 id=489 data-nosnippet>489</a>
+<a href=#490 id=490 data-nosnippet>490</a>    <span class="doccomment">/// The journal of finished runs in the workspace (`checkpoint`); off
+<a href=#491 id=491 data-nosnippet>491</a>    /// until `AnalyzeOpts::main` opens it, and for `hermit bisect`.
+<a href=#492 id=492 data-nosnippet>492</a>    </span><span class="attr">#[clap(skip)]
+<a href=#493 id=493 data-nosnippet>493</a>    </span><span class="kw">pub </span>journal: Journal,
+<a href=#494 id=494 data-nosnippet>494</a>
+<a href=#495 id=495 data-nosnippet>495</a>    <span class="doccomment">/// The phase running and the search's interval or bracket, written into
+<a href=#496 id=496 data-nosnippet>496</a>    /// the workspace as they change.
+<a href=#497 id=497 data-nosnippet>497</a>    </span><span class="attr">#[clap(skip)]
+<a href=#498 id=498 data-nosnippet>498</a>    </span><span class="kw">pub </span>progress: ProgressHandle,
+<a href=#499 id=499 data-nosnippet>499</a>
+<a href=#500 id=500 data-nosnippet>500</a>    <span class="doccomment">/// Whether `--analyze-seed` was drawn from system randomness by this
+<a href=#501 id=501 data-nosnippet>501</a>    /// analysis rather than given (its warnings still say so).
+<a href=#502 id=502 data-nosnippet>502</a>    </span><span class="attr">#[clap(skip)]
+<a href=#503 id=503 data-nosnippet>503</a>    </span><span class="kw">pub </span>analyze_seed_drawn: bool,
+<a href=#504 id=504 data-nosnippet>504</a>
+<a href=#505 id=505 data-nosnippet>505</a>    <span class="doccomment">/// Set once a partial report is written: the workspace is then kept.
+<a href=#506 id=506 data-nosnippet>506</a>    </span><span class="attr">#[clap(skip)]
+<a href=#507 id=507 data-nosnippet>507</a>    </span><span class="kw">pub </span>partial_report_written: bool,
+<a href=#508 id=508 data-nosnippet>508</a>
+<a href=#509 id=509 data-nosnippet>509</a>    <span class="doccomment">/// `--resume`: the progress the earlier invocation wrote, whose interval
+<a href=#510 id=510 data-nosnippet>510</a>    /// the default search restarts from.
+<a href=#511 id=511 data-nosnippet>511</a>    </span><span class="attr">#[clap(skip)]
+<a href=#512 id=512 data-nosnippet>512</a>    </span><span class="kw">pub </span>resumed_progress: <span class="prelude-ty">Option</span>&lt;Progress&gt;,
+<a href=#513 id=513 data-nosnippet>513</a>
+<a href=#514 id=514 data-nosnippet>514</a>    <span class="doccomment">/// What runs each trial's guest; unset, `RunData::run_now` does. Tests
+<a href=#515 id=515 data-nosnippet>515</a>    /// set it to drive the searches without a guest.
+<a href=#516 id=516 data-nosnippet>516</a>    </span><span class="attr">#[clap(skip)]
+<a href=#517 id=517 data-nosnippet>517</a>    </span><span class="kw">pub </span>trial_runner: TrialRunner,
+<a href=#518 id=518 data-nosnippet>518</a>
+<a href=#519 id=519 data-nosnippet>519</a>    <span class="doccomment">/// What `RunData::run_now` takes in place of `hermit run`'s result;
+<a href=#520 id=520 data-nosnippet>520</a>    /// unset, it runs `hermit run`. Tests set it to take a run through
+<a href=#521 id=521 data-nosnippet>521</a>    /// `run_now` and the journal without a guest.
+<a href=#522 id=522 data-nosnippet>522</a>    </span><span class="attr">#[clap(skip)]
+<a href=#523 id=523 data-nosnippet>523</a>    </span><span class="kw">pub </span>hermit_run: HermitRun,
+<a href=#524 id=524 data-nosnippet>524</a>    <span class="doccomment">/// The uncapped-slices mark the trials' schedules carry
+<a href=#525 id=525 data-nosnippet>525</a>    /// (`PreemptionRecord::uncapped_slices`): set from the schedules they are
+<a href=#526 id=526 data-nosnippet>526</a>    /// made from when those carry it, so that a trial's schedule replay
+<a href=#527 id=527 data-nosnippet>527</a>    /// keeps their long slices (`Self::stamp_trial_record`).
+<a href=#528 id=528 data-nosnippet>528</a>    </span><span class="attr">#[clap(skip)]
+<a href=#529 id=529 data-nosnippet>529</a>    </span><span class="kw">pub </span>trial_schedules_uncapped: std::cell::Cell&lt;<span class="prelude-ty">Option</span>&lt;u64&gt;&gt;,
+<a href=#530 id=530 data-nosnippet>530</a>}
+<a href=#531 id=531 data-nosnippet>531</a>
+<a href=#532 id=532 data-nosnippet>532</a><span class="doccomment">/// `--continuation-timeslice`.
+<a href=#533 id=533 data-nosnippet>533</a></span><span class="attr">#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+<a href=#534 id=534 data-nosnippet>534</a></span><span class="kw">pub enum </span>ContinuationTimeslice {
+<a href=#535 id=535 data-nosnippet>535</a>    <span class="doccomment">/// Short first, then coarser where the short one cannot serve.
+<a href=#536 id=536 data-nosnippet>536</a>    </span>Auto,
+<a href=#537 id=537 data-nosnippet>537</a>    <span class="doccomment">/// This many virtual nanoseconds.
+<a href=#538 id=538 data-nosnippet>538</a>    </span>Nanos(NonZeroU64),
+<a href=#539 id=539 data-nosnippet>539</a>}
+<a href=#540 id=540 data-nosnippet>540</a>
+<a href=#541 id=541 data-nosnippet>541</a><span class="kw">impl </span>FromStr <span class="kw">for </span>ContinuationTimeslice {
+<a href=#542 id=542 data-nosnippet>542</a>    <span class="kw">type </span><span class="prelude-val">Err </span>= String;
+<a href=#543 id=543 data-nosnippet>543</a>
+<a href=#544 id=544 data-nosnippet>544</a>    <span class="kw">fn </span>from_str(s: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;<span class="self">Self</span>, <span class="self">Self</span>::Err&gt; {
+<a href=#545 id=545 data-nosnippet>545</a>        <span class="kw">if </span>s == <span class="string">"auto" </span>{
+<a href=#546 id=546 data-nosnippet>546</a>            <span class="kw">return </span><span class="prelude-val">Ok</span>(ContinuationTimeslice::Auto);
+<a href=#547 id=547 data-nosnippet>547</a>        }
+<a href=#548 id=548 data-nosnippet>548</a>        <span class="kw">match </span>s.parse::&lt;NonZeroU64&gt;() {
+<a href=#549 id=549 data-nosnippet>549</a>            <span class="prelude-val">Ok</span>(nanos) <span class="kw">if </span>nanos.get() &gt;= detcore_model::time::NANOS_PER_RCB <span class="kw">as </span>u64 =&gt; {
+<a href=#550 id=550 data-nosnippet>550</a>                <span class="prelude-val">Ok</span>(ContinuationTimeslice::Nanos(nanos))
+<a href=#551 id=551 data-nosnippet>551</a>            }
+<a href=#552 id=552 data-nosnippet>552</a>            <span class="kw">_ </span>=&gt; <span class="prelude-val">Err</span>(<span class="macro">format!</span>(
+<a href=#553 id=553 data-nosnippet>553</a>                <span class="string">"expected `auto` or a timeslice of at least one RCB ({} virtual nanoseconds), \
+<a href=#554 id=554 data-nosnippet>554</a>                 got {s:?}"</span>,
+<a href=#555 id=555 data-nosnippet>555</a>                detcore_model::time::NANOS_PER_RCB
+<a href=#556 id=556 data-nosnippet>556</a>            )),
+<a href=#557 id=557 data-nosnippet>557</a>        }
+<a href=#558 id=558 data-nosnippet>558</a>    }
+<a href=#559 id=559 data-nosnippet>559</a>}
+<a href=#560 id=560 data-nosnippet>560</a>
+<a href=#561 id=561 data-nosnippet>561</a><span class="doccomment">/// The least a run analyze starts logs: errors, among them the reason Hermit
+<a href=#562 id=562 data-nosnippet>562</a>/// gives when it refuses the run at an operation it does not support, which
+<a href=#563 id=563 data-nosnippet>563</a>/// the refusal's warning points at.
+<a href=#564 id=564 data-nosnippet>564</a></span><span class="kw">pub const </span>TRIAL_LOG_LEAST: LevelFilter = LevelFilter::ERROR;
+<a href=#565 id=565 data-nosnippet>565</a>
+<a href=#566 id=566 data-nosnippet>566</a><span class="doccomment">/// `--trial-log`: how much each run analyze starts logs.
+<a href=#567 id=567 data-nosnippet>567</a></span><span class="attr">#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+<a href=#568 id=568 data-nosnippet>568</a></span><span class="kw">pub enum </span>TrialLog {
+<a href=#569 id=569 data-nosnippet>569</a>    <span class="doccomment">/// Errors only, to analyze's stderr: the reason Hermit refuses a trial is one.
+<a href=#570 id=570 data-nosnippet>570</a>    </span>Off,
+<a href=#571 id=571 data-nosnippet>571</a>    <span class="doccomment">/// Warnings and errors, to analyze's stderr.
+<a href=#572 id=572 data-nosnippet>572</a>    </span>Warn,
+<a href=#573 id=573 data-nosnippet>573</a>    <span class="doccomment">/// Info and above, into the run's own log file.
+<a href=#574 id=574 data-nosnippet>574</a>    </span>Info,
+<a href=#575 id=575 data-nosnippet>575</a>    <span class="doccomment">/// Debug and above, into the run's own log file.
+<a href=#576 id=576 data-nosnippet>576</a>    </span>Debug,
+<a href=#577 id=577 data-nosnippet>577</a>}
+<a href=#578 id=578 data-nosnippet>578</a>
+<a href=#579 id=579 data-nosnippet>579</a><span class="kw">impl </span>TrialLog {
+<a href=#580 id=580 data-nosnippet>580</a>    <span class="doccomment">/// The level a run logs at. `off` keeps errors ([`TRIAL_LOG_LEAST`]).
+<a href=#581 id=581 data-nosnippet>581</a>    </span><span class="kw">pub fn </span>level(<span class="self">self</span>) -&gt; LevelFilter {
+<a href=#582 id=582 data-nosnippet>582</a>        <span class="kw">match </span><span class="self">self </span>{
+<a href=#583 id=583 data-nosnippet>583</a>            TrialLog::Off =&gt; TRIAL_LOG_LEAST,
+<a href=#584 id=584 data-nosnippet>584</a>            TrialLog::Warn =&gt; LevelFilter::WARN,
+<a href=#585 id=585 data-nosnippet>585</a>            TrialLog::Info =&gt; LevelFilter::INFO,
+<a href=#586 id=586 data-nosnippet>586</a>            TrialLog::Debug =&gt; LevelFilter::DEBUG,
+<a href=#587 id=587 data-nosnippet>587</a>        }
+<a href=#588 id=588 data-nosnippet>588</a>    }
+<a href=#589 id=589 data-nosnippet>589</a>}
+<a href=#590 id=590 data-nosnippet>590</a>
+<a href=#591 id=591 data-nosnippet>591</a><span class="doccomment">/// `--trial-timeout`.
+<a href=#592 id=592 data-nosnippet>592</a></span><span class="attr">#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+<a href=#593 id=593 data-nosnippet>593</a></span><span class="kw">pub enum </span>TrialTimeout {
+<a href=#594 id=594 data-nosnippet>594</a>    <span class="doccomment">/// Derived from the endpoint runs' wall-clock time.
+<a href=#595 id=595 data-nosnippet>595</a>    </span>Auto,
+<a href=#596 id=596 data-nosnippet>596</a>    <span class="doccomment">/// No bound beyond the run arguments' own `--timeout`.
+<a href=#597 id=597 data-nosnippet>597</a>    </span>Off,
+<a href=#598 id=598 data-nosnippet>598</a>    <span class="doccomment">/// This many seconds.
+<a href=#599 id=599 data-nosnippet>599</a>    </span>Seconds(NonZeroU64),
+<a href=#600 id=600 data-nosnippet>600</a>}
+<a href=#601 id=601 data-nosnippet>601</a>
+<a href=#602 id=602 data-nosnippet>602</a><span class="kw">impl </span>FromStr <span class="kw">for </span>TrialTimeout {
+<a href=#603 id=603 data-nosnippet>603</a>    <span class="kw">type </span><span class="prelude-val">Err </span>= String;
+<a href=#604 id=604 data-nosnippet>604</a>
+<a href=#605 id=605 data-nosnippet>605</a>    <span class="kw">fn </span>from_str(s: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;<span class="self">Self</span>, <span class="self">Self</span>::Err&gt; {
+<a href=#606 id=606 data-nosnippet>606</a>        <span class="kw">match </span>s {
+<a href=#607 id=607 data-nosnippet>607</a>            <span class="string">"auto" </span>=&gt; <span class="prelude-val">Ok</span>(TrialTimeout::Auto),
+<a href=#608 id=608 data-nosnippet>608</a>            <span class="string">"off" </span>=&gt; <span class="prelude-val">Ok</span>(TrialTimeout::Off),
+<a href=#609 id=609 data-nosnippet>609</a>            <span class="kw">_ </span>=&gt; s.parse().map(TrialTimeout::Seconds).map_err(|<span class="kw">_</span>| {
+<a href=#610 id=610 data-nosnippet>610</a>                <span class="macro">format!</span>(<span class="string">"expected a positive number of seconds, `auto` or `off`, got {s:?}"</span>)
+<a href=#611 id=611 data-nosnippet>611</a>            }),
+<a href=#612 id=612 data-nosnippet>612</a>        }
+<a href=#613 id=613 data-nosnippet>613</a>    }
+<a href=#614 id=614 data-nosnippet>614</a>}
+<a href=#615 id=615 data-nosnippet>615</a>
+<a href=#616 id=616 data-nosnippet>616</a><span class="doccomment">/// The least wall-clock bound `--trial-timeout=auto` gives a trial.
+<a href=#617 id=617 data-nosnippet>617</a></span><span class="kw">pub const </span>TRIAL_TIMEOUT_FLOOR: Duration = Duration::from_secs(<span class="number">60</span>);
+<a href=#618 id=618 data-nosnippet>618</a><span class="doccomment">/// How many times the slowest endpoint run `--trial-timeout=auto` gives a trial.
+<a href=#619 id=619 data-nosnippet>619</a></span><span class="kw">pub const </span>TRIAL_TIMEOUT_FACTOR: u32 = <span class="number">10</span>;
+<a href=#620 id=620 data-nosnippet>620</a><span class="doccomment">/// The least cap on a trial's log file.
+<a href=#621 id=621 data-nosnippet>621</a></span><span class="kw">pub const </span>TRIAL_LOG_FLOOR: u64 = <span class="number">64 </span>&lt;&lt; <span class="number">20</span>;
+<a href=#622 id=622 data-nosnippet>622</a><span class="doccomment">/// How many times the largest endpoint log a trial's log file may grow to.
+<a href=#623 id=623 data-nosnippet>623</a></span><span class="kw">pub const </span>TRIAL_LOG_FACTOR: u64 = <span class="number">10</span>;
+<a href=#624 id=624 data-nosnippet>624</a>
+<a href=#625 id=625 data-nosnippet>625</a><span class="doccomment">/// The slowest wall-clock time and the largest log file of the endpoint runs
+<a href=#626 id=626 data-nosnippet>626</a>/// measured so far.
+<a href=#627 id=627 data-nosnippet>627</a></span><span class="attr">#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+<a href=#628 id=628 data-nosnippet>628</a></span><span class="kw">pub struct </span>EndpointMeasurements {
+<a href=#629 id=629 data-nosnippet>629</a>    <span class="doccomment">/// The slowest endpoint run, if one has been measured.
+<a href=#630 id=630 data-nosnippet>630</a>    </span><span class="kw">pub </span>slowest: <span class="prelude-ty">Option</span>&lt;Duration&gt;,
+<a href=#631 id=631 data-nosnippet>631</a>    <span class="doccomment">/// The largest endpoint log file, if an endpoint run wrote one.
+<a href=#632 id=632 data-nosnippet>632</a>    </span><span class="kw">pub </span>largest_log: <span class="prelude-ty">Option</span>&lt;u64&gt;,
+<a href=#633 id=633 data-nosnippet>633</a>}
+<a href=#634 id=634 data-nosnippet>634</a>
+<a href=#635 id=635 data-nosnippet>635</a><span class="kw">impl </span>EndpointMeasurements {
+<a href=#636 id=636 data-nosnippet>636</a>    <span class="doccomment">/// Record one endpoint run. Returns true if it is the slowest so far.
+<a href=#637 id=637 data-nosnippet>637</a>    </span><span class="kw">pub fn </span>record(<span class="kw-2">&amp;mut </span><span class="self">self</span>, wall: Duration, log_bytes: <span class="prelude-ty">Option</span>&lt;u64&gt;) -&gt; bool {
+<a href=#638 id=638 data-nosnippet>638</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(bytes) = log_bytes {
+<a href=#639 id=639 data-nosnippet>639</a>            <span class="self">self</span>.largest_log = <span class="self">self</span>.largest_log.max(<span class="prelude-val">Some</span>(bytes));
+<a href=#640 id=640 data-nosnippet>640</a>        }
+<a href=#641 id=641 data-nosnippet>641</a>        <span class="kw">let </span>slowest = <span class="self">self</span>.slowest.is_none_or(|slowest| wall &gt; slowest);
+<a href=#642 id=642 data-nosnippet>642</a>        <span class="kw">if </span>slowest {
+<a href=#643 id=643 data-nosnippet>643</a>            <span class="self">self</span>.slowest = <span class="prelude-val">Some</span>(wall);
+<a href=#644 id=644 data-nosnippet>644</a>        }
+<a href=#645 id=645 data-nosnippet>645</a>        slowest
+<a href=#646 id=646 data-nosnippet>646</a>    }
+<a href=#647 id=647 data-nosnippet>647</a>}
+<a href=#648 id=648 data-nosnippet>648</a>
+<a href=#649 id=649 data-nosnippet>649</a><span class="comment">// TODO: introduce a new type to encapsulate the state of the search, and make it immutable.
+<a href=#650 id=650 data-nosnippet>650</a>// pub struct SearchState {}
+<a href=#651 id=651 data-nosnippet>651</a>
+<a href=#652 id=652 data-nosnippet>652</a></span><span class="attr">#[derive(Debug, Eq, PartialEq, Clone)]
+<a href=#653 id=653 data-nosnippet>653</a></span><span class="kw">pub enum </span>ExitStatusConstraint {
+<a href=#654 id=654 data-nosnippet>654</a>    <span class="doccomment">/// Accept only a specific exit code.
+<a href=#655 id=655 data-nosnippet>655</a>    </span>Exact(i32),
+<a href=#656 id=656 data-nosnippet>656</a>    <span class="doccomment">/// Accept any nonzero exit code.
+<a href=#657 id=657 data-nosnippet>657</a>    </span>NonZero,
+<a href=#658 id=658 data-nosnippet>658</a>    <span class="doccomment">/// Accept any exit code.  No filter.
+<a href=#659 id=659 data-nosnippet>659</a>    </span>Any,
+<a href=#660 id=660 data-nosnippet>660</a>}
+<a href=#661 id=661 data-nosnippet>661</a>
+<a href=#662 id=662 data-nosnippet>662</a><span class="doccomment">/// The exit code a shell reports for a run that ended with `status`: the
+<a href=#663 id=663 data-nosnippet>663</a>/// guest's own code, or 128 plus the signal number for a signal death. Not
+<a href=#664 id=664 data-nosnippet>664</a>/// the raw wait status, which shifts an exit code left by eight bits.
+<a href=#665 id=665 data-nosnippet>665</a></span><span class="kw">pub fn </span>run_exit_code(status: ExitStatus) -&gt; i32 {
+<a href=#666 id=666 data-nosnippet>666</a>    <span class="kw">match </span>status {
+<a href=#667 id=667 data-nosnippet>667</a>        ExitStatus::Exited(code) =&gt; code,
+<a href=#668 id=668 data-nosnippet>668</a>        ExitStatus::Signaled(signal, <span class="kw">_</span>) =&gt; detcore_model::signal_exit_status(signal <span class="kw">as </span>i32),
+<a href=#669 id=669 data-nosnippet>669</a>        ExitStatus::SignaledRaw(signal, <span class="kw">_</span>) =&gt; detcore_model::signal_exit_status(signal),
+<a href=#670 id=670 data-nosnippet>670</a>    }
+<a href=#671 id=671 data-nosnippet>671</a>}
+<a href=#672 id=672 data-nosnippet>672</a>
+<a href=#673 id=673 data-nosnippet>673</a><span class="kw">impl </span>ExitStatusConstraint {
+<a href=#674 id=674 data-nosnippet>674</a>    <span class="doccomment">/// Is the constraint met for a run that ended with `exit_status`
+<a href=#675 id=675 data-nosnippet>675</a>    /// ([`run_exit_code`])?
+<a href=#676 id=676 data-nosnippet>676</a>    </span><span class="kw">pub fn </span>is_match(<span class="kw-2">&amp;</span><span class="self">self</span>, exit_status: ExitStatus) -&gt; bool {
+<a href=#677 id=677 data-nosnippet>677</a>        <span class="kw">let </span>exit_code = run_exit_code(exit_status);
+<a href=#678 id=678 data-nosnippet>678</a>        <span class="kw">match </span><span class="self">self </span>{
+<a href=#679 id=679 data-nosnippet>679</a>            ExitStatusConstraint::Exact(code) =&gt; exit_code == <span class="kw-2">*</span>code,
+<a href=#680 id=680 data-nosnippet>680</a>            ExitStatusConstraint::NonZero =&gt; exit_code != <span class="number">0</span>,
+<a href=#681 id=681 data-nosnippet>681</a>            ExitStatusConstraint::Any =&gt; <span class="bool-val">true</span>,
+<a href=#682 id=682 data-nosnippet>682</a>        }
+<a href=#683 id=683 data-nosnippet>683</a>    }
+<a href=#684 id=684 data-nosnippet>684</a>}
+<a href=#685 id=685 data-nosnippet>685</a>
+<a href=#686 id=686 data-nosnippet>686</a><span class="kw">impl </span>FromStr <span class="kw">for </span>ExitStatusConstraint {
+<a href=#687 id=687 data-nosnippet>687</a>    <span class="kw">type </span><span class="prelude-val">Err </span>= String;
+<a href=#688 id=688 data-nosnippet>688</a>
+<a href=#689 id=689 data-nosnippet>689</a>    <span class="kw">fn </span>from_str(s: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;<span class="self">Self</span>, <span class="self">Self</span>::Err&gt; {
+<a href=#690 id=690 data-nosnippet>690</a>        <span class="kw">if let </span><span class="prelude-val">Ok</span>(n) = s.parse::&lt;i32&gt;() {
+<a href=#691 id=691 data-nosnippet>691</a>            <span class="kw">if </span>!(<span class="number">0</span>..=<span class="number">255</span>).contains(<span class="kw-2">&amp;</span>n) {
+<a href=#692 id=692 data-nosnippet>692</a>                <span class="kw">return </span><span class="prelude-val">Err</span>(<span class="macro">format!</span>(
+<a href=#693 id=693 data-nosnippet>693</a>                    <span class="string">"Exit code constraint {n} is out of range: an exit code is 0 to 255 (128 plus \
+<a href=#694 id=694 data-nosnippet>694</a>                     the signal number for a signal death)"
+<a href=#695 id=695 data-nosnippet>695</a>                </span>));
+<a href=#696 id=696 data-nosnippet>696</a>            }
+<a href=#697 id=697 data-nosnippet>697</a>            <span class="prelude-val">Ok</span>(ExitStatusConstraint::Exact(n))
+<a href=#698 id=698 data-nosnippet>698</a>        } <span class="kw">else </span>{
+<a href=#699 id=699 data-nosnippet>699</a>            <span class="kw">match </span>s.to_lowercase().as_str() {
+<a href=#700 id=700 data-nosnippet>700</a>                <span class="string">"nonzero" </span>=&gt; <span class="prelude-val">Ok</span>(ExitStatusConstraint::NonZero),
+<a href=#701 id=701 data-nosnippet>701</a>                <span class="string">"none" </span>| <span class="string">"any" </span>=&gt; <span class="prelude-val">Ok</span>(ExitStatusConstraint::Any),
+<a href=#702 id=702 data-nosnippet>702</a>                <span class="kw">_ </span>=&gt; <span class="prelude-val">Err</span>(<span class="macro">format!</span>(
+<a href=#703 id=703 data-nosnippet>703</a>                    <span class="string">"Unable to parse string as exit code constraint, expected a number, 'none'/'any', or 'nonzero'.  Received: {}"</span>,
+<a href=#704 id=704 data-nosnippet>704</a>                    s
+<a href=#705 id=705 data-nosnippet>705</a>                )),
+<a href=#706 id=706 data-nosnippet>706</a>            }
+<a href=#707 id=707 data-nosnippet>707</a>        }
+<a href=#708 id=708 data-nosnippet>708</a>    }
+<a href=#709 id=709 data-nosnippet>709</a>}
+<a href=#710 id=710 data-nosnippet>710</a>
+<a href=#711 id=711 data-nosnippet>711</a><span class="doccomment">/// `--success-exit-code`: an exit status, 0 to 255, but those that already
+<a href=#712 id=712 data-nosnippet>712</a>/// mean something else for analyze (see the exit-code allocation table in
+<a href=#713 id=713 data-nosnippet>713</a>/// `hermit::lib`). A process exits with the low 8 bits of the value it
+<a href=#714 id=714 data-nosnippet>714</a>/// passes (`exit`, `exit_group`: `(error_code &amp; 0xff) &lt;&lt; 8`,
+<a href=#715 id=715 data-nosnippet>715</a>/// &lt;https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/exit.c?h=v6.9#n992&gt;),
+<a href=#716 id=716 data-nosnippet>716</a>/// so a value outside that range is refused before the reserved ones are
+<a href=#717 id=717 data-nosnippet>717</a>/// checked: 258 would exit 2 and 378 or -134 would exit 122.
+<a href=#718 id=718 data-nosnippet>718</a></span><span class="kw">fn </span>parse_success_exit_code(text: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Result</span>&lt;i32, String&gt; {
+<a href=#719 id=719 data-nosnippet>719</a>    <span class="kw">let </span>code: i32 = text
+<a href=#720 id=720 data-nosnippet>720</a>        .parse()
+<a href=#721 id=721 data-nosnippet>721</a>        .map_err(|error| <span class="macro">format!</span>(<span class="string">"{text:?} is not a 32-bit integer: {error}"</span>))<span class="question-mark">?</span>;
+<a href=#722 id=722 data-nosnippet>722</a>    <span class="kw">if </span>!(<span class="number">0</span>..=<span class="number">255</span>).contains(<span class="kw-2">&amp;</span>code) {
+<a href=#723 id=723 data-nosnippet>723</a>        <span class="kw">return </span><span class="prelude-val">Err</span>(<span class="macro">format!</span>(
+<a href=#724 id=724 data-nosnippet>724</a>            <span class="string">"{code} is not an exit status: a process exits with the low 8 bits of the value it \
+<a href=#725 id=725 data-nosnippet>725</a>             passes, 0 to 255, so a process exiting with {code} exits {}"</span>,
+<a href=#726 id=726 data-nosnippet>726</a>            code &amp; <span class="number">0xff
+<a href=#727 id=727 data-nosnippet>727</a>        </span>));
+<a href=#728 id=728 data-nosnippet>728</a>    }
+<a href=#729 id=729 data-nosnippet>729</a>    <span class="kw">match </span>code {
+<a href=#730 id=730 data-nosnippet>730</a>        hermit::HERMIT_ANALYZE_PRECONDITION_EXIT =&gt; <span class="prelude-val">Err</span>(<span class="macro">format!</span>(
+<a href=#731 id=731 data-nosnippet>731</a>            <span class="string">"{code} is the status analyze exits with when its inputs do not give it what it \
+<a href=#732 id=732 data-nosnippet>732</a>             needs (HERMIT_ANALYZE_PRECONDITION), so a success could not be told apart from it"
+<a href=#733 id=733 data-nosnippet>733</a>        </span>)),
+<a href=#734 id=734 data-nosnippet>734</a>        <span class="number">120</span>..=<span class="number">127 </span>=&gt; <span class="prelude-val">Err</span>(<span class="macro">format!</span>(
+<a href=#735 id=735 data-nosnippet>735</a>            <span class="string">"{code} is in 120 to 127, which Hermit reserves for its own statuses (122 a refusal, \
+<a href=#736 id=736 data-nosnippet>736</a>             123 the log cap, 124 a deadline, 125 an internal failure, 126 and 127 a program \
+<a href=#737 id=737 data-nosnippet>737</a>             that cannot run), so a success could not be told apart from them"
+<a href=#738 id=738 data-nosnippet>738</a>        </span>)),
+<a href=#739 id=739 data-nosnippet>739</a>        <span class="kw">_ </span>=&gt; <span class="prelude-val">Ok</span>(code),
+<a href=#740 id=740 data-nosnippet>740</a>    }
+<a href=#741 id=741 data-nosnippet>741</a>}
+<a href=#742 id=742 data-nosnippet>742</a>
+<a href=#743 id=743 data-nosnippet>743</a><span class="doccomment">/// The final report that comes out of the analyze process.
+<a href=#744 id=744 data-nosnippet>744</a></span><span class="attr">#[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
+<a href=#745 id=745 data-nosnippet>745</a></span><span class="kw">pub struct </span>Report {
+<a href=#746 id=746 data-nosnippet>746</a>    <span class="doccomment">/// What the analysis concluded; read it first. `critical_events` names
+<a href=#747 id=747 data-nosnippet>747</a>    /// the critical events below. `reproduced_without_schedule` names none: the header
+<a href=#748 id=748 data-nosnippet>748</a>    /// says why, and the event fields are absent. A report without the field,
+<a href=#749 id=749 data-nosnippet>749</a>    /// from before it, names the critical events.
+<a href=#750 id=750 data-nosnippet>750</a>    </span><span class="attr">#[serde(default)]
+<a href=#751 id=751 data-nosnippet>751</a>    </span><span class="kw">pub </span>verdict: Verdict,
+<a href=#752 id=752 data-nosnippet>752</a>
+<a href=#753 id=753 data-nosnippet>753</a>    <span class="doccomment">/// Why the verdict names no event: `{"cause": "scheduler_alone"}`, or,
+<a href=#754 id=754 data-nosnippet>754</a>    /// when the scheduler alone meets the target under timing settings the
+<a href=#755 id=755 data-nosnippet>755</a>    /// recording carries and every trial keeps, `{"cause":
+<a href=#756 id=756 data-nosnippet>756</a>    /// "timing_semantics", "options": [...]}` with those settings. Absent
+<a href=#757 id=757 data-nosnippet>757</a>    /// when the verdict names the critical events.
+<a href=#758 id=758 data-nosnippet>758</a>    </span><span class="attr">#[serde(default, skip_serializing_if = <span class="string">"Option::is_none"</span>)]
+<a href=#759 id=759 data-nosnippet>759</a>    </span><span class="kw">pub </span>verdict_reason: <span class="prelude-ty">Option</span>&lt;VerdictReason&gt;,
+<a href=#760 id=760 data-nosnippet>760</a>
+<a href=#761 id=761 data-nosnippet>761</a>    <span class="doccomment">/// A header containing some contextual information, to go at the beginning of the report.
+<a href=#762 id=762 data-nosnippet>762</a>    </span><span class="kw">pub </span>header: String,
+<a href=#763 id=763 data-nosnippet>763</a>
+<a href=#764 id=764 data-nosnippet>764</a>    <span class="doccomment">/// Some additional context about where in the execution the issue occured. (Basically used as a footer.)
+<a href=#765 id=765 data-nosnippet>765</a>    </span><span class="attr">#[serde(default)]
+<a href=#766 id=766 data-nosnippet>766</a>    </span><span class="kw">pub </span>additional_context: String,
+<a href=#767 id=767 data-nosnippet>767</a>
+<a href=#768 id=768 data-nosnippet>768</a>    <span class="doccomment">/// Is it a baseline run (e.g. passing run) vs a target run (e.g. failing/crashing).
+<a href=#769 id=769 data-nosnippet>769</a>    </span><span class="attr">#[serde(default)]
+<a href=#770 id=770 data-nosnippet>770</a>    </span><span class="kw">pub </span>baseline_run: bool,
+<a href=#771 id=771 data-nosnippet>771</a>
+<a href=#772 id=772 data-nosnippet>772</a>    <span class="doccomment">/// The runtime context for one critical event, which is racing with, and does not commute with
+<a href=#773 id=773 data-nosnippet>773</a>    /// the other. Absent when the verdict names no event.
+<a href=#774 id=774 data-nosnippet>774</a>    </span><span class="attr">#[serde(default, skip_serializing_if = <span class="string">"Option::is_none"</span>)]
+<a href=#775 id=775 data-nosnippet>775</a>    </span><span class="kw">pub </span>critical_event1: <span class="prelude-ty">Option</span>&lt;ReportCriticalEvent&gt;,
+<a href=#776 id=776 data-nosnippet>776</a>    <span class="doccomment">/// The runtime context for the other identified critical event.
+<a href=#777 id=777 data-nosnippet>777</a>    </span><span class="attr">#[serde(default, skip_serializing_if = <span class="string">"Option::is_none"</span>)]
+<a href=#778 id=778 data-nosnippet>778</a>    </span><span class="kw">pub </span>critical_event2: <span class="prelude-ty">Option</span>&lt;ReportCriticalEvent&gt;,
+<a href=#779 id=779 data-nosnippet>779</a>
+<a href=#780 id=780 data-nosnippet>780</a>    <span class="doccomment">/// The warning line, without its newline, that `hermit analyze` or `hermit bisect` printed
+<a href=#781 id=781 data-nosnippet>781</a>    /// before its first trial because those trials read a retired-branch counter that failed
+<a href=#782 id=782 data-nosnippet>782</a>    /// Reverie's validation (`AnalyzeOpts::admit_branch_counter`): the seeds, preemption records
+<a href=#783 id=783 data-nosnippet>783</a>    /// and schedules behind this report are then not guaranteed to reproduce it. Absent where the
+<a href=#784 id=784 data-nosnippet>784</a>    /// counter passed or the trials do not read it, as in every report written before the field
+<a href=#785 id=785 data-nosnippet>785</a>    /// existed.
+<a href=#786 id=786 data-nosnippet>786</a>    </span><span class="attr">#[serde(default, skip_serializing_if = <span class="string">"Option::is_none"</span>)]
+<a href=#787 id=787 data-nosnippet>787</a>    </span><span class="kw">pub </span>branch_counter_warning: <span class="prelude-ty">Option</span>&lt;String&gt;,
+<a href=#788 id=788 data-nosnippet>788</a>
+<a href=#789 id=789 data-nosnippet>789</a>    <span class="doccomment">/// `--prefix-search` only, when the deciding event is a timing decision
+<a href=#790 id=790 data-nosnippet>790</a>    /// (both continuations run the same thread there, for different lengths):
+<a href=#791 id=791 data-nosnippet>791</a>    /// that thread's stack at the deciding event. The two critical events are
+<a href=#792 id=792 data-nosnippet>792</a>    /// then the threads that run next in each continuation, and their
+<a href=#793 id=793 data-nosnippet>793</a>    /// `event_index` is a position in that continuation's recorded schedule
+<a href=#794 id=794 data-nosnippet>794</a>    /// (the header names both files); where no other thread runs, it is that
+<a href=#795 id=795 data-nosnippet>795</a>    /// schedule's length and the stack is empty. A partial report never sets
+<a href=#796 id=796 data-nosnippet>796</a>    /// it.
+<a href=#797 id=797 data-nosnippet>797</a>    </span><span class="attr">#[serde(default, skip_serializing_if = <span class="string">"Option::is_none"</span>)]
+<a href=#798 id=798 data-nosnippet>798</a>    </span><span class="kw">pub </span>deciding_event: <span class="prelude-ty">Option</span>&lt;ReportCriticalEvent&gt;,
+<a href=#799 id=799 data-nosnippet>799</a>
+<a href=#800 id=800 data-nosnippet>800</a>    <span class="doccomment">/// The two conflicting accesses whose order flips after the deciding
+<a href=#801 id=801 data-nosnippet>801</a>    /// event (`--no-racing-accesses` leaves it out).
+<a href=#802 id=802 data-nosnippet>802</a>    </span><span class="attr">#[serde(default, skip_serializing_if = <span class="string">"Option::is_none"</span>)]
+<a href=#803 id=803 data-nosnippet>803</a>    </span><span class="kw">pub </span>racing_accesses: <span class="prelude-ty">Option</span>&lt;RacingAccesses&gt;,
+<a href=#804 id=804 data-nosnippet>804</a>
+<a href=#805 id=805 data-nosnippet>805</a>    <span class="doccomment">/// Set when a budget (--time-budget, --trial-budget) ended the analysis
+<a href=#806 id=806 data-nosnippet>806</a>    /// before it found the critical events: what it found so far. Read it
+<a href=#807 id=807 data-nosnippet>807</a>    /// before the event fields: a partial report names no decision in them.
+<a href=#808 id=808 data-nosnippet>808</a>    </span><span class="attr">#[serde(default, skip_serializing_if = <span class="string">"Option::is_none"</span>)]
+<a href=#809 id=809 data-nosnippet>809</a>    </span><span class="kw">pub </span>partial: <span class="prelude-ty">Option</span>&lt;PartialReport&gt;,
+<a href=#810 id=810 data-nosnippet>810</a>}
+<a href=#811 id=811 data-nosnippet>811</a>
+<a href=#812 id=812 data-nosnippet>812</a><span class="doccomment">/// What a partial report adds: why the analysis stopped, where, its best
+<a href=#813 id=813 data-nosnippet>813</a>/// answer so far, and how to continue it.
+<a href=#814 id=814 data-nosnippet>814</a></span><span class="attr">#[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
+<a href=#815 id=815 data-nosnippet>815</a></span><span class="kw">pub struct </span>PartialReport {
+<a href=#816 id=816 data-nosnippet>816</a>    <span class="doccomment">/// The budget that ran out.
+<a href=#817 id=817 data-nosnippet>817</a>    </span><span class="kw">pub </span>reason: BudgetKind,
+<a href=#818 id=818 data-nosnippet>818</a>    <span class="doccomment">/// The phase that was running.
+<a href=#819 id=819 data-nosnippet>819</a>    </span><span class="kw">pub </span>phase: Phase,
+<a href=#820 id=820 data-nosnippet>820</a>    <span class="doccomment">/// Wall-clock seconds this invocation ran, and its budget, if any.
+<a href=#821 id=821 data-nosnippet>821</a>    </span><span class="kw">pub </span>elapsed_seconds: u64,
+<a href=#822 id=822 data-nosnippet>822</a>    <span class="kw">pub </span>time_budget_seconds: <span class="prelude-ty">Option</span>&lt;u64&gt;,
+<a href=#823 id=823 data-nosnippet>823</a>    <span class="doccomment">/// Runs this invocation started, its budget, if any, and the runs it
+<a href=#824 id=824 data-nosnippet>824</a>    /// answered from the journal of an earlier invocation.
+<a href=#825 id=825 data-nosnippet>825</a>    </span><span class="kw">pub </span>runs_started: u64,
+<a href=#826 id=826 data-nosnippet>826</a>    <span class="kw">pub </span>trial_budget: <span class="prelude-ty">Option</span>&lt;u64&gt;,
+<a href=#827 id=827 data-nosnippet>827</a>    <span class="kw">pub </span>runs_from_journal: u64,
+<a href=#828 id=828 data-nosnippet>828</a>    <span class="doccomment">/// The run the time budget cut short, whose outcome was not counted.
+<a href=#829 id=829 data-nosnippet>829</a>    </span><span class="kw">pub </span>cut_run: <span class="prelude-ty">Option</span>&lt;String&gt;,
+<a href=#830 id=830 data-nosnippet>830</a>    <span class="doccomment">/// The default search's interval, if it got that far.
+<a href=#831 id=831 data-nosnippet>831</a>    </span><span class="kw">pub </span>interval: <span class="prelude-ty">Option</span>&lt;BisectInterval&gt;,
+<a href=#832 id=832 data-nosnippet>832</a>    <span class="doccomment">/// `--prefix-search`'s bracket, if it got that far.
+<a href=#833 id=833 data-nosnippet>833</a>    </span><span class="kw">pub </span>bracket: <span class="prelude-ty">Option</span>&lt;PrefixBracket&gt;,
+<a href=#834 id=834 data-nosnippet>834</a>    <span class="doccomment">/// Whether the stack traces were taken, or why not.
+<a href=#835 id=835 data-nosnippet>835</a>    </span><span class="kw">pub </span>stacks: String,
+<a href=#836 id=836 data-nosnippet>836</a>    <span class="doccomment">/// Commands that replay the runs the report rests on.
+<a href=#837 id=837 data-nosnippet>837</a>    </span><span class="kw">pub </span>replay_commands: Vec&lt;String&gt;,
+<a href=#838 id=838 data-nosnippet>838</a>    <span class="doccomment">/// The kept workspace, and the command that continues the analysis.
+<a href=#839 id=839 data-nosnippet>839</a>    </span><span class="kw">pub </span>workspace: PathBuf,
+<a href=#840 id=840 data-nosnippet>840</a>    <span class="kw">pub </span>resume_command: String,
+<a href=#841 id=841 data-nosnippet>841</a>}
+<a href=#842 id=842 data-nosnippet>842</a>
+<a href=#843 id=843 data-nosnippet>843</a><span class="doccomment">/// Runtime context for a critical event included in the analyze report.
+<a href=#844 id=844 data-nosnippet>844</a></span><span class="attr">#[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
+<a href=#845 id=845 data-nosnippet>845</a></span><span class="kw">pub struct </span>ReportCriticalEvent {
+<a href=#846 id=846 data-nosnippet>846</a>    <span class="doccomment">/// The event index.
+<a href=#847 id=847 data-nosnippet>847</a>    </span><span class="kw">pub </span>event_index: usize,
+<a href=#848 id=848 data-nosnippet>848</a>
+<a href=#849 id=849 data-nosnippet>849</a>    <span class="doccomment">/// The thread stack trace.
+<a href=#850 id=850 data-nosnippet>850</a>    </span><span class="kw">pub </span>stack: <span class="prelude-ty">Option</span>&lt;PrettyBacktrace&gt;,
+<a href=#851 id=851 data-nosnippet>851</a>}
+</code></pre></div></section></main></body></html>

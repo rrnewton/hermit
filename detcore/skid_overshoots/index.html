@@ -1,0 +1,33 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Skid overshoots counted as events, not as reports."><title>detcore::skid_overshoots - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module skid_overshoots</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../detcore/index.html">detcore</a><span class="version">0.5.7</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module skid_<wbr>overshoots</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate detcore</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">detcore</a></div><h1>Module <span>skid_<wbr>overshoots</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/detcore/skid_overshoots.rs.html#9-350">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Skid overshoots counted as events, not as reports.</p>
+<p>Two sites report a precise PMU timer event that took effect past its
+target. Reverie reports it where its timer finds the thread past the
+target, usually with a [<code>reverie::SkidOvershootDetail</code>] naming the thread
+and the target. Detcore’s prehook reports it when the thread ran more
+branches since its last handler than its timer was armed for
+(<code>record_rcb_overshoot_report</code>, called by <code>report_rcb_overshoot</code>). Both
+increment Reverie’s process-global count
+([<code>reverie::record_skid_overshoot</code>]), so one late event usually counts
+twice. That count stays a count of reports: a refusal, and <code>--verify</code>’s
+attribution of a divergence to skid, need only that it is nonzero, and
+Detcore’s report is what keeps it nonzero for an overshoot no Reverie site
+saw.</p>
+<p>Detcore keys each report by thread and target, the pair a detail names, and
+<code>SkidOvershootCounts::count</code> counts a Detcore report whose pair matches a
+detail once.</p>
+<p>The pair is matched rather than the order of detection, because the two
+sites detect in either order. Reverie records a late delivery before the
+Tool’s timer callback, whose prehook reports it again; it records an event
+that another stop overtook only when that stop is settled, after the Tool’s
+callback for the stop, and so after the prehook’s report and after any other
+thread the prehook yielded to has run.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.SkidOvershootCounts.html" title="struct detcore::skid_overshoots::SkidOvershootCounts">Skid<wbr>Overshoot<wbr>Counts</a></dt><dd>The skid overshoots of one run.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.skid_overshoot_counts.html" title="fn detcore::skid_overshoots::skid_overshoot_counts">skid_<wbr>overshoot_<wbr>counts</a></dt><dd><a href="fn.take_skid_overshoots.html" title="fn detcore::skid_overshoots::take_skid_overshoots"><code>take_skid_overshoots</code></a>’s counts, read without taking them, as a report
+written before the run’s final take does. Reverie returns its details only
+by taking them, so they are put back in order: unchanged, since this runs
+once the run’s threads have stopped and no site records in between, and
+all of them, since no more than Reverie keeps were taken. A Reverie
+accessor that reads the details without taking them, as
+<code>reverie::skid_overshoot_count</code> reads the count, would replace the take
+and re-record; that is the clean follow-up, left out of this change to
+keep Reverie’s pin.</dd><dt><a class="fn" href="fn.take_skid_overshoots.html" title="fn detcore::skid_overshoots::take_skid_overshoots">take_<wbr>skid_<wbr>overshoots</a></dt><dd>Take every site’s skid overshoots since the last take: Reverie’s count and
+details and Detcore’s reports, counted with <code>SkidOvershootCounts::count</code>.
+Returns the details as well, in detection order.</dd></dl></section></div></main></body></html>

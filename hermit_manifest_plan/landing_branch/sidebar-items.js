@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["HERMIT_LANDING_BRANCH","REVERIE_LANDING_BRANCH","SETTINGS_FILE"],"fn":["hermit","is_branch_name","resolve","reverie","setting","value_in"]};

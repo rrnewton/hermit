@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MOUNT_PEER_PREFIXES"],"fn":["exclude_ephemeral_host_seed_mounts","is_ephemeral_host_seed_fields","is_ephemeral_host_seed_mount","mount_identity_provenance_is_well_formed","mount_ids_are_ordered_subset","parse_fdinfo_mount_id","parse_mountinfo"],"struct":["MountInfoRow"]};

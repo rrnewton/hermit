@@ -1,0 +1,221 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="A datatype to abstract a record of thread preemptions, as generated during chaos mode execution."><title>detcore::preemptions - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../static.files/rustdoc-17e0aaed.css"><meta name="rustdoc-vars" data-root-path="../../" data-static-root-path="../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.97.1 (8bab26f4f 2026-07-14)" data-channel="1.97.1" data-search-js="search-fd9372ac.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../static.files/main-fcd733ba.js"></script><noscript><link rel="stylesheet" href="../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module preemptions</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../detcore/index.html">detcore</a><span class="version">0.5.7</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module preemptions</a></h2><h3><a href="#modules">Module Items</a></h3><ul class="block"><li><a href="#modules" title="Modules">Modules</a></li><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#enums" title="Enums">Enums</a></li><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2 class="in-crate"><a href="../index.html">In crate detcore</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../index.html">detcore</a></div><h1>Module <span>preemptions</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../src/detcore/preemptions.rs.html#9-8983">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>A datatype to abstract a record of thread preemptions, as generated during chaos mode execution.</p>
+</div></details><h2 id="modules" class="section-header">Modules<a href="#modules" class="anchor">§</a></h2><dl class="item-table"><dt><a class="mod" href="boundary_recording/index.html" title="mod detcore::preemptions::boundary_recording">boundary_<wbr>recording</a></dt><dd>File-format boundary between legacy editors and explicit slice records.
+The scheduler consumes the complete stream; legacy editors must refuse it.
+History-only replay and read-only inspection never rewrite that stream.</dd><dt><a class="mod" href="callback_history/index.html" title="mod detcore::preemptions::callback_history">callback_<wbr>history</a></dt><dd>Software callback expirations in an otherwise unchanged legacy event replay.
+These coordinates do not program the PMU or select a runnable owner.</dd></dl><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.BackgroundStart.html" title="struct detcore::preemptions::BackgroundStart">Background<wbr>Start</a></dt><dd>The turn that began a kernel-run blocking call
+(<code>ResourceID::is_kernel_run_blocking</code>: a blocking read of an external
+descriptor, a binder call that waits for another process, a vfork, an
+<code>rt_sigsuspend</code>), committed as BACKGROUND: from then on the call runs in
+the kernel while other threads’ turns commit. The turn runs no guest code
+and so leaves no event; it is recorded after the global schedule’s first
+<code>after</code> events. When a call starts can decide what it sees: a binder read
+already waiting in the driver is the idle looper a later read on another
+thread finds, or not. A schedule replay starts the call at the same point,
+before the event that follows it.</dd><dt><a class="struct" href="struct.InstructionOffset.html" title="struct detcore::preemptions::InstructionOffset">Instruction<wbr>Offset</a></dt><dd>Where a chaos timeslice with <code>--chaos-instruction-offset</code> ends (defined
+beside the schedule events, which record it too).
+Where a chaos timeslice with <code>--chaos-instruction-offset</code> ends: <code>instructions</code>
+single steps after the thread’s conditional-branch counter reaches
+<code>rcb_target</code>. Straight-line code can return to an address without a
+conditional branch (a repeated call, a backward jump, a <code>rep</code> instruction),
+so the step count, not an address, names the point.</dd><dt><a class="struct" href="struct.PreemptionReader.html" title="struct detcore::preemptions::PreemptionReader">Preemption<wbr>Reader</a></dt><dd>A reader for a stream of preemption events.</dd><dt><a class="struct" href="struct.PreemptionRecord.html" title="struct detcore::preemptions::PreemptionRecord">Preemption<wbr>Record</a></dt><dd>A record of all the preemptions and other scheduling events that occur during execution.</dd><dt><a class="struct" href="struct.PreemptionWriter.html" title="struct detcore::preemptions::PreemptionWriter">Preemption<wbr>Writer</a></dt><dd>A writer for a stream of preemption events.</dd><dt><a class="struct" href="struct.RecordAdmissionRefusal.html" title="struct detcore::preemptions::RecordAdmissionRefusal">Record<wbr>Admission<wbr>Refusal</a></dt><dd>A schedule admission policy failure, not malformed JSON or a replay desync.</dd><dt><a class="struct" href="struct.RecordFormatRefusal.html" title="struct detcore::preemptions::RecordFormatRefusal">Record<wbr>Format<wbr>Refusal</a></dt><dd>A record whose format, or jumps of global time, this Hermit refuses to
+replay (<code>PreemptionRecord::validate_format</code>): a policy refusal, not a
+malformed file.</dd><dt><a class="struct" href="struct.RecordedRewriteExclusives.html" title="struct detcore::preemptions::RecordedRewriteExclusives">Recorded<wbr>Rewrite<wbr>Exclusives</a></dt><dd>What a preemption record file states about its run’s exclusive-loop
+rewrite, for replay admission (<code>rewrite_exclusives_mismatch</code>).</dd><dt><a class="struct" href="struct.RecordedTimedWaitSpread.html" title="struct detcore::preemptions::RecordedTimedWaitSpread">Recorded<wbr>Timed<wbr>Wait<wbr>Spread</a></dt><dd>The <code>--chaos-timed-wait-spread</code> a record was produced under
+(<a href="struct.PreemptionRecord.html" title="struct detcore::preemptions::PreemptionRecord"><code>PreemptionRecord</code></a>): the spread, and the scheduler seed of the run when
+the scheduler wrote the record (<code>None</code> in a record <code>hermit analyze</code>
+assembles from its trials, whose seeds it keeps itself).</dd><dt><a class="struct" href="struct.ReservedInputMetadata.html" title="struct detcore::preemptions::ReservedInputMetadata">Reserved<wbr>Input<wbr>Metadata</a></dt><dd>An optional JSON member, distinguishing absence from a present null.</dd><dt><a class="struct" href="struct.RewriteExclusives.html" title="struct detcore::preemptions::RewriteExclusives">Rewrite<wbr>Exclusives</a></dt><dd>The exclusive-loop rewrite a record’s run applied: where it applied and
+the rewrite format that produced the rewritten instructions
+(<code>crate::aarch64_lse::REWRITE_FORMAT_VERSION</code>). The rewrite changes the
+instructions the guest retires while the files stay the same, so a
+replay must apply the same rewrite; another mode, or another format
+version under the same mode, cannot be shown to retire the same
+instructions and is refused (<code>rewrite_exclusives_mismatch</code>).</dd><dt><a class="struct" href="struct.ThreadHistory.html" title="struct detcore::preemptions::ThreadHistory">Thread<wbr>History</a></dt><dd>The record of priorities and preemptions for a particular thread.</dd><dt><a class="struct" href="struct.ThreadHistoryIterator.html" title="struct detcore::preemptions::ThreadHistoryIterator">Thread<wbr>History<wbr>Iterator</a></dt><dd>An iterator over the preemption history of a thread.  Does not include the final
+timeslice, which does not have an ending time.</dd><dt><a class="struct" href="struct.TimeSkip.html" title="struct detcore::preemptions::TimeSkip">Time<wbr>Skip</a></dt><dd>One jump of global time. A replay of the record makes it where the
+recording did, as replay drives context switches, and checks it: its target
+must still lie ahead, and no finite deadline the replay knows, then or
+later, may come before it, or the replay reports a desync
+(<code>Scheduler::make_recorded_time_skip</code>).</dd></dl><h2 id="enums" class="section-header">Enums<a href="#enums" class="anchor">§</a></h2><dl class="item-table"><dt><a class="enum" href="enum.HistoryIdentity.html" title="enum detcore::preemptions::HistoryIdentity">History<wbr>Identity</a></dt><dd>The RCB-coordinate identity a stored history declares. Only a history
+written in the <code>rcb_history</code> envelope (<code>boundary_recording</code>) has one; a
+legacy file states none, so where it was produced is unknown.</dd><dt><a class="enum" href="enum.RecordedOffsets.html" title="enum detcore::preemptions::RecordedOffsets">Recorded<wbr>Offsets</a></dt><dd>What a preemption record holds of <code>--chaos-instruction-offset</code>’s
+decisions, as a replay or an analysis must treat it.</dd><dt><a class="enum" href="enum.RewriteExclusivesMode.html" title="enum detcore::preemptions::RewriteExclusivesMode">Rewrite<wbr>Exclusives<wbr>Mode</a></dt><dd>Where a run’s rewrite of exclusive loops applied (<code>RewriteExclusives</code>).</dd><dt><a class="enum" href="enum.TimeSkipReason.html" title="enum detcore::preemptions::TimeSkipReason">Time<wbr>Skip<wbr>Reason</a></dt><dd>Why the scheduler moved global time ahead to a deadline.</dd></dl><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.BACKGROUND_STARTS_FORMAT.html" title="constant detcore::preemptions::BACKGROUND_STARTS_FORMAT">BACKGROUND_<wbr>STARTS_<wbr>FORMAT</a></dt><dd>The first format whose records note every background start
+(<code>BackgroundStart</code>), so that a call such a record does not start at a point
+did not start there: the next number above <a href="constant.SWITCH_IN_CHARGE_FORMAT.html" title="constant detcore::preemptions::SWITCH_IN_CHARGE_FORMAT"><code>SWITCH_IN_CHARGE_FORMAT</code></a> on
+the record-format counter (<a href="constant.PREEMPTION_RECORD_FORMAT_MAX.html" title="constant detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX"><code>PREEMPTION_RECORD_FORMAT_MAX</code></a>).</dd><dt><a class="constant" href="constant.INSTRUCTION_OFFSET_FORMAT.html" title="constant detcore::preemptions::INSTRUCTION_OFFSET_FORMAT">INSTRUCTION_<wbr>OFFSET_<wbr>FORMAT</a></dt><dd>The format from which a record’s schedule trace (its <code>global</code> events)
+may carry an instruction offset on a batch of branches
+(<code>SchedEvent::instruction_offset</code>): above
+<a href="constant.INSTRUCTION_OFFSET_ROWS_FORMAT.html" title="constant detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT"><code>INSTRUCTION_OFFSET_ROWS_FORMAT</code></a>, which only its rows may hold.</dd><dt><a class="constant" href="constant.INSTRUCTION_OFFSET_ROWS_FORMAT.html" title="constant detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT">INSTRUCTION_<wbr>OFFSET_<wbr>ROWS_<wbr>FORMAT</a></dt><dd>The format of a record whose rows hold a <code>--chaos-instruction-offset</code>
+decision (<code>ThreadHistory::preemption_instruction_offsets</code>): the next number
+above <a href="constant.STOPLESS_SLICE_ENDS_FORMAT.html" title="constant detcore::preemptions::STOPLESS_SLICE_ENDS_FORMAT"><code>STOPLESS_SLICE_ENDS_FORMAT</code></a> on the record-format counter.</dd><dt><a class="constant" href="constant.PREEMPTION_RECORD_FORMAT_MAX.html" title="constant detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX">PREEMPTION_<wbr>RECORD_<wbr>FORMAT_<wbr>MAX</a></dt><dd>The newest preemption-record format this Hermit writes and reads
+(<code>PreemptionRecord::format_version</code>), one counter for every format change:
+a record of format N has every property of the formats before it.</dd><dt><a class="constant" href="constant.PREEMPTION_RECORD_FORMAT_WITHOUT_OFFSETS.html" title="constant detcore::preemptions::PREEMPTION_RECORD_FORMAT_WITHOUT_OFFSETS">PREEMPTION_<wbr>RECORD_<wbr>FORMAT_<wbr>WITHOUT_<wbr>OFFSETS</a></dt><dd>The format a fresh record states when its rows hold no instruction
+offset: the newest format below <a href="constant.INSTRUCTION_OFFSET_ROWS_FORMAT.html" title="constant detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT"><code>INSTRUCTION_OFFSET_ROWS_FORMAT</code></a>,
+which is <a href="constant.STOPLESS_SLICE_ENDS_FORMAT.html" title="constant detcore::preemptions::STOPLESS_SLICE_ENDS_FORMAT"><code>STOPLESS_SLICE_ENDS_FORMAT</code></a>. Such a file is written exactly
+as before the offsets existed, so every Hermit still reads it; only a
+record whose rows hold an offset states
+<a href="constant.PREEMPTION_RECORD_FORMAT_MAX.html" title="constant detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX"><code>PREEMPTION_RECORD_FORMAT_MAX</code></a>. The writer stamps this format
+(<code>format_without_instruction_offsets</code>), and its first row with an
+offset raises it (<code>PreemptionWriter::insert_reprioritization</code>).</dd><dt><a class="constant" href="constant.STOPLESS_SLICE_ENDS_FORMAT.html" title="constant detcore::preemptions::STOPLESS_SLICE_ENDS_FORMAT">STOPLESS_<wbr>SLICE_<wbr>ENDS_<wbr>FORMAT</a></dt><dd>The format from which a record may mark a lone thread’s timeslice end
+taken without a stop (<code>SchedEvent::stopless</code>): the next number above
+<a href="constant.BACKGROUND_STARTS_FORMAT.html" title="constant detcore::preemptions::BACKGROUND_STARTS_FORMAT"><code>BACKGROUND_STARTS_FORMAT</code></a>. A writer that notes its run’s background
+starts writes it (<code>PreemptionWriter::noting_background_starts</code>): a run
+that follows no record, and a preemption replay’s re-record. A record of
+an older format holds no mark: a writer below this format records such an
+end as an ordinary one (<code>PreemptionWriter::insert_schedevent</code>), and a
+record lowered below <code>BACKGROUND_STARTS_FORMAT</code> drops its marks with its
+starts (<code>PreemptionRecord::forget_stopless_marks_below_their_format</code>). A
+record read with a mark in an older format is refused
+(<code>PreemptionRecord::validate_format</code>).</dd><dt><a class="constant" href="constant.SWITCH_IN_CHARGE_FORMAT.html" title="constant detcore::preemptions::SWITCH_IN_CHARGE_FORMAT">SWITCH_<wbr>IN_<wbr>CHARGE_<wbr>FORMAT</a></dt><dd>The format from which a schedule replay charges a scheduler turn for every
+replayed switch to a thread that then runs guest code
+(<code>Scheduler::bump_global_time</code>), as the run that wrote the record charged
+the yield turn the switch stands for. A run charges every such stretch when
+it follows no record, or follows one of this format. A replay of an older
+record charges as before: its writer cannot say whether its own run
+followed a schedule, and so left those stretches uncharged.</dd><dt><a class="constant" href="constant.TIME_SKIPS_FORMAT.html" title="constant detcore::preemptions::TIME_SKIPS_FORMAT">TIME_<wbr>SKIPS_<wbr>FORMAT</a></dt><dd>The format from which a record lists all its jumps of global time.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.annotated_replay_mode_refusal.html" title="fn detcore::preemptions::annotated_replay_mode_refusal">annotated_<wbr>replay_<wbr>mode_<wbr>refusal</a></dt><dd>Detcore’s own refusal of a run prepared to replay a callback-annotated
+priority history (<code>Config::annotated_priority_replay</code>) on an effective
+configuration that cannot honor its row ends
+(<code>Config::annotated_priority_replay_unqualified</code>), checked before the
+scheduler or any history exists. Hosts refuse earlier, by name; this
+backstop holds for every configuration that reaches Detcore, whoever
+prepared it. <code>None</code> for an unannotated run or a qualified one.</dd><dt><a class="fn" href="fn.cap_preemption_charge_mismatch.html" title="fn detcore::preemptions::cap_preemption_charge_mismatch">cap_<wbr>preemption_<wbr>charge_<wbr>mismatch</a></dt><dd>The refusal of a replay whose <code>--cap-preemption-charge</code> differs from the
+one a record stores, naming the record by <code>source</code> (an option and a
+path), or <code>None</code> when they agree.</dd><dt><a class="fn" href="fn.config_rewrite_exclusives.html" title="fn detcore::preemptions::config_rewrite_exclusives">config_<wbr>rewrite_<wbr>exclusives</a></dt><dd>The exclusive-loop rewrite a run under <code>config</code> applies, as its
+preemption record states it and as a replay of that record must be
+admitted under: the config’s rewrite form at this Hermit’s rewrite
+format version, or <code>None</code> when the run rewrites nothing.</dd><dt><a class="fn" href="fn.draw_chaos_timeslice.html" title="fn detcore::preemptions::draw_chaos_timeslice">draw_<wbr>chaos_<wbr>timeslice</a></dt><dd>The <code>--max-timeslice</code> a chaos run with <code>--chaos-timeslice-draw=run</code> draws:
+log-uniform over <code>range</code>, both bounds included, as a pure function of the
+scheduler seed. A stream of its own (<code>CHAOS_TIMESLICE_SALT</code>) keeps it
+independent of the seed’s other draws, so adding the option changes no
+other random choice of the run.</dd><dt><a class="fn" href="fn.expired_wait_charge_mismatch.html" title="fn detcore::preemptions::expired_wait_charge_mismatch">expired_<wbr>wait_<wbr>charge_<wbr>mismatch</a></dt><dd>The refusal of a replay whose explicit <code>--expired-wait-charge</code> differs from
+the rule a record states (<code>recorded_once</code>, as
+<a href="fn.read_recorded_expired_wait_runs_charged_once.html" title="fn detcore::preemptions::read_recorded_expired_wait_runs_charged_once"><code>read_recorded_expired_wait_runs_charged_once</code></a> reads it), naming the
+record by <code>source</code> (an option and a path), or <code>None</code> when they agree or the
+replay leaves the option unset, and so takes the record’s rule. For a
+search (<code>hermit analyze</code>, <code>hermit bisect</code>), which runs every trial under
+one rule, the remedy names the recordings instead.</dd><dt><a class="fn" href="fn.format_without_background_starts.html" title="fn detcore::preemptions::format_without_background_starts">format_<wbr>without_<wbr>background_<wbr>starts</a></dt><dd>The newest format a record may state when it does not hold every
+background start of its run: <code>format</code>, lowered below
+<a href="constant.BACKGROUND_STARTS_FORMAT.html" title="constant detcore::preemptions::BACKGROUND_STARTS_FORMAT"><code>BACKGROUND_STARTS_FORMAT</code></a> when it is a format this Hermit reads at or
+above it (<code>BACKGROUND_STARTS_FORMAT..=PREEMPTION_RECORD_FORMAT_MAX</code>). A schedule
+replay’s re-record, a slice-boundary recording, an edit or a shorter
+prefix of a schedule, and an analyze or bisect trial note no starts, so
+they keep the timing rules of their format and claim no list of starts.
+Any other stated format, newer than this Hermit or invalid (0), stays as
+stated, so that reading the record still refuses it
+(<code>PreemptionRecord::validate_format</code>): lowered, a newer Hermit’s record
+would read as one without what it may hold.</dd><dt><a class="fn" href="fn.format_without_instruction_offsets.html" title="fn detcore::preemptions::format_without_instruction_offsets">format_<wbr>without_<wbr>instruction_<wbr>offsets</a></dt><dd>The newest format a record may state when its rows hold no instruction
+offset: <code>format</code>, lowered below <a href="constant.INSTRUCTION_OFFSET_ROWS_FORMAT.html" title="constant detcore::preemptions::INSTRUCTION_OFFSET_ROWS_FORMAT"><code>INSTRUCTION_OFFSET_ROWS_FORMAT</code></a> when it is a
+format this Hermit reads at or above it
+(<code>INSTRUCTION_OFFSET_ROWS_FORMAT..=PREEMPTION_RECORD_FORMAT_MAX</code>). A run without
+<code>--chaos-instruction-offset</code> decisions keeps the timing rules of its format
+and claims no offsets. Any other stated format, newer than this Hermit or
+invalid (0), stays as stated, so that reading the record still refuses it
+(<code>PreemptionRecord::validate_format</code>): lowered, a newer Hermit’s record
+would read as one without what it may hold.</dd><dt><a class="fn" href="fn.guest_ids_mismatch.html" title="fn detcore::preemptions::guest_ids_mismatch">guest_<wbr>ids_<wbr>mismatch</a></dt><dd>The refusal of a replay whose guest would be numbered otherwise than the
+run that a record (named by <code>source</code>, an option and a path) came from,
+or <code>None</code> when they number it alike (<code>GuestIds::numbers_like</code>).</dd><dt><a class="fn" href="fn.pipe_wake_latency_mismatch.html" title="fn detcore::preemptions::pipe_wake_latency_mismatch">pipe_<wbr>wake_<wbr>latency_<wbr>mismatch</a></dt><dd>The refusal of a replay whose <code>--pipe-wake-latency</code> differs from the one a
+record stores, naming the record by <code>source</code> (an option and a path), or
+<code>None</code> when they agree. Absent and off are the same; <code>Some(0)</code> is not off.</dd><dt><a class="fn" href="fn.post_crash_timeslice_for_replay.html" title="fn detcore::preemptions::post_crash_timeslice_for_replay">post_<wbr>crash_<wbr>timeslice_<wbr>for_<wbr>replay</a></dt><dd>The post-crash bound a replay of a record runs under, naming the record
+by <code>source</code> (an option and a path) in a refusal. A record that stores a
+bound gives it to a replay that sets none; a replay that sets another
+bound, or sets one for a record made with the switch off, is refused: the
+switch changes every slice after it, so the replay would leave the record.</dd><dt><a class="fn" href="fn.read_recorded_callback_checkpoints.html" title="fn detcore::preemptions::read_recorded_callback_checkpoints">read_<wbr>recorded_<wbr>callback_<wbr>checkpoints</a></dt><dd>Read only whether a preemption record file carries callback checkpoints
+(<code>Config::annotated_priority_replay</code>), as <a href="fn.read_recorded_epoch.html" title="fn detcore::preemptions::read_recorded_epoch"><code>read_recorded_epoch</code></a> reads
+the epoch. A record without the field, older or made without chaos
+recording, carries none. Detcore validates the whole record, checkpoints
+included, when it loads it for the run.</dd><dt><a class="fn" href="fn.read_recorded_cap_preemption_charge.html" title="fn detcore::preemptions::read_recorded_cap_preemption_charge">read_<wbr>recorded_<wbr>cap_<wbr>preemption_<wbr>charge</a></dt><dd>Read only whether the run that wrote a preemption record file capped
+preemption charges, as <a href="fn.read_recorded_epoch.html" title="fn detcore::preemptions::read_recorded_epoch"><code>read_recorded_epoch</code></a> reads the epoch. A record
+without the field was made with the option off.</dd><dt><a class="fn" href="fn.read_recorded_chaos_slowdown.html" title="fn detcore::preemptions::read_recorded_chaos_slowdown">read_<wbr>recorded_<wbr>chaos_<wbr>slowdown</a></dt><dd>Read only the <code>--pipe-wake-latency</code> stored in a preemption record file, as
+<a href="fn.read_recorded_epoch.html" title="fn detcore::preemptions::read_recorded_epoch"><code>read_recorded_epoch</code></a> reads the epoch. <code>Ok(None)</code> means the record was
+made with the option off, or before the field existed.</dd><dt><a class="fn" href="fn.read_recorded_chaos_timeslice.html" title="fn detcore::preemptions::read_recorded_chaos_timeslice">read_<wbr>recorded_<wbr>chaos_<wbr>timeslice</a></dt><dd>Read only the timeslice a preemption record file states its run drew under
+<code>--chaos-timeslice-draw=run</code> (<code>PreemptionRecord::chaos_timeslice</code>), as
+<a href="fn.read_recorded_epoch.html" title="fn detcore::preemptions::read_recorded_epoch"><code>read_recorded_epoch</code></a> reads the epoch. <code>Ok(None)</code> for a record without
+one.</dd><dt><a class="fn" href="fn.read_recorded_epoch.html" title="fn detcore::preemptions::read_recorded_epoch">read_<wbr>recorded_<wbr>epoch</a></dt><dd>Read only the virtual-time epoch stored in a preemption record file.</dd><dt><a class="fn" href="fn.read_recorded_expired_wait_runs_charged_once.html" title="fn detcore::preemptions::read_recorded_expired_wait_runs_charged_once">read_<wbr>recorded_<wbr>expired_<wbr>wait_<wbr>runs_<wbr>charged_<wbr>once</a></dt><dd>Read only whether the run that wrote a preemption record file charged a
+run of expired timed waits one turn, as <a href="fn.read_recorded_epoch.html" title="fn detcore::preemptions::read_recorded_epoch"><code>read_recorded_epoch</code></a> reads the
+epoch. <code>Ok(false)</code> for a record that does not say: one written before the
+field existed, or by a run under the <code>each</code> rule (by default race search),
+both of which charged every wait.</dd><dt><a class="fn" href="fn.read_recorded_guest_ids.html" title="fn detcore::preemptions::read_recorded_guest_ids">read_<wbr>recorded_<wbr>guest_<wbr>ids</a></dt><dd>How the run that wrote the record at <code>path</code> numbered its guest, as the
+record stores it: <code>GuestIds::Namespace</code> for a record that does not say,
+which only a run its PID namespace numbered, or one before the field
+existed, writes.</dd><dt><a class="fn" href="fn.read_recorded_instruction_offsets.html" title="fn detcore::preemptions::read_recorded_instruction_offsets">read_<wbr>recorded_<wbr>instruction_<wbr>offsets</a></dt><dd>Whether any timeslice in a preemption record file was delivered past its
+branch target (<code>--chaos-instruction-offset</code>). A replay of such a record
+needs the precise single steps that only the ptrace backend takes.</dd><dt><a class="fn" href="fn.read_recorded_offsets.html" title="fn detcore::preemptions::read_recorded_offsets">read_<wbr>recorded_<wbr>offsets</a></dt><dd>What a preemption record file holds of <code>--chaos-instruction-offset</code>’s
+decisions (<a href="enum.RecordedOffsets.html" title="enum detcore::preemptions::RecordedOffsets"><code>RecordedOffsets</code></a>), read from its settings and format. A replay of offsets needs the precise single steps that only the
+ptrace backend takes, and a schedule replay needs them in the schedule
+trace.</dd><dt><a class="fn" href="fn.read_recorded_pipe_wake_latency.html" title="fn detcore::preemptions::read_recorded_pipe_wake_latency">read_<wbr>recorded_<wbr>pipe_<wbr>wake_<wbr>latency</a></dt><dd>Read only the <code>--pipe-wake-latency</code> stored in a preemption record file, as
+<a href="fn.read_recorded_epoch.html" title="fn detcore::preemptions::read_recorded_epoch"><code>read_recorded_epoch</code></a> reads the epoch. <code>Ok(None)</code> means the record was
+made with the option off, or before the field existed.</dd><dt><a class="fn" href="fn.read_recorded_post_crash_switches.html" title="fn detcore::preemptions::read_recorded_post_crash_switches">read_<wbr>recorded_<wbr>post_<wbr>crash_<wbr>switches</a></dt><dd>Read only the post-crash switches a preemption record holds, so a replay
+can refuse to take a different one: <code>Some</code> (possibly empty) for a record
+its own run wrote with the switch on, <code>None</code> for one made with it off,
+derived from another, or made before the field existed.</dd><dt><a class="fn" href="fn.read_recorded_post_crash_timeslice.html" title="fn detcore::preemptions::read_recorded_post_crash_timeslice">read_<wbr>recorded_<wbr>post_<wbr>crash_<wbr>timeslice</a></dt><dd>Read only the post-crash bound stored in a preemption record file, as
+<a href="fn.read_recorded_epoch.html" title="fn detcore::preemptions::read_recorded_epoch"><code>read_recorded_epoch</code></a> reads the epoch. <code>Ok(None)</code> means the record was
+made with the switch off, or before the field existed.</dd><dt><a class="fn" href="fn.read_recorded_queued_sleeps_registered_at_first_pass.html" title="fn detcore::preemptions::read_recorded_queued_sleeps_registered_at_first_pass">read_<wbr>recorded_<wbr>queued_<wbr>sleeps_<wbr>registered_<wbr>at_<wbr>first_<wbr>pass</a></dt><dd>Read only whether the run that wrote a preemption record file registered
+queued sleeps at the first pass, as <a href="fn.read_recorded_epoch.html" title="fn detcore::preemptions::read_recorded_epoch"><code>read_recorded_epoch</code></a> reads the
+epoch. <code>Ok(false)</code> for a record that does not say: one written before the
+field existed, or by a run under the <code>when-chosen</code> rule (by default race
+search), both of which registered a sleep only when its thread was chosen.</dd><dt><a class="fn" href="fn.read_recorded_replay_departure.html" title="fn detcore::preemptions::read_recorded_replay_departure">read_<wbr>recorded_<wbr>replay_<wbr>departure</a></dt><dd>Read only whether a preemption record was written by a replay that left a
+change point out of it (<a href="struct.PreemptionRecord.html#method.replay_departed_at" title="method detcore::preemptions::PreemptionRecord::replay_departed_at"><code>PreemptionRecord::replay_departed_at</code></a>).</dd><dt><a class="fn" href="fn.read_recorded_reserved_input.html" title="fn detcore::preemptions::read_recorded_reserved_input">read_<wbr>recorded_<wbr>reserved_<wbr>input</a></dt><dd>Preserve missing/unknown metadata when inspecting either JSON envelope.</dd><dt><a class="fn" href="fn.read_recorded_rewrite_exclusives.html" title="fn detcore::preemptions::read_recorded_rewrite_exclusives">read_<wbr>recorded_<wbr>rewrite_<wbr>exclusives</a></dt><dd>Read only what a preemption record file states about its run’s
+exclusive-loop rewrite, as <a href="fn.read_recorded_epoch.html" title="fn detcore::preemptions::read_recorded_epoch"><code>read_recorded_epoch</code></a> reads the epoch.</dd><dt><a class="fn" href="fn.read_recorded_rewrite_exclusives_in_memory.html" title="fn detcore::preemptions::read_recorded_rewrite_exclusives_in_memory">read_<wbr>recorded_<wbr>rewrite_<wbr>exclusives_<wbr>in_<wbr>memory</a></dt><dd>Read only whether the run that wrote a preemption record file rewrote
+exclusive loops in the guest’s memory, as <a href="fn.read_recorded_epoch.html" title="fn detcore::preemptions::read_recorded_epoch"><code>read_recorded_epoch</code></a> reads
+the epoch. A record without the field was made without the rewrite.</dd><dt><a class="fn" href="fn.read_recorded_rng_seed.html" title="fn detcore::preemptions::read_recorded_rng_seed">read_<wbr>recorded_<wbr>rng_<wbr>seed</a></dt><dd>Read only the <code>--rng-seed</code> stored in a preemption record file, as
+<a href="fn.read_recorded_epoch.html" title="fn detcore::preemptions::read_recorded_epoch"><code>read_recorded_epoch</code></a> reads the epoch. <code>Ok(None)</code> means the record predates
+the field.</dd><dt><a class="fn" href="fn.read_recorded_signal_state_copy.html" title="fn detcore::preemptions::read_recorded_signal_state_copy">read_<wbr>recorded_<wbr>signal_<wbr>state_<wbr>copy</a></dt><dd>Read only whether the signal-state copy was on in the run that wrote a
+preemption record file, as <a href="fn.read_recorded_epoch.html" title="fn detcore::preemptions::read_recorded_epoch"><code>read_recorded_epoch</code></a> reads the epoch.
+<code>Ok(None)</code> for a record written before the field existed.</dd><dt><a class="fn" href="fn.read_recorded_timed_wait_spread.html" title="fn detcore::preemptions::read_recorded_timed_wait_spread">read_<wbr>recorded_<wbr>timed_<wbr>wait_<wbr>spread</a></dt><dd>Read only the <code>--chaos-timed-wait-spread</code> stored in a preemption record
+file, as <a href="fn.read_recorded_epoch.html" title="fn detcore::preemptions::read_recorded_epoch"><code>read_recorded_epoch</code></a> reads the epoch. <code>Ok(None)</code> means the
+record was made with the option off, or before the field existed.</dd><dt><a class="fn" href="fn.read_recorded_uncapped_slices.html" title="fn detcore::preemptions::read_recorded_uncapped_slices">read_<wbr>recorded_<wbr>uncapped_<wbr>slices</a></dt><dd>Read only the uncapped-slices mark of a preemption record file
+(<code>PreemptionRecord::uncapped_slices</code>), as <a href="fn.read_recorded_epoch.html" title="fn detcore::preemptions::read_recorded_epoch"><code>read_recorded_epoch</code></a> reads the
+epoch. <code>Ok(None)</code> for an unmarked record.</dd><dt><a class="fn" href="fn.read_trace.html" title="fn detcore::preemptions::read_trace">read_<wbr>trace</a></dt><dd>Read a full trace from disk.  Panic if it doesn’t load.</dd><dt><a class="fn" href="fn.recorded_pipe_wake_latency_in.html" title="fn detcore::preemptions::recorded_pipe_wake_latency_in">recorded_<wbr>pipe_<wbr>wake_<wbr>latency_<wbr>in</a></dt><dd><a href="fn.read_recorded_pipe_wake_latency.html" title="fn detcore::preemptions::read_recorded_pipe_wake_latency"><code>read_recorded_pipe_wake_latency</code></a> over <code>bytes</code> already read from <code>path</code>,
+which only names them in errors.</dd><dt><a class="fn" href="fn.recorded_signal_state_copy_in.html" title="fn detcore::preemptions::recorded_signal_state_copy_in">recorded_<wbr>signal_<wbr>state_<wbr>copy_<wbr>in</a></dt><dd><a href="fn.read_recorded_signal_state_copy.html" title="fn detcore::preemptions::read_recorded_signal_state_copy"><code>read_recorded_signal_state_copy</code></a> over <code>bytes</code> already read from
+<code>path</code>, which only names them in errors.</dd><dt><a class="fn" href="fn.refuse_unread_record_format.html" title="fn detcore::preemptions::refuse_unread_record_format">refuse_<wbr>unread_<wbr>record_<wbr>format</a></dt><dd>Refuse <code>path</code> if it is a preemption record of a format this Hermit does
+not read, as reading it refuses it (<a href="boundary_recording/enum.Recording.html#method.read" title="associated function detcore::preemptions::boundary_recording::Recording::read"><code>boundary_recording::Recording::read</code></a>:
+<code>validate_format</code>, or the format a record too new to decode states),
+keeping the refusal typed (<a href="struct.RecordFormatRefusal.html" title="struct detcore::preemptions::RecordFormatRefusal"><code>RecordFormatRefusal</code></a>) in the error’s chain so
+that a tool can exit with the policy status. For a tool that reads a
+record’s settings (<code>read_recorded_*</code>) before decoding it. An unreadable or
+otherwise malformed file is left to the reader that needs it.</dd><dt><a class="fn" href="fn.requests_first_pass_sleep_registration.html" title="fn detcore::preemptions::requests_first_pass_sleep_registration">requests_<wbr>first_<wbr>pass_<wbr>sleep_<wbr>registration</a></dt><dd>Whether <code>config</code> asks for queued sleeps to be registered at the first
+pass, before the backend’s limit: a replay that leaves
+<code>--sleep-registration</code> unset takes its record’s rule (a record that cannot
+be read counts as <code>when-chosen</code>; the replay’s own loader fails on it), and
+any other run <code>Config::queued_sleeps_registered_at_first_pass</code>.
+<code>Scheduler::new</code> registers at the first pass only when this holds and the
+scheduler reads a sleeper’s signal state
+(<code>Config::reads_sleeper_signal_state</code>), and hermit refuses a launch where
+this holds and that does not, before the guest starts.</dd><dt><a class="fn" href="fn.rewrite_exclusives_in_memory_mismatch.html" title="fn detcore::preemptions::rewrite_exclusives_in_memory_mismatch">rewrite_<wbr>exclusives_<wbr>in_<wbr>memory_<wbr>mismatch</a></dt><dd>The refusal of a replay that would rewrite exclusive loops in the guest’s
+memory where the record’s run did not, or the other way round, naming the
+record by <code>source</code> (an option and a path); <code>None</code> when they agree.</dd><dt><a class="fn" href="fn.rewrite_exclusives_mismatch.html" title="fn detcore::preemptions::rewrite_exclusives_mismatch">rewrite_<wbr>exclusives_<wbr>mismatch</a></dt><dd>The refusal of a replay whose exclusive-loop rewrite (<code>replay</code>, this
+Hermit’s current provenance, or <code>None</code> for no rewrite) is not the one
+the record states, naming the record by <code>source</code> (an option and a
+path); <code>None</code> when the replay can be shown to retire the same
+instructions. A record of the removed stripped-file heuristic is
+always refused, and so is a record that states no provenance — made
+before records carried it, an in-memory one included — when the
+replay rewrites at all: its rewritten instructions are unknown. Only
+a replay that rewrites nothing still follows such a record, as it did
+before the provenance existed, unless the record states the in-memory
+rewrite.</dd><dt><a class="fn" href="fn.signal_state_copy_mismatch.html" title="fn detcore::preemptions::signal_state_copy_mismatch">signal_<wbr>state_<wbr>copy_<wbr>mismatch</a></dt><dd>The refusal of a replay whose signal-state copy setting differs from the
+one a record stores, naming the record by <code>source</code> (an option and a path),
+or <code>None</code> when they agree or the record does not say.</dd><dt><a class="fn" href="fn.sleep_registration_mismatch.html" title="fn detcore::preemptions::sleep_registration_mismatch">sleep_<wbr>registration_<wbr>mismatch</a></dt><dd>The refusal of a replay whose explicit <code>--sleep-registration</code> differs from
+the rule a record states (<code>recorded_first_pass</code>, as
+<a href="fn.read_recorded_queued_sleeps_registered_at_first_pass.html" title="fn detcore::preemptions::read_recorded_queued_sleeps_registered_at_first_pass"><code>read_recorded_queued_sleeps_registered_at_first_pass</code></a> reads it), naming
+the record by <code>source</code> (an option and a path), or <code>None</code> when they agree or
+the replay leaves the option unset, and so takes the record’s rule. For a
+search (<code>hermit analyze</code>, <code>hermit bisect</code>), which runs every trial under
+one rule, the remedy names the recordings instead.</dd><dt><a class="fn" href="fn.strip_times_from_events_file.html" title="fn detcore::preemptions::strip_times_from_events_file">strip_<wbr>times_<wbr>from_<wbr>events_<wbr>file</a></dt><dd>Take a file containing a PreemptionRecord and strip the times from all the events.
+Optionally take a destination path, otherwise create a destination file in the same directory
+with our own naming convention.</dd><dt><a class="fn" href="fn.timed_wait_spread_mismatch.html" title="fn detcore::preemptions::timed_wait_spread_mismatch">timed_<wbr>wait_<wbr>spread_<wbr>mismatch</a></dt><dd>The refusal of a replay that would not redraw a record’s spread-wait
+factors, naming the record by <code>source</code> (an option and a path), or <code>None</code>
+when it would: the replay’s <code>--chaos-timed-wait-spread</code> (<code>spread</code>) must be
+the recorded one, and where both the record and the replay name a
+scheduler seed (<code>seed</code>), so must the seed. Absent and off are the same.</dd><dt><a class="fn" href="fn.validate_chosen_provenance.html" title="fn detcore::preemptions::validate_chosen_provenance">validate_<wbr>chosen_<wbr>provenance</a></dt><dd>Early launch preflight. Each authoritative loader repeats the check on
+the same immutable decoded bytes it installs; this pathname check is not
+that final authority. Both Config inputs are checked independently.
+The run’s exclusive-loop rewrite must be the one each record states
+(<code>super::rewrite_exclusives_mismatch</code> against the final config), so
+every launch path – the CLI and the public library entries alike –
+refuses another rewrite before any backend starts the guest.
+The Chosen provenance half of <a href="fn.validate_config_replay_inputs.html" title="fn detcore::preemptions::validate_config_replay_inputs"><code>validate_config_replay_inputs</code></a>, with
+each record validated under its own recorded guest numbering. A CLI
+preflight that runs before the run adopts the recorded numbering uses
+this so a record failing provenance is refused for that specific
+reason, before identity admission, as the Detcore route refuses it;
+the launch still repeats the full check against the final config.</dd><dt><a class="fn" href="fn.validate_config_replay_inputs.html" title="fn detcore::preemptions::validate_config_replay_inputs">validate_<wbr>config_<wbr>replay_<wbr>inputs</a></dt><dd>Every replay input in <code>config</code> validated against the run’s final
+guest numbering and exclusive-loop rewrite, as documented above.</dd></dl></section></div></main></body></html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["BINDING_BYTES","HEADER_BYTES","MAX_BYTES"],"enum":["Error"],"fn":["decode","encode_header"],"struct":["CutBinding"]};

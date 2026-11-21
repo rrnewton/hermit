@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["ERESTARTNOHAND","ERESTARTNOINTR","ERESTARTSYS","ERESTART_RESTARTBLOCK"],"enum":["CaughtSignalReturn"],"fn":["caught_signal_return"]};

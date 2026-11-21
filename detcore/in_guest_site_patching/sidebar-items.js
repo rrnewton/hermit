@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["require_site_patching_off","site_patching_off_required","violation"]};

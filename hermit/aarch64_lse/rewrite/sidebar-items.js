@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["Idiom","Refusal"],"fn":["apply","direct_branch_targets","plan","plan_section","plan_with_entries","plan_with_external_store","plan_with_external_targets","refuse_patched","unknown_direct_branch_possible"],"struct":["RefusedSite","Report","Site"]};
