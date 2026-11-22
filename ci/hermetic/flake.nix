@@ -37,16 +37,16 @@
   # Do NOT replace these with a branch name to keep them fresh. A branch is not
   # reproducible. Re-pin to a new revision as a reviewed change instead.
   inputs = {
-    # nixos-unstable @ 2026-08-23. `pkgs.rustc` here is 1.95.0 on the 26.05
-    # release branch and 1.97.1 on unstable; unstable is taken because 1.97.1 is
-    # the exact stable version the whole workspace has been shown to
-    # `cargo check` clean against, so the drop-rust-overlay question can be
-    # tested against this image rather than argued about.
+    # nixos-unstable @ 2026-08-23, retained unchanged by the 1.99.1 repin:
+    # the Rust toolchain comes from the overlay, so only the overlay had to
+    # move. `pkgs.rustc` here is 1.95.0 on the 26.05 release branch and
+    # 1.97.1 on unstable.
     nixpkgs.url = "github:NixOS/nixpkgs/56c02bc00adcf003215cc4bd996d6efaf4cff188";
-    # oxalica/rust-overlay @ 2026-08-24, which was already the tip when this
-    # bump was made -- this input had not gone stale, only nixpkgs had.
+    # oxalica/rust-overlay @ 2026-11-22 (tip of the day), the first pin
+    # carrying the rustc 1.99.1 manifests the 1.99.1 repin needs; the
+    # previous pin (2026-08-24) predates the 1.99.1 release.
     rust-overlay = {
-      url = "github:oxalica/rust-overlay/ab450d47a3f906d19de1b332915bfc6e5b29c853";
+      url = "github:oxalica/rust-overlay/5aa410a1df0e4e9c25f3818320651c2bddf66aff";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -61,7 +61,7 @@
 
       # Exact stable release, matching rust-toolchain.toml. Bumping this is a
       # reviewed change to the lock and the digest together, never a drift.
-      rustToolchain = pkgs.rust-bin.stable."1.97.1".default.override {
+      rustToolchain = pkgs.rust-bin.stable."1.99.1".default.override {
         extensions = [ "rust-src" "rustfmt" "clippy" ];
       };
 
