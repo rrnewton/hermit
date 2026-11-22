@@ -25,4 +25,4 @@
 # line, `NAME = "value"`.
 
 HERMIT_VERSION = "0.5.7"
-HERMIT_REVERIE_PIN = "f049a4edc87aa5f9002bbd9ebfd7f405a04d20e3"
+HERMIT_REVERIE_PIN = "0bde85ea0ba8b3bfd3675b1f6820f08d19ad446d"
