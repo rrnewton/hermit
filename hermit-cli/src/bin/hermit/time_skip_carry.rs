@@ -461,7 +461,7 @@ mod tests {
         // A source of a format this Hermit does not read keeps it, so a trial
         // from it states it too and is refused, not lowered into a format
         // this Hermit reads.
-        let newer = detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX + 1;
+        let newer = detcore::preemptions::PREEMPTION_RECORD_ENVELOPE + 1;
         let mut sources = TimeSkipSources::default();
         sources
             .remember(&PreemptionRecord::from_sched_events(events(&[3])).with_format(Some(newer)));

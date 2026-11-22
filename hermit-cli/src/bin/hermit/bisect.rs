@@ -364,7 +364,7 @@ mod tests {
 
         // A schedule of a newer format is refused by name as a policy refusal,
         // with main's `validate_format` message, before its epoch is read.
-        let newer_format = detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX + 1;
+        let newer_format = detcore::preemptions::PREEMPTION_RECORD_ENVELOPE + 1;
         let mut newer = bad.clone();
         newer["rcb_history"]["recording"]["format_version"] = serde_json::json!(newer_format);
         newer["rcb_history"]["recording"]["epoch"] = serde_json::json!("2001-02-03T04:05:06Z");

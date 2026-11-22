@@ -29777,16 +29777,17 @@ mod record_format_installer_tests {
     /// The record each case installs for a priority replay.
     fn record(case: &str) -> String {
         let newest = crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
+        let unread = crate::preemptions::PREEMPTION_RECORD_ENVELOPE + 1;
         match case {
             "newer" => format!(
                 r#"{{"per_thread":{{}},"global":[],"format_version":{}}}"#,
-                newest + 1
+                unread
             ),
             "zero" => r#"{"per_thread":{},"global":[],"format_version":0}"#.to_owned(),
             "explicit1" => r#"{"per_thread":{},"global":[],"format_version":1}"#.to_owned(),
             "marked" => format!(
                 r#"{{"incomplete_preemption_record":{{"version":1,"replay_departed_at":7,"record":{{"per_thread":{{}},"global":[],"format_version":{}}}}}}}"#,
-                newest + 1
+                unread
             ),
             "malformed" => "{not json".to_owned(),
             "current" => crate::preemptions::PreemptionWriter::new(None)
@@ -29819,12 +29820,12 @@ mod record_format_installer_tests {
             let _state = GlobalState::for_tests(&config);
             return;
         }
-        let newest = crate::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
+        let unread = crate::preemptions::PREEMPTION_RECORD_ENVELOPE + 1;
         for (case, refused) in [
-            ("newer", Some(Some(newest + 1))),
+            ("newer", Some(Some(unread))),
             ("zero", Some(Some(0))),
             ("explicit1", Some(Some(1))),
-            ("marked", Some(Some(newest + 1))),
+            ("marked", Some(Some(unread))),
             ("malformed", None),
             ("current", None),
         ] {

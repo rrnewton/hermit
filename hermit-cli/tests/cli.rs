@@ -78152,9 +78152,9 @@ fn namespace_record_format_refusals_are_policy_before_guest_startup() {
     assert_eq!(fs::read(&marker).unwrap(), b"started");
     fs::remove_file(&marker).unwrap();
 
-    // The first format past the newest this Hermit reads.
+    // The first number this Hermit does not read (8 is the envelope's).
     let newest = detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
-    let future = newest + 1;
+    let future = detcore::preemptions::PREEMPTION_RECORD_ENVELOPE + 1;
     for (name, value, reason) in [
         (
             "future-format.json",

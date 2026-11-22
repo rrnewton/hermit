@@ -544,10 +544,10 @@ mod tests {
         use detcore::preemptions::RecordFormatRefusal;
         use detcore::preemptions::boundary_recording::Recording;
 
-        // The first format past the newest this Hermit reads.
+        // The first number this Hermit does not read (8 is the envelope's).
         let future = format!(
             r#"{{"per_thread":{{}},"global":[],"format_version":{}}}"#,
-            detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX + 1
+            detcore::preemptions::PREEMPTION_RECORD_ENVELOPE + 1
         );
         let records: [&[u8]; 2] = [
             future.as_bytes(),

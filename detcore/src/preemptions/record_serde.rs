@@ -85,10 +85,12 @@ struct RawRecord {
     store_exclusive_failures: HostObservedCount,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     format_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capability_format: Option<u32>,
     #[serde(default, skip_serializing_if = "super::lists_no_time_skips")]
     time_skips: Option<Vec<TimeSkip>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    rejoins: Option<Vec<crate::scheduler::rejoin_log::Rejoin>>,
+    rejoins: Option<Vec<crate::scheduler::rejoin_log::LogEntry>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     background_starts: Vec<BackgroundStart>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -154,10 +156,12 @@ struct InfoRecord {
     store_exclusive_failures: HostObservedCount,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     format_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capability_format: Option<u32>,
     #[serde(default, skip_serializing_if = "super::lists_no_time_skips")]
     time_skips: Option<Vec<TimeSkip>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    rejoins: Option<Vec<crate::scheduler::rejoin_log::Rejoin>>,
+    rejoins: Option<Vec<crate::scheduler::rejoin_log::LogEntry>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     background_starts: Vec<BackgroundStart>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -751,12 +755,15 @@ mod tests {
         let old =
             r#"{"per_thread":{},"global":[],"rejoins":[{"turn":4,"wakes":1,"calls":[[3,2]]}]}"#;
         let record: PreemptionRecord = serde_json::from_str(old).unwrap();
-        let expected = vec![crate::scheduler::rejoin_log::Rejoin {
+        use crate::scheduler::rejoin_log::LogEntry;
+        use crate::scheduler::rejoin_log::Rejoin;
+        let rejoin = Rejoin {
             turn: 4,
             wakes: 1,
             calls: vec![(DetTid::from_raw(3), 2)],
             popped: None,
-        }];
+        };
+        let expected = vec![LogEntry::Rejoin(rejoin.clone())];
         assert_eq!(record.rejoins.as_ref(), Some(&expected));
         let mut whole = PreemptionRecord::from_sched_events(Vec::new());
         whole.rejoins = Some(expected.clone());
@@ -775,7 +782,7 @@ mod tests {
         use crate::scheduler::rejoin_log::TimedEventId;
         let mut named = record;
         named.rejoins = Some(vec![
-            crate::scheduler::rejoin_log::Rejoin {
+            LogEntry::Rejoin(Rejoin {
                 popped: Some(vec![
                     PoppedEvent {
                         event: TimedEventId::Thread(DetTid::from_raw(5)),
@@ -786,17 +793,14 @@ mod tests {
                         deadline: crate::types::LogicalTime::from_nanos(2_500),
                     },
                 ]),
-                ..expected[0].clone()
-            },
-            crate::scheduler::rejoin_log::Rejoin {
+                ..rejoin.clone()
+            }),
+            LogEntry::Rejoin(Rejoin {
                 turn: 5,
                 popped: Some(Vec::new()),
-                ..expected[0].clone()
-            },
-            crate::scheduler::rejoin_log::Rejoin {
-                turn: 6,
-                ..expected[0].clone()
-            },
+                ..rejoin.clone()
+            }),
+            LogEntry::Rejoin(Rejoin { turn: 6, ..rejoin }),
         ]);
         for marker in [None, Some(7)] {
             let mut copy = named.clone();
@@ -1047,6 +1051,7 @@ mod tests {
             queued_sleeps_registered_at_first_pass: _,
             store_exclusive_failures: _,
             format_version: _,
+            capability_format: _,
             time_skips: _,
             rejoins: _,
             background_starts: _,

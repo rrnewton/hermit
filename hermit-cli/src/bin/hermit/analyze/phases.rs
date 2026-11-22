@@ -9015,8 +9015,7 @@ mod tests {
         // is read from the record: here its epoch, which the run arguments'
         // --epoch would contradict.
         let newer = edited("newer", &|json| {
-            json["format_version"] =
-                (detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX + 1).into();
+            json["format_version"] = (detcore::preemptions::PREEMPTION_RECORD_ENVELOPE + 1).into();
             json["epoch"] = "2001-02-03T04:05:06Z".into();
         });
         // Recorded under --chaos-per-thread-slowdown: its rows hold slowdown
@@ -9030,7 +9029,7 @@ mod tests {
         // Main's `validate_format` message names the newer format.
         let newer_refusal = format!(
             "record format Some({}) with 0 time skips",
-            detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX + 1
+            detcore::preemptions::PREEMPTION_RECORD_ENVELOPE + 1
         );
         for (run1, run2, flags, run_args, expected) in [
             (

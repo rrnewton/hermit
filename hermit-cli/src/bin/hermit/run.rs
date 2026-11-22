@@ -7668,7 +7668,10 @@ fn replay_of_instruction_offsets_is_refused_where_unsupported() {
         path
     };
     let newest = detcore::preemptions::PREEMPTION_RECORD_FORMAT_MAX;
-    for format in [newest + 1, newest + 3] {
+    for format in [
+        detcore::preemptions::PREEMPTION_RECORD_ENVELOPE + 1,
+        newest + 3,
+    ] {
         let legacy = dir.path().join(format!("legacy-{format}.json"));
         {
             let mut json: serde_json::Value =
