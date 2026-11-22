@@ -20,11 +20,13 @@ pub(crate) use files::status_published_sigblk;
 pub(crate) mod guest_siginfo;
 pub mod helpers;
 
+pub(crate) use files::NameRemovals;
 pub(crate) use files::SyscallCwd;
 pub(crate) use files::descriptor_directory::SendInspection;
 /// Re-exported so `procfs` can report the SAME ceiling that `F_SETPIPE_SZ`
 /// enforces. Two values that must agree are one value.
 pub(crate) use files::deterministic_pipe_capacity_bytes;
+pub(crate) use files::entry_mtime::changes_entries;
 pub(crate) use files::may_name_file_or_descriptor;
 pub(crate) use files::procfs_levels::take_proc_device;
 pub(crate) use files::read_guest_exact;
