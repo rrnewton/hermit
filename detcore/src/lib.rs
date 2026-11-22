@@ -1357,6 +1357,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         )
     }
 
+    /// The CPUs the machine Detcore presents has in sysfs
+    /// (`procfs::SysfsCpus`): `--virtual-cpus` of them, and none with a
+    /// `cache` directory where the guest's CPUID instruction is answered from
+    /// a virtual table, whose leaf 4 lists no cache
+    /// (`InterceptedCpuid::cache_leaves`), as Linux builds no such directory
+    /// for that CPU (https://github.com/facebookexperimental/hermit/issues/438).
+    /// Where the instruction is answered from the host's CPUID (the
+    /// host-no-rdrand profile) or reaches the host (`--no-virtualize-cpuid`, a
+    /// backend without CPUID interception), the host's directories stay.
+    pub(crate) fn sysfs_cpus<G: Guest<Self>>(&self, guest: &G) -> procfs::SysfsCpus {
+        let virtual_table = self.rendered_files(guest).cpuinfo
+            && self.cfg.cpu_profile != detcore_model::cpu_profile::CpuProfile::HostNoRdrand;
+        procfs::SysfsCpus {
+            count: self.cfg.virtual_cpu_count(),
+            caches: !(virtual_table && self.virtual_cpuid().cache_leaves() == 0),
+        }
+    }
+
     /// Linux's `commit_creds` clears the caller's parent-death signal when a
     /// credential change moves its effective or filesystem user or group id,
     /// or grows its permitted capabilities (`commit_creds::clears_parent_death`,
@@ -7551,11 +7569,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // The inodes whose last name this call removes, stat'ed before it runs
             // and retired once it succeeds, so that a host reusing one cannot hand
             // a new file the old file's number
-            // (https://github.com/rrnewton/hermit/issues/3840).
-            let removed_inodes = if may_name_files {
+            // (https://github.com/rrnewton/hermit/issues/3840). For a rename the
+            // same lookups tell whether it can change any name (`entry_mtime`).
+            let crate::syscalls::NameRemovals {
+                retired: removed_inodes,
+                rename_target,
+            } = if may_name_files {
                 self.last_names_removed_by(guest, &call).await
             } else {
-                Vec::new()
+                crate::syscalls::NameRemovals::default()
             };
             // The guest-made FIFOs whose name this call removes, forgotten once it
             // succeeds (https://github.com/rrnewton/hermit/issues/2203).
@@ -9011,6 +9033,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
             if res.is_ok() && !removed_inodes.is_empty() {
                 self.retire_removed_inodes(guest, removed_inodes).await;
+            }
+            // A call that created, removed or renamed a name moves its
+            // directory's virtual mtime, and gives a new object its creation
+            // time, in this turn (`entry_mtime`; an open does so in
+            // `handle_openat`). Not boxed here: it returns at once where the
+            // model is off, and boxes its own lookups where it is on, so that
+            // no other call's future carries them
+            // (`hot_path_futures_stay_small`).
+            if matches!(res, Ok(ret) if ret >= 0) && crate::syscalls::changes_entries(call.number())
+            {
+                self.touch_entries_changed_by(guest, &call, rename_target)
+                    .await;
             }
             if res.is_ok() {
                 for fifo in removed_guest_fifos {
