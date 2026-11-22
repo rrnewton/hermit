@@ -11,7 +11,7 @@ remain ignored because they can be regenerated.
 - Git, and enough network access to reach `github.com`, `index.crates.io`,
   `static.rust-lang.org`, and the Buck2 GitHub release assets.
 - `rustup`. The build compiler is pinned by `rust-toolchain.toml`
-  (`1.97.1`, rustc 1.97.1 `8bab26f4f`); rustup installs it
+  (`1.99.1`, rustc 1.99.1 `58cf8f9c3`); rustup installs it
   on first use. `components = ["clippy", "rustfmt"]` is part of that pin
   because rustup does not add them to a freshly installed pinned toolchain
   otherwise.
@@ -784,7 +784,7 @@ The wrappers use immutable versions rather than live branch tips:
 - Reindeer `e3d72748131d3a70378055f091e0647c1edad85e`, with the local patches in
   `bootstrap/patches/reindeer` (below)
 - Reindeer's own Rust toolchain `nightly-2026-05-22`
-- The build compiler, `1.97.1` in `rust-toolchain.toml`
+- The build compiler, `1.99.1` in `rust-toolchain.toml`
 
 The compiler pin matters as much as the others. The shim uses
 `system_rust_toolchain`, which runs whatever `rustc` is on `PATH`; under rustup

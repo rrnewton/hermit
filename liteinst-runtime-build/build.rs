@@ -113,12 +113,42 @@ fn main() {
         "HERMIT_LITEINST_REVERIE_PIN must be a full lowercase 40-hex revision"
     );
     let evidence = constructor_evidence_directory(&out_dir);
+    // Cost is judged by CPU, not wall: on a loaded host these producers
+    // were refused by a 60 s wall deadline after a fraction of a second
+    // of child-command CPU. Completed aggregate observations on
+    // devbig014 (2026-11-22, normal load mix, child plus producer-process
+    // CPU): release cold 19.36 and 17.84 CPU-s, release warm 16.37 and
+    // 14.88 CPU-s. The budget is ceil(1.5 x 19.36) = 30 CPU-s with a
+    // 240 s wall backstop at 8x. Dev-profile attempts did not complete
+    // (the provisional budget tripped at 20.03 CPU-s), so no dev
+    // observation is counted.
+    let producer_cpu = match qualifier::ProducerCpuBudget::new(Duration::from_secs(30)) {
+        Ok(budget) => Some(budget),
+        Err(error) => {
+            eprintln!(
+                "producer CPU accounting unavailable ({error}); \
+                 running under the 240 s wall backstop only"
+            );
+            None
+        }
+    };
     let mut source_runner = qualifier::Runner::new(
         evidence.join("source-logs"),
-        Duration::from_secs(60),
+        Duration::from_secs(240),
         64 * 1024 * 1024,
     )
     .expect("failed to create bounded compiled-source runner");
+    if let Some(budget) = &producer_cpu {
+        if let qualifier::TotalCpuBound::WallBackstopOnly(reason) = source_runner
+            .bound_shared_total_cpu_or_wall_backstop(budget.clone())
+            .expect("failed to bound compiled-source runner CPU")
+        {
+            eprintln!(
+                "producer CPU accounting unavailable ({reason}); \
+                 running under the 240 s wall backstop only"
+            );
+        }
+    }
     let path_sourced = artifact::reverie_is_path_sourced(
         &fs::read_to_string(&source_manifest).expect("failed to read the nested manifest"),
     )
@@ -327,10 +357,21 @@ fn main() {
         .expect("failed to retain runtime Cargo diagnostics");
     let mut runner = qualifier::Runner::new(
         evidence.join("logs"),
-        Duration::from_secs(60),
+        Duration::from_secs(240),
         64 * 1024 * 1024,
     )
     .expect("failed to create bounded constructor proof runner");
+    if let Some(budget) = &producer_cpu {
+        if let qualifier::TotalCpuBound::WallBackstopOnly(reason) = runner
+            .bound_shared_total_cpu_or_wall_backstop(budget.clone())
+            .expect("failed to bound constructor proof runner CPU")
+        {
+            eprintln!(
+                "producer CPU accounting unavailable ({reason}); \
+                 running under the 240 s wall backstop only"
+            );
+        }
+    }
     compiled_sources
         .verify_unchanged(&mut runner)
         .expect("compiled sources changed during the runtime build");
