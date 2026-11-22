@@ -89,6 +89,7 @@ use crate::types::*;
 pub(crate) mod descriptor_directory;
 #[cfg(test)]
 mod determinize_stat_tests;
+pub(crate) mod entry_mtime;
 pub(crate) mod flock_model;
 pub(crate) mod other_process_procfs;
 #[cfg(test)]
@@ -2063,6 +2064,18 @@ pub(crate) fn removes_a_name(sysno: Sysno) -> bool {
         Sysno::unlinkat | Sysno::renameat | Sysno::renameat2 => true,
         _ => false,
     }
+}
+
+/// What [`Detcore::last_names_removed_by`] found before a call ran.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct NameRemovals {
+    /// The host inodes whose last name the call removes, for
+    /// [`Detcore::retire_removed_inodes`] once it succeeds.
+    pub(crate) retired: Vec<RawInode>,
+    /// For a rename other than an exchange, what the lookups saw of its
+    /// target (see [`entry_mtime::RenameTarget`]); `None` for every other
+    /// call and where they cannot tell.
+    pub(crate) rename_target: Option<entry_mtime::RenameTarget>,
 }
 
 /// Whether a call numbered `sysno` can be acted on by any of the file and
@@ -5683,9 +5696,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// it is a directory or a file with one link (see [`retires_on_removal`]).
     /// Each name is stat'ed with an injected `fstatat(AT_SYMLINK_NOFOLLOW)`
     /// before the call runs; a name that does not resolve removes nothing.
-    /// Pass the result to [`Self::retire_removed_inodes`] if the call
-    /// succeeds. Only with virtualized metadata, the only mode that numbers
-    /// inodes.
+    /// Pass the `retired` inodes to [`Self::retire_removed_inodes`] if the
+    /// call succeeds. For a rename the same lookups also tell whether it can
+    /// change any name (`rename_target`, which the entry-mtime model reads
+    /// instead of looking the old name up again after the call). Only with
+    /// virtualized metadata, the only mode that numbers inodes.
     ///
     /// Nothing is retired without sequentialized threads. Only then do the
     /// lookups, the call and the retirement run in one turn; otherwise another
@@ -5697,36 +5712,58 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: &Syscall,
-    ) -> Vec<RawInode> {
+    ) -> NameRemovals {
         if !guest.config().virtualize_metadata || !guest.config().sequentialize_threads {
-            return Vec::new();
+            return NameRemovals::default();
         }
         // The name removed, and for a rename the source, which replaces
         // nothing when it is the target's own file (`rename(a, a)`, or two
         // links of one file).
         let Some((removed, source)) = removed_names(call, true) else {
-            return Vec::new();
+            return NameRemovals::default();
         };
         // Every path the call reads, which the lookups must leave unchanged.
         let inputs = [removed.1, source.and_then(|source| source.1)];
         let Some(path) = removed.1 else {
-            return Vec::new();
+            return NameRemovals::default();
         };
-        let Ok(stat) = Self::inject_lstatat(guest, removed.0, path, inputs).await else {
-            return Vec::new();
+        let stat = match Self::inject_lstatat(guest, removed.0, path, inputs).await {
+            Ok(stat) => stat,
+            Err(errno) => {
+                return NameRemovals {
+                    retired: Vec::new(),
+                    rename_target: source
+                        .and_then(|_| entry_mtime::RenameTarget::from_lookups(Err(errno), None)),
+                };
+            }
         };
         let inode = RawInode::new(stat.st_dev, stat.st_ino);
-        if let Some((dirfd, Some(path))) = source
-            && Self::inject_lstatat(guest, dirfd, path, inputs)
-                .await
-                .is_ok_and(|source| RawInode::new(source.st_dev, source.st_ino) == inode)
-        {
-            return Vec::new();
+        let mut rename_target = None;
+        if let Some((dirfd, source_path)) = source {
+            let looked_up = match source_path {
+                Some(path) => Some(
+                    Self::inject_lstatat(guest, dirfd, path, inputs)
+                        .await
+                        .map(|source| RawInode::new(source.st_dev, source.st_ino)),
+                ),
+                None => None,
+            };
+            rename_target = entry_mtime::RenameTarget::from_lookups(Ok(inode), looked_up);
+            if rename_target == Some(entry_mtime::RenameTarget::SameFile) {
+                return NameRemovals {
+                    retired: Vec::new(),
+                    rename_target,
+                };
+            }
         }
-        if retires_on_removal(&stat) {
+        let retired = if retires_on_removal(&stat) {
             vec![inode]
         } else {
             Vec::new()
+        };
+        NameRemovals {
+            retired,
+            rename_target,
         }
     }
 
@@ -6841,6 +6878,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut property_copy: Option<PathBuf> = None;
         // A name in the property area the snapshot does not hold.
         let mut property_unknown: Option<String> = None;
+        // Whether the open creates its file, decided in its own turn, after
+        // its grant and just before it runs, so that its directory's mtime and
+        // the new file's follow it (`entry_mtime`). Not boxed here: the model
+        // and the flags decide most opens at once, and it boxes the lookup an
+        // `O_CREAT` open without `O_EXCL` needs.
+        let creates = self.open_creates(guest, call).await;
         let res: Result<i64, Error> = match fifo {
             Some((fifo, fifo_path)) => {
                 self.open_fifo_once_a_guest_holds_its_peer(guest, call, fifo, &fifo_path)
@@ -7156,7 +7199,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let sysfs_object = self.opened_sysfs_object(guest, fd, identity.as_ref());
                 if let Some(object) = sysfs_object
                     .as_deref()
-                    .filter(|object| self.is_absent_sysfs_object(object))
+                    .filter(|object| self.is_absent_sysfs_object(guest, object))
                 {
                     guest.thread_state().remove_fd(fd);
                     let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
@@ -7295,6 +7338,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                         RawInode::new(stat.st_dev, stat.st_ino),
                         procfs.name(stat.st_dev),
                     )
+                    .await;
+                }
+                // The file this open created, and for a named one its
+                // directory, take the virtual now as their mtime, once any
+                // retired mapping of its inode is gone (`entry_mtime`).
+                if let (Some(creates), Some(stat)) = (creates, &host_stat) {
+                    Box::pin(self.touch_created_by_open(
+                        guest,
+                        call,
+                        creates,
+                        RawInode::new(stat.st_dev, stat.st_ino),
+                    ))
                     .await;
                 }
                 // A descriptor that writes process memory can rewrite the
@@ -20168,7 +20223,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         if let Some(directory) = directory {
             let level = self.cfg.proc_level;
-            let cpus = self.cfg.virtual_cpu_count();
+            let cpus = self.sysfs_cpus(guest);
             // A user bind over a sysfs path keeps its own names. Ask the
             // opened descriptor, not its path in the tool's mount namespace.
             let has_absent_cpu = entries
