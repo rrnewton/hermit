@@ -5,10 +5,10 @@
 # that resolves through this file, so a floating `nightly` gives a cold reviewer
 # a different compiler on a different day and leaves every other bootstrap pin
 # (Buck2 release, Reindeer revision) without effect. This pin is the exact
-# stable toolchain, rustc 1.97.1 (8bab26f4f 2026-07-14); Buck2 validation
+# stable toolchain, rustc 1.99.1 (58cf8f9c3 2026-10-13); Buck2 validation
 # records are refreshed under it by the validation DAG. See
 # docs/BUCK2_OSS.md.
-channel = "1.97.1" # @oss-only
+channel = "1.99.1" # @oss-only
 # A version pin installs that exact toolchain; rustup only adds clippy and
 # rustfmt for it when they are requested here.
 components = ["clippy", "rustfmt"] # @oss-only

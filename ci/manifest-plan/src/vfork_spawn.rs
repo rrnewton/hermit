@@ -1099,7 +1099,7 @@ fn injected_wait_failure(
         return None;
     }
     remaining
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
             left.checked_sub(1)
         })
         .ok()
