@@ -23008,21 +23008,17 @@ impl Scheduler {
     }
 
     /// Record the actual birth policy separately from raw replay's dispatch
-    /// priority. `vfork_child` comes from CreateVforkChildThread's authenticated
-    /// registration path, not a speculative priority-map key or replay row.
-    /// Other policies retain their existing writer behavior.
+    /// priority: a run without a replayed schedule gives every thread, a vfork
+    /// child included, `DEFAULT_PRIORITY` at birth (`create_child_thread`,
+    /// `create_vfork_child_thread`). Other policies retain their existing
+    /// writer behavior.
     pub(crate) fn register_preemption_thread(
         &mut self,
         dettid: DetTid,
         starting_priority: Priority,
-        vfork_child: bool,
     ) {
         let logical_priority = if self.record_logical_replay_priorities {
-            if vfork_child {
-                DEFAULT_PRIORITY - 1
-            } else {
-                DEFAULT_PRIORITY
-            }
+            DEFAULT_PRIORITY
         } else {
             starting_priority
         };
@@ -29981,7 +29977,7 @@ mod test {
                     ] {
                         register_known_thread(&mut sched, tid);
                         sched.priorities.insert(tid, priority);
-                        sched.register_preemption_thread(tid, priority, false);
+                        sched.register_preemption_thread(tid, priority);
                         sched.runqueue_push_back(tid);
                     }
                     let exit = ResourceID::Exit {
@@ -30103,7 +30099,7 @@ mod test {
                 Scheduler::records_logical_replay_priorities(&cfg);
             sched.preemption_writer = Some(PreemptionWriter::new(None));
             let tid = DetTid::from_raw(3);
-            sched.register_preemption_thread(tid, REPLAY_DEFERRED_PRIORITY, false);
+            sched.register_preemption_thread(tid, REPLAY_DEFERRED_PRIORITY);
             assert_eq!(
                 sched
                     .preemption_writer
@@ -30128,14 +30124,14 @@ mod test {
         sched.thread_tree.add_child(root, root, true);
         sched.thread_tree.add_child(root, child, false);
         sched.thread_tree.add_child(root, vfork, true);
-        for (tid, control, is_vfork) in [
-            (root, REPLAY_FOREGROUND_PRIORITY, false),
-            (child, REPLAY_DEFERRED_PRIORITY, false),
-            (vfork, REPLAY_DEFERRED_PRIORITY, true),
+        for (tid, control) in [
+            (root, REPLAY_FOREGROUND_PRIORITY),
+            (child, REPLAY_DEFERRED_PRIORITY),
+            (vfork, REPLAY_DEFERRED_PRIORITY),
         ] {
             register_known_thread(&mut sched, tid);
             sched.priorities.insert(tid, control);
-            sched.register_preemption_thread(tid, control, is_vfork);
+            sched.register_preemption_thread(tid, control);
         }
         sched.readmit_ready_thread(vfork);
         sched.logically_kill_thread(&child, &root, MmId::initial(root));
@@ -30154,14 +30150,27 @@ mod test {
                 .current_priority(root),
             DEFAULT_PRIORITY
         );
+        // A vfork child is born at the default priority like any other thread
+        // (`create_vfork_child_thread`), so its logical row is the default
+        // too, not its deferred dispatch band.
         assert_eq!(
             sched
                 .preemption_writer
                 .as_ref()
                 .unwrap()
                 .current_priority(vfork),
-            DEFAULT_PRIORITY - 1
+            DEFAULT_PRIORITY
         );
+        // The end of the schedule returns the dispatch priorities to the
+        // default as well. Give the vfork child's logical row a marker value
+        // through the writer, so that a change that copied a dispatch priority
+        // into the record at the end of the schedule would show.
+        let vfork_logical = DEFAULT_PRIORITY - 1;
+        sched
+            .preemption_writer
+            .as_mut()
+            .unwrap()
+            .set_current(vfork, vfork_logical);
         let _ = sched.consume_schedevent(&last);
         assert!(sched.replay_priorities_released);
         assert_eq!(sched.priorities[&root], DEFAULT_PRIORITY);
@@ -30170,10 +30179,10 @@ mod test {
             Some(DEFAULT_PRIORITY)
         );
         assert_eq!((sched.turn, sched.committed_time), before);
-        for (tid, is_vfork) in [(DetTid::from_raw(9), false), (DetTid::from_raw(11), true)] {
+        for tid in [DetTid::from_raw(9), DetTid::from_raw(11)] {
             register_known_thread(&mut sched, tid);
             assert!(!sched.replay_registration_priority(tid, REPLAY_DEFERRED_PRIORITY));
-            sched.register_preemption_thread(tid, REPLAY_DEFERRED_PRIORITY, is_vfork);
+            sched.register_preemption_thread(tid, REPLAY_DEFERRED_PRIORITY);
             assert_eq!(sched.priorities[&tid], DEFAULT_PRIORITY);
         }
         let queue = sched.run_queue.tids().copied().collect::<Vec<_>>();
@@ -30183,11 +30192,11 @@ mod test {
         let exported: serde_json::Value =
             serde_json::from_str(&sched.preemption_writer.take().unwrap().into_string()).unwrap();
         for (tid, priority) in [
-            ("3", 1000),
-            ("5", 1000),
-            ("7", 999),
-            ("9", 1000),
-            ("11", 999),
+            ("3", DEFAULT_PRIORITY),
+            ("5", DEFAULT_PRIORITY),
+            ("7", vfork_logical),
+            ("9", DEFAULT_PRIORITY),
+            ("11", DEFAULT_PRIORITY),
         ] {
             assert_eq!(exported["per_thread"][tid]["final_prio"], priority);
             assert_eq!(
@@ -30210,7 +30219,7 @@ mod test {
         let mut sched = plain_replay_with_writer(vec![first.clone(), skipped, last.clone()]);
         register_known_thread(&mut sched, tid);
         sched.priorities.insert(tid, REPLAY_FOREGROUND_PRIORITY);
-        sched.register_preemption_thread(tid, REPLAY_FOREGROUND_PRIORITY, false);
+        sched.register_preemption_thread(tid, REPLAY_FOREGROUND_PRIORITY);
         let _ = sched.consume_schedevent(&first);
         assert_eq!(sched.priorities[&future], REPLAY_FOREGROUND_PRIORITY);
         assert!(!sched.next_turns.contains_key(&future));
@@ -30235,16 +30244,26 @@ mod test {
             let mut sched = plain_replay_with_writer(vec![]);
             let (detpid, mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
             sched.requeue_with_new_priority(caller, control);
-            sched.register_preemption_thread(leader, REPLAY_FOREGROUND_PRIORITY, false);
-            sched.register_preemption_thread(caller, REPLAY_DEFERRED_PRIORITY, true);
+            sched.register_preemption_thread(leader, REPLAY_FOREGROUND_PRIORITY);
+            sched.register_preemption_thread(caller, REPLAY_DEFERRED_PRIORITY);
+            // Every thread is born at the default logical priority, so give the
+            // caller a logical priority of its own, as a recorded change would
+            // (`Scheduler::perform_priority_changepoint`), to tell its row apart from
+            // the leader's and from both dispatch bands.
+            let caller_logical = DEFAULT_PRIORITY - 1;
+            sched
+                .preemption_writer
+                .as_mut()
+                .unwrap()
+                .set_current(caller, caller_logical);
             let before = (sched.turn, sched.committed_time);
             reconnect_nonleader_exec(&mut sched, leader, caller, detpid, mm);
             assert_eq!(sched.priorities[&leader], control);
             assert!(!sched.next_turns.contains_key(&caller));
             assert_eq!((sched.turn, sched.committed_time), before);
             let writer = sched.preemption_writer.as_ref().unwrap();
-            assert_eq!(writer.current_priority(leader), DEFAULT_PRIORITY - 1);
-            assert_eq!(writer.current_priority(caller), DEFAULT_PRIORITY - 1);
+            assert_eq!(writer.current_priority(leader), caller_logical);
+            assert_eq!(writer.current_priority(caller), caller_logical);
         }
     }
 
@@ -30255,7 +30274,7 @@ mod test {
         let caller = DetTid::from_raw(18);
         let mut sched = plain_replay_with_writer(vec![]);
         let (detpid, mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
-        sched.register_preemption_thread(leader, REPLAY_FOREGROUND_PRIORITY, false);
+        sched.register_preemption_thread(leader, REPLAY_FOREGROUND_PRIORITY);
         reconnect_nonleader_exec(&mut sched, leader, caller, detpid, mm);
     }
 
@@ -30266,7 +30285,7 @@ mod test {
         let caller = DetTid::from_raw(18);
         let mut sched = plain_replay_with_writer(vec![]);
         let (detpid, mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
-        sched.register_preemption_thread(caller, REPLAY_DEFERRED_PRIORITY, true);
+        sched.register_preemption_thread(caller, REPLAY_DEFERRED_PRIORITY);
         reconnect_nonleader_exec(&mut sched, leader, caller, detpid, mm);
     }
 

@@ -13373,7 +13373,7 @@ fn a_recording_from_before_rendered_io_and_arch_status_is_refused_by_version() {
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
     assert_eq!(
-        metadata["version"], 0x1a1,
+        metadata["version"], 0x1a2,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x197);
@@ -35612,20 +35612,44 @@ fn happens_before_cycle_through_a_child_wait_is_refused_by_name() {
     }
 }
 
+/// The turn of the first `COMMIT` line in `log` by a thread whose dettid
+/// `tid` accepts, with every string of `resources` in its resource set.
+fn first_commit_turn(log: &str, tid: impl Fn(&str) -> bool, resources: &[&str]) -> Option<u64> {
+    log.lines().find_map(|line| {
+        let rest = line.split(" COMMIT turn ").nth(1)?;
+        let (turn, rest) = rest.split_once(", dettid ")?;
+        let (dettid, rest) = rest.split_once(" using resources ")?;
+        if tid(dettid) && resources.iter().all(|resource| rest.contains(resource)) {
+            turn.parse().ok()
+        } else {
+            None
+        }
+    })
+}
+
 /// A BEFORE anchor at the posthook orders the BEFORE syscall's completed
 /// effect (https://github.com/rrnewton/hermit/issues/3929). The parent
-/// posix_spawns `/bin/echo child`, then writes `parent`; an edge orders the
+/// posix_spawns `/bin/echo child`, sleeps so that the echo reaches its write
+/// first and is held there, then writes `parent`; an edge orders the
 /// parent's write before the child's. Fired at the prehook, the edge only
-/// orders the parent *reaching* its write: the held child is re-admitted
-/// before the parent's write commits, so stdout is `child` then `parent`.
-/// Fired at the posthook, the child is held until the parent's write has
-/// completed, so stdout is `parent` then `child`.
+/// orders the parent *reaching* its write: the anchor fires at the checkpoint
+/// before the parent's write commits, and the held child is re-admitted
+/// there. Fired at the posthook, the anchor fires at a checkpoint after the
+/// parent's write has completed. Either way the child's write commits after
+/// the anchor, and the commit order shows which phase fired.
+///
+/// stdout is `parent` then `child` in both cases. At the prehook that order
+/// is the scheduler's choice, not the edge's: once the child is re-admitted,
+/// the two writes come from independent processes, and Linux allows either
+/// order. Until RECORD_VERSION 0x1a2 a vfork child kept a priority ahead of
+/// every other thread after its exec, so the re-admitted echo wrote first;
+/// at equal priority the parent's write, already requested, commits first.
 #[test]
 fn happens_before_posthook_before_anchor_orders_the_completed_write() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let guest = hb_spawn_echo_guest().to_str().unwrap().to_owned();
     for (name, phase, expected) in [
-        ("prehook.json", "prehook", "child\nparent\n"),
+        ("prehook.json", "prehook", "parent\nchild\n"),
         ("posthook.json", "posthook", "parent\nchild\n"),
     ] {
         let spec = directory.path().join(name);
@@ -35659,6 +35683,34 @@ fn happens_before_posthook_before_anchor_orders_the_completed_write() {
             log.contains("held at happens-before anchor(s) [\"child_writes\"]"),
             "{name}: the child was never held at its gate"
         );
+        let turn = |tid: &dyn Fn(&str) -> bool, resources: &[&str]| {
+            first_commit_turn(&log, tid, resources)
+                .unwrap_or_else(|| panic!("{name}: no commit of {resources:?}:\n{log}"))
+        };
+        let parent = |dettid: &str| dettid == "3";
+        let child = |dettid: &str| dettid != "3";
+        let anchor = turn(
+            &parent,
+            &["HappensBeforeSyscallCheckpoint", "\"parent_writes\""],
+        );
+        let parent_write = turn(&parent, &["Device(ContainerStdout): W"]);
+        let child_write = turn(&child, &["Device(ContainerStdout): W"]);
+        assert!(
+            anchor < child_write,
+            "{name}: the child wrote at turn {child_write}, before the anchor at turn {anchor}"
+        );
+        match phase {
+            "prehook" => assert!(
+                anchor < parent_write,
+                "{name}: the anchor fired at turn {anchor}, not before the parent's write at \
+                 turn {parent_write}"
+            ),
+            _ => assert!(
+                parent_write < anchor,
+                "{name}: the anchor fired at turn {anchor}, not after the parent's write at \
+                 turn {parent_write}"
+            ),
+        }
     }
 }
 
@@ -35851,6 +35903,10 @@ fn happens_before_posthook_after_anchor_holds_the_thread_after_its_call() {
 /// The posix_spawn echo case with the posthook edge passes at L2 on ptrace:
 /// `--verify --verify-strict` gives a canonical matched report with nonzero
 /// INFO counts on both sides (https://github.com/rrnewton/hermit/issues/3929).
+/// The edge must actually hold the echo: the golden log `--keep-logs` keeps
+/// names the hold, and the second run's log compared equal to it. A run in
+/// which the parent wrote before the echo reached its gate verifies nothing
+/// about the edge, so it fails here.
 #[test]
 fn happens_before_posthook_edge_passes_strict_verify() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -35867,6 +35923,7 @@ fn happens_before_posthook_edge_passes_strict_verify() {
     )
     .unwrap();
     let report_path = directory.path().join("verify.json");
+    let kept_logs = directory.path().join("verify-logs");
     let args = [
         "--log",
         "info",
@@ -35876,6 +35933,9 @@ fn happens_before_posthook_edge_passes_strict_verify() {
         "--verify-strict",
         "--verify-json",
         report_path.to_str().unwrap(),
+        "--keep-logs",
+        "--verify-log-dir",
+        kept_logs.to_str().unwrap(),
         "--happens-before",
         spec.to_str().unwrap(),
         "--",
@@ -35884,6 +35944,19 @@ fn happens_before_posthook_edge_passes_strict_verify() {
     let output = hermit(&args);
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "parent\nchild\n");
+    let holds: usize = fs::read_dir(&kept_logs)
+        .expect("no kept verification logs")
+        .map(|entry| {
+            fs::read_to_string(entry.unwrap().path())
+                .unwrap()
+                .matches("held at happens-before anchor(s) [\"child_writes\"]")
+                .count()
+        })
+        .sum();
+    assert!(
+        holds >= 1,
+        "the edge never held the echo, so the verified runs exercised nothing of it"
+    );
     let report: serde_json::Value =
         serde_json::from_slice(&fs::read(&report_path).expect("no verify report")).unwrap();
     let left = report["compared_log_messages"]["left"]
@@ -53941,7 +54014,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x1a1, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x1a2, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     // Drop the current recorder's CPU profile fields, so the era check does not fire first.
     if let Some(document) = metadata.as_object_mut() {
@@ -65776,31 +65849,72 @@ fn a_rerun_of_an_era_migrated_manifest_stays_on_the_legacy_table() {
     );
 }
 
-/// A genuine pre-split (0x1a0) recording of a CPUID-dependent guest
-/// replays bit for bit on the legacy table its era migrates to.
-/// The fixture under tests/fixtures/recordings was recorded by a
-/// pre-fix binary (see its README); its guest prints a LEAK line
-/// per leaked bit, so replaying it on the psABI table instead —
-/// which is what removing the load-time migration would do —
-/// changes its output and its exit status, and this test goes red.
-/// The copy whose version is edited to the psABI era must instead
-/// be refused: no digest was ever recorded for it to bind.
+/// Copies a checked-in recording under tests/fixtures/recordings into a
+/// test's data directory.
 #[cfg(target_arch = "x86_64")]
-#[test]
-fn a_genuine_pre_psabi_recording_replays_bit_for_bit() {
-    const ID: &str = "7a1b8833fde348c785270b61161d3a17";
-    fn copy_recording(from: &Path, to: &Path) {
-        fs::create_dir_all(to).unwrap();
-        for entry in fs::read_dir(from).unwrap() {
-            let entry = entry.unwrap();
-            let target = to.join(entry.file_name());
-            if entry.file_type().unwrap().is_dir() {
-                copy_recording(&entry.path(), &target);
-            } else {
-                fs::copy(entry.path(), target).unwrap();
-            }
+fn copy_recording(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_recording(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
         }
     }
+}
+
+/// A genuine recording made at the current RECORD_VERSION replays bit
+/// for bit. The fixture under tests/fixtures/recordings is the same
+/// static leak-reporting CPUID probe as the pre-split fixture, recorded
+/// with the same recipe at 0x1a2 (see its README), on the psABI
+/// x86-64-v2 table it binds by digest. Its guest prints a FIXED line
+/// for each of the seven bits that table hides and exits 1, so a replay
+/// on another table, or one that loses or reorders a recorded event,
+/// changes its output or its exit status. When RECORD_VERSION moves,
+/// replay refuses this recording by its version: re-record it with the
+/// README's recipe in the same change.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_genuine_current_version_recording_replays_bit_for_bit() {
+    const ID: &str = "b1bda700dbf34970882540c342894404";
+    let recordings = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recordings");
+    let expected =
+        fs::read_to_string(recordings.join(format!("{ID}-expected-stdout.txt"))).unwrap();
+    let run = UnpinnedRun::new();
+    copy_recording(&recordings.join(ID), &run.data().join(ID));
+    let (status, stdout, stderr) = run.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
+    assert!(
+        !stderr.contains("Version mismatch"),
+        "RECORD_VERSION moved: re-record this fixture with the recipe in \
+         tests/fixtures/recordings/README.md\n{stderr}"
+    );
+    // The probe exits 1 after its seven FIXED lines; replay reproduces both.
+    // EXIT-CLASS: guest
+    assert_eq!(
+        (status, stdout.as_str()),
+        (Some(1), expected.as_str()),
+        "{stderr}"
+    );
+    assert_eq!(logged_profile(&stderr), Some("x86-64-v2"), "{stderr}");
+}
+
+/// A genuine pre-split (0x1a0) recording of a CPUID-dependent guest
+/// is refused by its version before any guest runs. It replayed bit
+/// for bit on the legacy table while the 0x1a1 replayer kept a
+/// window open for it; 0x1a2 changed the vfork child priority that
+/// every older recording was made under, and closed the window. The
+/// fixture under tests/fixtures/recordings was recorded by a
+/// pre-fix binary (see its README); its guest prints a LEAK line
+/// per leaked bit. Its copies edited to the current version still
+/// exercise the psABI era's digest gate: without a digest one is
+/// refused by name, and with the psABI table's digest one replays
+/// on that table and departs from the recorded output.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_genuine_pre_psabi_recording_is_refused_by_its_version() {
+    const ID: &str = "7a1b8833fde348c785270b61161d3a17";
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/recordings")
         .join(ID);
@@ -65813,25 +65927,22 @@ fn a_genuine_pre_psabi_recording_replays_bit_for_bit() {
     let run = UnpinnedRun::new();
     copy_recording(&fixture, &run.data().join(ID));
     let (status, stdout, stderr) = run.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
-    assert_eq!(
-        (status, stdout.as_str()),
-        (Some(0), expected.as_str()),
-        "{stderr}"
-    );
-    assert_eq!(
-        logged_profile(&stderr),
-        Some("x86-64-v2-legacy"),
-        "{stderr}"
+    assert_ne!(status, Some(0), "{stderr}");
+    assert_eq!(stdout, "", "no guest may run:\n{stderr}");
+    assert!(
+        stderr.contains("Version mismatch, recording version RecordVersion(416)"),
+        "the 0x1a0 recording must be refused by its version:\n{stderr}"
     );
 
-    // The same recording claiming the psABI era carries no table
-    // digest for replay to bind, so it is refused by name.
+    // The same recording claiming the current, psABI-era version
+    // carries no table digest for replay to bind, so it is refused
+    // by name.
     let edited = UnpinnedRun::new();
     copy_recording(&fixture, &edited.data().join(ID));
     let metadata_path = edited.data().join(ID).join("metadata.json");
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    metadata["version"] = 0x1a1.into();
+    metadata["version"] = 0x1a2.into();
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let (status, stdout, stderr) = edited.run(&["--log=debug", "replay", "--autopilot", ID], &[]);
     assert_ne!(status, Some(0), "{stderr}");
@@ -65842,16 +65953,14 @@ fn a_genuine_pre_psabi_recording_replays_bit_for_bit() {
     // the psABI era WITH that table's digest passes the digest gate
     // and replays on the psABI table, where the guest's branches on
     // the seven bits go the other way and the replay departs from
-    // the recorded output instead of reproducing it. This is what
-    // removing the load-time migration would do to the genuine
-    // replay above, so the migration is pinned by output, not only
-    // by the refusal.
+    // the recorded output instead of reproducing it, so the table
+    // the digest binds is pinned by output, not only by the refusal.
     let forced = UnpinnedRun::new();
     copy_recording(&fixture, &forced.data().join(ID));
     let metadata_path = forced.data().join(ID).join("metadata.json");
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    metadata["version"] = 0x1a1.into();
+    metadata["version"] = 0x1a2.into();
     let digest = detcore::virtual_cpuid_digest(&detcore::Config {
         cpu_profile: detcore_model::cpu_profile::CpuProfile::X86_64V2,
         ..Default::default()
@@ -65960,8 +66069,8 @@ fn hermit_cpu_profile_in_the_environment_does_not_lift_a_documents_migration() {
     );
 }
 
-/// The checked-in pre-split recording is exported publicly, so no file
-/// of it may carry the recording host's environment: no
+/// The checked-in recordings are exported publicly, so no file of
+/// them may carry the recording host's environment: no
 /// home-directory paths, host names, or internal tree or domain
 /// names. The fixture was recorded with `--base-env=minimal` from a
 /// neutral scratch directory for exactly this property (see its
@@ -66042,34 +66151,36 @@ fn the_checked_in_pre_psabi_recording_carries_no_host_environment() {
 
     // The recorded guest environment is exactly the synthetic
     // minimal set `--base-env=minimal` presents, key for key:
-    // anything else in `envs` came from a recording host.
-    let metadata: serde_json::Value = serde_json::from_slice(
-        &fs::read(
-            root.join("7a1b8833fde348c785270b61161d3a17")
-                .join("metadata.json"),
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    let env_keys: BTreeSet<&str> = metadata["envs"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(
-        env_keys,
-        BTreeSet::from([
-            "ASAN_OPTIONS",
-            "HOME",
-            "HOSTNAME",
-            "LOGNAME",
-            "LSAN_OPTIONS",
-            "PATH",
-            "USER"
-        ]),
-        "the checked-in recording's guest environment is not the minimal set"
-    );
+    // anything else in `envs` came from a recording host. Both
+    // checked-in recordings, the pre-split one and its re-record at
+    // the current version, were made that way.
+    for id in [
+        "7a1b8833fde348c785270b61161d3a17",
+        "b1bda700dbf34970882540c342894404",
+    ] {
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join(id).join("metadata.json")).unwrap())
+                .unwrap();
+        let env_keys: BTreeSet<&str> = metadata["envs"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            env_keys,
+            BTreeSet::from([
+                "ASAN_OPTIONS",
+                "HOME",
+                "HOSTNAME",
+                "LOGNAME",
+                "LSAN_OPTIONS",
+                "PATH",
+                "USER"
+            ]),
+            "the checked-in recording {id}'s guest environment is not the minimal set"
+        );
+    }
 }
 
 /// Runs `image` with `--cpu-profile auto`, which `what` makes resolve to
@@ -77553,15 +77664,17 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
     // than replaying the producer's priority history. Under PR 4966's
     // `records_logical_replay_priorities` gate (schedule-only replay, no
     // preemptions file, no chaos, heuristic None), the writer records the
-    // logical priority: the default for every thread except a vfork child,
-    // which records one less. This expectation corrects the pre-4966
+    // logical priority: the default for every thread, a vfork child
+    // included, since RECORD_VERSION 0x1a2 (before it, a vfork child
+    // recorded one less). This expectation corrects the pre-4966
     // deferred-dispatch value (9999) for that composition; every other
     // assertion in this test is unchanged. Chosen IDs here are all above
     // the inherited low-ID foreground special case. The fixture creates,
     // in order, main, two pthread threads, a fork child, a vfork child, a
     // raw clone and a clone3 (see tests/c/chosen_guest_ids.c), so with
-    // --pid-base=5000 the vfork child is 5004. Keep every history key and
-    // field exact; priority replay still expects the original.
+    // --pid-base=5000 the vfork child is 5004, and its row is expected to
+    // hold the default like every other. Keep every history key and field
+    // exact; priority replay still expects the original.
     let mut schedule_per_thread = original["per_thread"].clone();
     for (tid, history) in schedule_per_thread.as_object_mut().unwrap() {
         assert!(
@@ -77575,7 +77688,7 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
                 "producer {tid}: {field}"
             );
         }
-        history["final_prio"] = serde_json::json!(if tid == "5004" { 999 } else { 1000 });
+        history["final_prio"] = serde_json::json!(detcore::DEFAULT_PRIORITY);
     }
     // A schedule replay notes no background starts, so its re-record states
     // the format below the background-starts format, with the same timing

@@ -37,17 +37,17 @@ pub enum CpuProfile {
     /// The pre-psABI x86-64-v2 table (a Broadwell-era capture that
     /// also advertises AVX, BMI1, HLE, AVX2, BMI2, RTM and ADX;
     /// facebookexperimental/hermit#124), kept bit-for-bit so stored
-    /// recordings replay against the CPU they recorded with. No
-    /// serialized form written before the split names it: recording
-    /// metadata of that era says `x86-64-v2` (or nothing) and is
-    /// migrated here by recording version at load. Its public name,
-    /// `x86-64-v2-legacy`, is what documents a migrated run writes
-    /// carry, so a rerun presents this table by name; it may also
-    /// be named explicitly to rerun what a pre-split document ran.
-    /// Never recorded (recording refuses it) and never chosen by
+    /// documents rerun against the CPU they ran with. No serialized
+    /// form written before the split names it: recording metadata of
+    /// that era says `x86-64-v2` (or nothing) and is migrated here by
+    /// recording version at load, although replay refuses such a
+    /// recording by its version since recording version 0x1a2. Its
+    /// public name, `x86-64-v2-legacy`, is what documents a migrated
+    /// run writes carry, so a rerun presents this table by name; it
+    /// may also be named explicitly to rerun what a pre-split document
+    /// ran. Never recorded (recording refuses it) and never chosen by
     /// auto: resolution chooses it only for a pre-split document,
-    /// and replay only for a pre-split recording, because that
-    /// document's `x86-64-v2` named this table.
+    /// because that document's `x86-64-v2` named this table.
     #[value(name = "x86-64-v2-legacy")]
     #[serde(rename = "x86-64-v2-legacy", alias = "x86-64-v2-legacy-broadwell")]
     X86_64V2LegacyBroadwell,

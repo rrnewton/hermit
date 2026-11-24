@@ -6136,7 +6136,7 @@ fn shared_mapping_replay_refuses_metadata_retagged_as_0x199() {
     let mut metadata: serde_json::Value =
         serde_json::from_slice(&fs::read(&metadata_path).expect("read metadata"))
             .expect("parse metadata");
-    assert_eq!(metadata["version"], 0x1a1, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x1a2, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x199);
     // Drop the current recorder's CPU profile fields, so the era check does not fire first.
     if let Some(document) = metadata.as_object_mut() {
