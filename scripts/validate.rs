@@ -43,7 +43,7 @@
 //!
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "cd9dd5b954178c2e0c6c0118aab31be6c5cd13a5" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "132dd98d1518973ec7d53b0537e53fdb83b62f20" }
 //! hermit-manifest-plan = { path = "../ci/manifest-plan" }
 //! serde_json = "1"
 //! toml = "0.8.23"
@@ -1032,8 +1032,9 @@ enum Focused {
     },
     /// `--tests node::case[,...]`: run only the named test cases (plus the
     /// upstream steps those nodes need). The map is node tag -> case IDs as
-    /// they appear in per-node results (`<crate>::<binary>$<test name>` for
-    /// nextest producers; see `case_filter_expr`).
+    /// they appear in per-node results (`<package>$<test name>` or
+    /// `<package>::<binary name>$<test name>` for nextest producers; see
+    /// `case_filter_expr`).
     TestCases {
         cases: std::collections::BTreeMap<String, Vec<String>>,
     },
@@ -1118,6 +1119,11 @@ struct Args {
     force_full: bool,
     baseline: Option<String>,
     allow_local_off_the_record_run: bool,
+    /// `--human-off-the-record`: the front door's human route. Implies
+    /// `allow_local_off_the_record_run` and lifts its narrowing rule, for a
+    /// caller the front door classifies as a human. See
+    /// [`local_off_the_record_refusal_with`].
+    human_off_the_record: bool,
     skip_inner_dirty_working_tree_and_rebase_freshness_checks: bool,
     ignore_cache: bool,
     label_pr: bool,
@@ -1164,6 +1170,14 @@ const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION: &str =
 const SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_ENV: &str =
     "VALIDATE_SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS";
 const ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION: &str = "--allow-local-off-the-record-run";
+const HUMAN_OFF_THE_RECORD_OPTION: &str = "--human-off-the-record";
+/// `make validate`'s default: --all unless this invocation names a level.
+/// The driver's own parser decides, so an option value that happens to be a
+/// level word (`--only quick ...`, `--baseline full`) names no level.
+const ALL_UNLESS_LEVEL_OPTION: &str = "--all-unless-level";
+/// The `make validate` front door, whose `--classify` mode is the one
+/// implementation of the agent-or-human routing decision.
+const FRONT_DOOR_SCRIPT: &str = "scripts/validate-front-door.sh";
 const FROZEN_RUN_OPTION: &str = "--frozen-run";
 const FAIL_FAST_OPTION: &str = "--fail-fast";
 /// The one node `--frozen-run` withholds, matched by exact tag. A frozen
@@ -1244,6 +1258,71 @@ mod e2e_payload_identity_tests {
             .unwrap_or_else(|error| panic!("cannot read {relative}: {error}"))
     }
 
+    /// The GitHub export ShipIt publishes, whose commits do not carry the files
+    /// it strips; see `stripped_from_export`.
+    const EXPORT_REPOSITORY: &str = "facebookexperimental/hermit";
+
+    /// Whether the checkout at `root` does not carry `relative`, as
+    /// `ci/checkout-carries.sh` in the tool root, `tool_root`, decides: the one
+    /// shared rule, which skips only a path the export has never carried, absent
+    /// here, at the top level of a git worktree whose commit does not track it.
+    /// That is the export's shape, decided from the checkout itself, so it holds
+    /// for a fresh clone with no environment set. Every other outcome, including
+    /// the tool being absent or failing to run, is false, so the caller reads the
+    /// file and fails by name. The tool runs under bash, so a lost execute bit or
+    /// a noexec mount cannot stop it; its own line, when git cannot answer, and
+    /// bash's when the tool is missing, go to stderr, as does one line when bash
+    /// itself cannot start. Each skip it allows comes out as `export_skip_line`
+    /// says.
+    fn export_strip_applies(tool_root: &Path, root: &Path, relative: &str) -> bool {
+        let tool_path = tool_root.join("ci/checkout-carries.sh");
+        let mut tool = Command::new("bash");
+        without_repository_location(&mut tool);
+        let status = tool
+            .arg(&tool_path)
+            .arg(root)
+            .arg(relative)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .status();
+        match status {
+            Ok(status) => status.code() == Some(1),
+            Err(error) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "validate.rs: could not start bash for {}: {error}; {relative} counts as carried",
+                    tool_path.display()
+                );
+                false
+            }
+        }
+    }
+
+    /// The SKIPPED line for skipping `what` because this checkout does not carry
+    /// `relative`, a file of the open-source Buck layer that the export has never
+    /// carried. Its skip comes out when dh-8zi9o4, which decides where that layer
+    /// lives after the branch flip, is resolved.
+    fn export_skip_line(relative: &str, what: &str) -> String {
+        format!(
+            "validate.rs: SKIPPED: {relative} is absent and this checkout's commit does not \
+             track it: it belongs to the open-source Buck layer, which the {EXPORT_REPOSITORY} \
+             export does not carry; {what} needs that layer, and this skip comes out when \
+             dh-8zi9o4 (where that layer lives after the branch flip) is resolved"
+        )
+    }
+
+    /// `export_strip_applies` for the checkout at `root`. When it holds, the
+    /// caller skips `what` (the part that reads the file), and this prints its
+    /// `export_skip_line` to stderr directly, so a test harness's output capture
+    /// does not hide it.
+    fn stripped_from_export(root: &Path, relative: &str, what: &str) -> bool {
+        let applies = export_strip_applies(root, root, relative);
+        if applies {
+            let _ = writeln!(std::io::stderr(), "{}", export_skip_line(relative, what));
+        }
+        applies
+    }
+
     #[test]
     fn artifact_node_publishes_each_recorded_path() {
         let root = test_source_root();
@@ -1282,22 +1361,49 @@ mod e2e_payload_identity_tests {
         let buck = e2e_payload_identity(RELEASE_BUILDER_BUCK);
         assert_eq!(buck["profile"], "release");
         let root = test_source_root();
-        // On the GitHub export each Buck file below is absent, and its check is
-        // skipped, saying so (stripped_from_export).
+        // The export has never carried shim/BUCK, the open-source Buck layer's
+        // file: there its check is skipped, saying so (stripped_from_export).
         if !stripped_from_export(&root, "shim/BUCK", "the release flag check") {
             release_flags_match(&buck, &read(&root, "shim/BUCK"));
         }
         // The release target's own rustc_flags come after the toolchain's and
         // would override them, in either the one- or two-token spelling.
         // hermit-cli/BUCK defines the release targets through release_alias.bzl.
+        // The export carries both, so both are read everywhere.
         for path in ["hermit-cli/BUCK", "hermit-cli/release_alias.bzl"] {
-            if stripped_from_export(&root, path, "its rustc_flags override check") {
-                continue;
-            }
             let target = read(&root, path);
             for class in ["debug-assertions", "overflow-checks"] {
                 assert!(!target.contains(class), "{path} sets {class}");
             }
+        }
+    }
+
+    /// The release identity check passes in this checkout with
+    /// GITHUB_REPOSITORY unset, as in a fresh clone. Where the checkout's
+    /// commit does not carry shim/BUCK (the export's shape), it skips that file
+    /// by name instead of failing to read it.
+    #[test]
+    fn buck_identity_needs_no_repository_claim() {
+        let root = test_source_root();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "e2e_payload_identity_tests::buck_identity_matches_the_release_rustc_flags",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_remove("GITHUB_REPOSITORY")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}\n{stderr}");
+        assert!(stdout.contains("test result: ok. 1 passed"), "{stdout}");
+        if export_strip_applies(&root, &root, "shim/BUCK") {
+            assert!(
+                stderr.contains("validate.rs: SKIPPED: shim/BUCK is absent"),
+                "{stderr}"
+            );
         }
     }
 
@@ -1331,66 +1437,99 @@ mod e2e_payload_identity_tests {
         }
     }
 
+    /// Git in an export-shape fixture repository, as a fixed committer.
+    fn export_fixture_git(root: &Path, args: &[&str]) {
+        let output = scratch_git()
+            .arg("-C")
+            .arg(root)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
-    fn only_an_absent_buck_file_on_the_export_is_skipped() {
+    fn only_a_never_exported_file_the_checkout_does_not_carry_is_skipped() {
+        // The shared rule, ci/checkout-carries.sh, comes from this checkout.
+        let tool = test_source_root();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
+        // An export-shaped checkout: its commit tracks hermit-cli's Buck files
+        // and the Makefile, and not shim/BUCK. No environment variable takes
+        // part: the answer comes from the checkout alone.
         std::fs::create_dir_all(root.join("hermit-cli")).unwrap();
-        let export = Some(EXPORT_REPOSITORY);
-        for absent in [
+        for tracked in [
             "hermit-cli/BUCK",
-            "shim/BUCK",
             "hermit-cli/release_alias.bzl",
-            "x/defs.BZL",
-        ] {
-            assert!(export_strip_applies(root, absent, export), "{absent}");
-            for other in [
-                None,
-                Some("rrnewton/hermit"),
-                Some(""),
-                Some("FacebookExperimental/hermit"),
-                Some("facebookexperimental/hermit-fork"),
-                Some("facebookexperimental/hermit "),
-            ] {
-                assert!(
-                    !export_strip_applies(root, absent, other),
-                    "{absent} {other:?}"
-                );
-            }
-        }
-        // Only Buck files: any other missing file still fails on the export.
-        for other_file in [
-            "hermit-cli/Cargo.toml",
-            "hermit-cli/BUCK.v2",
-            "x/BUCKET",
             "Makefile",
         ] {
-            assert!(
-                !export_strip_applies(root, other_file, export),
-                "{other_file}"
-            );
+            std::fs::write(root.join(tracked), "").unwrap();
         }
-        // Present, or anything at all at the path, is not absent.
-        std::fs::write(root.join("hermit-cli/BUCK"), "").unwrap();
-        assert!(!export_strip_applies(root, "hermit-cli/BUCK", export));
-        std::fs::create_dir(root.join("hermit-cli/release_alias.bzl")).unwrap();
+        export_fixture_git(root, &["init", "-q"]);
+        export_fixture_git(root, &["add", "hermit-cli", "Makefile"]);
+        export_fixture_git(root, &["commit", "-qm", "export-shaped fixture"]);
+        // shim/BUCK, which the export has never carried, is skipped.
+        assert!(export_strip_applies(&tool, root, "shim/BUCK"));
+        // Any path the export carries, or might, is never skipped, even absent
+        // and untracked: its absence is a deletion and must fail.
+        for other in [
+            "x/defs.BZL",
+            "hermit-cli/other.bzl",
+            "hermit-cli/Cargo.toml",
+            "README.md",
+        ] {
+            assert!(!export_strip_applies(&tool, root, other), "{other}");
+        }
+        // A file the commit tracks still fails when it is missing on disk.
+        std::fs::remove_file(root.join("hermit-cli/BUCK")).unwrap();
+        assert!(!export_strip_applies(&tool, root, "hermit-cli/BUCK"));
+        // Below a worktree's top level git answers for the enclosing
+        // checkout, not this directory, so nothing is skipped there.
         assert!(!export_strip_applies(
-            root,
-            "hermit-cli/release_alias.bzl",
-            export
+            &tool,
+            &root.join("hermit-cli"),
+            "shim/BUCK"
         ));
-        std::fs::create_dir(root.join("x")).unwrap();
-        std::os::unix::fs::symlink("nowhere", root.join("x/defs.BZL")).unwrap();
-        assert!(!export_strip_applies(root, "x/defs.BZL", export));
-        // The line names what removes the skip. V4 exports hermit-cli's Buck
-        // files; the open-source Buck layer under shim/ waits for dh-8zi9o4.
-        for shared in ["hermit-cli/BUCK", "hermit-cli/release_alias.bzl"] {
-            let line = export_skip_line(shared, "a check");
-            assert!(
-                line.contains("dh-2y5z03 V4") && !line.contains("dh-8zi9o4"),
-                "{line}"
-            );
-        }
+        // Without the shared tool nothing is skipped either.
+        assert!(!export_strip_applies(root, root, "shim/BUCK"));
+        // Present, or anything at all at the path, is not absent: a file, a
+        // dangling symlink, a directory.
+        std::fs::create_dir(root.join("shim")).unwrap();
+        std::fs::write(root.join("shim/BUCK"), "").unwrap();
+        assert!(!export_strip_applies(&tool, root, "shim/BUCK"));
+        std::fs::remove_file(root.join("shim/BUCK")).unwrap();
+        std::os::unix::fs::symlink("nowhere", root.join("shim/BUCK")).unwrap();
+        assert!(!export_strip_applies(&tool, root, "shim/BUCK"));
+        std::fs::remove_file(root.join("shim/BUCK")).unwrap();
+        std::fs::create_dir(root.join("shim/BUCK")).unwrap();
+        assert!(!export_strip_applies(&tool, root, "shim/BUCK"));
+        // Where git cannot answer (a repository with no commit yet), nothing
+        // is skipped: the caller reads the file and fails by name.
+        let empty = tempfile::tempdir().unwrap();
+        export_fixture_git(empty.path(), &["init", "-q"]);
+        assert!(!export_strip_applies(&tool, empty.path(), "shim/BUCK"));
+        // Nor for a tree with no repository of its own inside an UNRELATED
+        // repository: git would answer for the enclosing one, whose commit
+        // does not track inner/shim/BUCK, so that answer is refused.
+        let outer = tempfile::tempdir().unwrap();
+        std::fs::write(outer.path().join("tracked"), "").unwrap();
+        export_fixture_git(outer.path(), &["init", "-q"]);
+        export_fixture_git(outer.path(), &["add", "tracked"]);
+        export_fixture_git(outer.path(), &["commit", "-qm", "unrelated repository"]);
+        let inner = outer.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        assert!(!export_strip_applies(&tool, &inner, "shim/BUCK"));
+        // The line names what removes the skip.
         let line = export_skip_line("shim/BUCK", "a check");
         assert!(
             line.contains("open-source Buck layer")
@@ -1866,15 +2005,26 @@ fn usage() -> &'static str {
      \x20                                the GitHub portable shard runner.\n\
      \x20 --hosted-privileged-only      Select the committed 12-node privileged host graph.\n\
      \x20 --requalify-cell TEST MODE BACKEND  Run the committed DAG step owning that exact cell.\n\
-     \x20 --only <lane> <group.job>[,...]  Run those lane node(s) with their own\n\
-     \x20                  declared caps; outside deps are dropped; preflight tags\n\
-     \x20                  reuse validate's canonical preflight nodes.\n\
+     \x20 --only <lane> <group.job>[,...]  Run those node(s) with their own\n\
+     \x20                  declared caps, and every node they depend on (declared\n\
+     \x20                  deps and artifact producers, transitively), plus the\n\
+     \x20                  lane's canonical preflight nodes. The plan is the same\n\
+     \x20                  on and off the record, except that on the record it\n\
+     \x20                  also runs the driver's own self-test where the lane\n\
+     \x20                  has it. A dependency that cannot be selected refuses\n\
+     \x20                  by name before anything runs.\n\
      \x20 --tests <node::case>[,...]     Run only the named test cases (portable\n\
      \x20                  lane; upstream steps those nodes need still run). A case\n\
      \x20                  ID is node tag + '::' + the runner result ID, e.g.\n\
      \x20                  test.cli::hermit-run::cli$some_test; IDs are listed in a\n\
      \x20                  run record's test_cases vector. Only nextest nodes can\n\
      \x20                  be sliced by case; any other node fails loudly by name.\n\
+     \x20                  A named case its node does not list fails that node\n\
+     \x20                  by name before any test runs, never a zero-test pass;\n\
+     \x20                  the selection narrows the node's own filter, never\n\
+     \x20                  widens it. A package or binary name nextest does not\n\
+     \x20                  know fails the node earlier, at nextest's filter\n\
+     \x20                  parser (exit 2), which names it.\n\
      \x20 --tests-file <path>            Same selection, one node::case ID per line\n\
      \x20                  ('#' comments and blank lines are ignored).\n\
      \x20 --selective, --since-green    Only nodes affected since the last green baseline.\n\
@@ -1890,12 +2040,21 @@ fn usage() -> &'static str {
      \x20 --envelope-compare FILE       Measure, then fail if any count regressed below FILE.\n\
      \x20 --all, --full-run             Assert the COMPLETE suite explicitly (overrides\n\
      \x20                               the selective default; the landing form).\n\
+     \x20 --all-unless-level            --all, unless this invocation names a level\n\
+     \x20                               (quick, portable-only, full, super, --quick,\n\
+     \x20                               --portable, --portable-only or VALIDATE_LEVEL).\n\
+     \x20                               `make validate` passes it, so ARGS=--quick runs quick.\n\
      \n\
      Other options:\n\
      \x20 --allow-local-off-the-record-run\n\
      \x20                  Permit a clean, commit-anchored quick or focused local run for\n\
      \x20                  iterative testing. It writes no ledger row, publishes no receipt,\n\
      \x20                  and cannot be cited as validation evidence.\n\
+     \x20 --human-off-the-record\n\
+     \x20                  The human route of `make validate` (scripts/validate-front-door.sh):\n\
+     \x20                  --allow-local-off-the-record-run at ANY level, the full profile\n\
+     \x20                  included, for a caller that front door classifies as a human.\n\
+     \x20                  Refused for an agent caller. Routing, not a security boundary.\n\
      \x20 --frozen-run     Set by `ci-hub validate-run --frozen-validate` only. Withholds\n\
      \x20                  check.canonical_adapter_accept, which needs the dev-hermit\n\
      \x20                  parent, as an intentional skip (never a pass). Refused without\n\
@@ -2078,6 +2237,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         force_full: env_flag("VALIDATE_FORCE_FULL", "1"),
         baseline: None,
         allow_local_off_the_record_run: false,
+        human_off_the_record: false,
         skip_inner_dirty_working_tree_and_rebase_freshness_checks: env_flag(
             SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_ENV,
             "1",
@@ -2105,6 +2265,7 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
         buck2: None,
     };
     let mut e2e_runner_explicit = false;
+    let mut all_unless_level = false;
     let mut label_pr_explicit = false;
     let mut shallow = false;
     let mut selective = false;
@@ -2238,8 +2399,14 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
                 shallow = true;
             }
             "--all" | "--full-run" => args.force_full = true,
+            ALL_UNLESS_LEVEL_OPTION => all_unless_level = true,
             ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION => {
                 args.allow_local_off_the_record_run = true;
+                args.label_pr = false;
+            }
+            HUMAN_OFF_THE_RECORD_OPTION => {
+                args.allow_local_off_the_record_run = true;
+                args.human_off_the_record = true;
                 args.label_pr = false;
             }
             SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION => {
@@ -2450,6 +2617,12 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             }
         }
         i += 1;
+    }
+    // `make validate` passes --all-unless-level in place of --all: once
+    // every argument is parsed, a level the parser saw wins; otherwise the
+    // run is the complete full suite, exactly as with --all.
+    if all_unless_level && !args.level_explicit {
+        args.force_full = true;
     }
     // An explicit `--label-pr` with no level or focused mode implies
     // `--all`: publishing a receipt requires the complete full run, so a
@@ -3372,6 +3545,14 @@ fn strict_flag_missing_from(argv: &[String]) -> bool {
         .any(|arg| arg == STRICT_EXECUTION_FLAG)
 }
 
+/// Whether git records a regular file with these permission bits as
+/// executable (mode 100755) rather than 100644. Git reads only the owner's
+/// execute bit (its `ce_permissions`: `(mode & 0100) ? 0755 : 0644`), so 0700
+/// and 0755 are both executable to it, and 0654 is not.
+fn git_executable(mode: u32) -> bool {
+    mode & 0o100 != 0
+}
+
 fn assert_submodule_fixture_source(
     root: &Path,
     checkout: &Path,
@@ -3416,7 +3597,7 @@ fn assert_submodule_fixture_source(
             }
             Ok(a.is_file()
                 && b.is_file()
-                && a.permissions().mode() & 0o111 == b.permissions().mode() & 0o111
+                && git_executable(a.permissions().mode()) == git_executable(b.permissions().mode())
                 && std::fs::read(&original)? == std::fs::read(&copied)?)
         })()
         .map_err(|error| format!("submodule service result: cannot compare {relative}: {error}"))?;
@@ -3455,61 +3636,6 @@ fn assert_submodule_fixture_source(
     }
 
     Ok(())
-}
-
-/// The GitHub export ShipIt publishes, which carries no BUCK or .bzl file; see
-/// `stripped_from_export`.
-const EXPORT_REPOSITORY: &str = "facebookexperimental/hermit";
-
-/// Whether `relative` is a Buck file that ShipIt strips (a BUCK or .bzl file),
-/// nothing at all is at it below `root`, and `repository` is exactly
-/// `EXPORT_REPOSITORY`. Anywhere else, or with the file present, it is false,
-/// so a checkout missing the file still fails. Each skip it allows comes out as
-/// `export_skip_line` says.
-fn export_strip_applies(root: &Path, relative: &str, repository: Option<&str>) -> bool {
-    let name = relative.rsplit('/').next().unwrap_or(relative);
-    let buck_file = name == "BUCK" || name.to_ascii_lowercase().ends_with(".bzl");
-    let absent = matches!(
-        std::fs::symlink_metadata(root.join(relative)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound
-    );
-    buck_file && absent && repository == Some(EXPORT_REPOSITORY)
-}
-
-/// The SKIPPED line for skipping `what` because `relative` is absent on the
-/// export. The file decides what removes the skip. dh-2y5z03 V4 exports the
-/// shared Buck files, such as hermit-cli's, and deletes their skips. The
-/// open-source Buck layer under shim/ stays off the export even after V4, so
-/// its skips name dh-8zi9o4, which decides where that layer lives after the
-/// branch flip, and come out when that is resolved.
-fn export_skip_line(relative: &str, what: &str) -> String {
-    if relative.starts_with("shim/") {
-        format!(
-            "validate.rs: SKIPPED on {EXPORT_REPOSITORY}: {relative} is absent: it belongs \
-             to the open-source Buck layer, which this export does not carry; {what} needs \
-             that layer, and this skip comes out when dh-8zi9o4 (where that layer lives \
-             after the branch flip) is resolved"
-        )
-    } else {
-        format!(
-            "validate.rs: SKIPPED on {EXPORT_REPOSITORY}: {relative} is absent, because \
-             ShipIt strips it from this export; {what} is skipped until dh-2y5z03 V4 \
-             exports it and deletes this skip"
-        )
-    }
-}
-
-/// `export_strip_applies` for this process's GITHUB_REPOSITORY. When it holds,
-/// the caller skips `what` (the part that reads the file), and this prints its
-/// `export_skip_line` to stderr directly, so a test harness's output capture
-/// does not hide it.
-fn stripped_from_export(root: &Path, relative: &str, what: &str) -> bool {
-    let repository = std::env::var("GITHUB_REPOSITORY").ok();
-    let applies = export_strip_applies(root, relative, repository.as_deref());
-    if applies {
-        let _ = writeln!(std::io::stderr(), "{}", export_skip_line(relative, what));
-    }
-    applies
 }
 
 // Keep the development overlay and its staged population identical by using
@@ -4180,23 +4306,12 @@ impl SubmoduleServiceBracket {
         // A self-test can run from an uncommitted edit while it is being developed.
         // Overlay exactly this test's production files, then commit only when that
         // changed the clone. The real child therefore still runs from a clean SHA.
-        // On the GitHub export, the list's Buck file is absent; that one copy is
-        // skipped, saying so (stripped_from_export), and the case still runs.
-        let sources = SUBMODULE_SERVICE_FIXTURE_SOURCES
-            .iter()
-            .copied()
-            .filter(|relative| {
-                !stripped_from_export(
-                    root,
-                    relative,
-                    "its copy into the submodule-service fixture",
-                )
-            })
-            .collect::<Vec<_>>();
+        // The export carries every file on the list, so every one is copied, and
+        // a missing one fails the copy by name.
+        let sources = SUBMODULE_SERVICE_FIXTURE_SOURCES.to_vec();
         // The clone has only the directories HEAD tracks. A source in the tree
-        // that HEAD does not track yet (a new file being developed, or a Buck
-        // stand-in the export does not carry yet) needs its directory made
-        // first, or the copy fails before the case runs.
+        // that HEAD does not track yet (a new file being developed) needs its
+        // directory made first, or the copy fails before the case runs.
         for relative in &sources {
             let destination = checkout.join(relative);
             if let Some(directory) = destination.parent() {
@@ -6365,9 +6480,12 @@ cleared-caps refusal names {} starved step(s)",
                     consumer.cmd
                 ));
             }
-            // A host-run bucket (programs the pinned image does not carry)
-            // reaches the same published artifact through the host pointer
-            // build.host_hermit_link writes and verifies.
+            // The rrcompat host-run bucket reaches the same published
+            // artifact through the host pointer
+            // build.host_hermit_link writes and verifies; the other
+            // focused compat buckets run their own release builds
+            // instead
+            // (https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-u6do9t.md).
             let host_run = hermit_manifest_plan::validation_dag::HOST_MANIFEST_RUNS
                 .contains(&consumer.tag().as_str());
             if consumer
@@ -6538,21 +6656,82 @@ cleared-caps refusal names {} starved step(s)",
         }
         // A host-run manifest bucket does not enter the pinned root at all;
         // the consumer check above requires exactly that.
-        for step in full.cfg.steps.iter().filter(|step| {
-            step.tag().ends_with("_in_pinned_root")
-                || (validation_step_identity(step) == ValidationStepIdentity::ManifestRun
-                    && !hermit_manifest_plan::validation_dag::HOST_MANIFEST_RUNS
-                        .contains(&step.tag().as_str()))
-        }) {
-            if !step
-                .cmd
-                .contains("/src/ci/hermetic/assert-build-dependencies.sh")
-            {
+        // Family-mapped test nodes run the test-node guard instead of the
+        // build guard (exactly where validate_pinned_image maps the tag to
+        // a family image); every other pinned-root node keeps the build
+        // guard. Neither guard substitutes for the other.
+        let pinned_guard_ok = |step: &Step| {
+            if hermit_manifest_plan::validation_dag::family_image_reference(&step.tag()).is_some() {
+                step.cmd
+                    .contains("/src/ci/hermetic/assert-test-dependencies.sh")
+            } else {
+                step.cmd
+                    .contains("/src/ci/hermetic/assert-build-dependencies.sh")
+            }
+        };
+        let pinned_guard_steps: Vec<&Step> = full
+            .cfg
+            .steps
+            .iter()
+            .filter(|step| {
+                step.tag().ends_with("_in_pinned_root")
+                    || (validation_step_identity(step) == ValidationStepIdentity::ManifestRun
+                        && !hermit_manifest_plan::validation_dag::HOST_MANIFEST_RUNS
+                            .contains(&step.tag().as_str()))
+            })
+            .collect();
+        for step in &pinned_guard_steps {
+            if !pinned_guard_ok(step) {
                 return Err(format!(
-                    "full-plan bracket: pinned-root node {} can start without the build-dependency assertion: {}",
+                    "full-plan bracket: pinned-root node {} can start without its dependency assertion: {}",
                     step.tag(),
                     step.cmd
                 ));
+            }
+        }
+        // Red controls on cloned steps (the plan itself is not mutated):
+        // a planted family node with neither guard, and a planted
+        // unmapped node carrying only the test-node guard, must both be
+        // refused by the same per-step check.
+        {
+            let mut family_step = full
+                .cfg
+                .steps
+                .iter()
+                .find(|s| s.tag() == "e2e.manifest_system_utils")
+                .ok_or("full-plan bracket: family-mapped system-utils node disappeared")?
+                .clone();
+            family_step.cmd = family_step.cmd.replace(
+                "/src/ci/hermetic/assert-test-dependencies.sh",
+                "/src/ci/hermetic/assert-no-network.sh",
+            );
+            if pinned_guard_ok(&family_step) {
+                return Err(
+                    "full-plan bracket: planted family node without either guard was accepted"
+                        .into(),
+                );
+            }
+            let mut unmapped_step = full
+                .cfg
+                .steps
+                .iter()
+                .find(|s| {
+                    s.cmd
+                        .contains("/src/ci/hermetic/assert-build-dependencies.sh")
+                        && hermit_manifest_plan::validation_dag::family_image_reference(&s.tag())
+                            .is_none()
+                })
+                .ok_or("full-plan bracket: no unmapped build-guarded node to plant")?
+                .clone();
+            unmapped_step.cmd = unmapped_step.cmd.replace(
+                "/src/ci/hermetic/assert-build-dependencies.sh",
+                "/src/ci/hermetic/assert-test-dependencies.sh",
+            );
+            if pinned_guard_ok(&unmapped_step) {
+                return Err(
+                    "full-plan bracket: planted unmapped node with only the test-node guard was accepted"
+                        .into(),
+                );
             }
         }
         for tag in [
@@ -8007,11 +8186,34 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         .into_iter()
         .map(str::to_string),
     );
+    // The selftest.validate_rs inclusion build_plan applies to every
+    // on-record focused closure, decided by exactly the driver's own
+    // pure action function (this bracket is an on-record run in the
+    // portable lane, which carries the node).
+    if validate_rs_self_test_action(
+        true,
+        false,
+        true,
+        std::env::var_os("CI_HUB_COMPOSITION_BASE_RUN").is_some(),
+    ) == ValidateRsSelfTestAction::Add
+    {
+        expected_tags.insert("selftest.validate_rs".to_string());
+    }
+    // dh-kra8l9: --only selects the requested IDs and the preflight WITH their
+    // whole dependency closure, dagrun's own closure over plain and artifact
+    // edges (ignore_selected_deps = false). This replaced an expectation of
+    // exactly those IDs with every outside edge dropped, so the expected
+    // selection is now a superset, compared exactly.
     let mut expected = dagrun::select_steps_by_tags(
         &portable,
         &expected_tags.iter().cloned().collect::<Vec<_>>(),
-        true,
+        false,
     )?;
+    let expected_tags = expected
+        .steps
+        .iter()
+        .map(Step::tag)
+        .collect::<BTreeSet<_>>();
     // build_plan applies the default early-exit shape before sealing; the
     // reconstructed expectation takes the same step, so the comparison
     // below still catches every other change to the selected graph.
@@ -8022,7 +8224,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         || plan.second.is_some()
     {
         return Err(
-            "only bracket: runtime selection differs from exact committed IDs plus preflight"
+            "only bracket: runtime selection differs from the committed IDs plus preflight with their whole dependency closure"
                 .into(),
         );
     }
@@ -8083,32 +8285,119 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .map(Step::tag)
         .collect::<BTreeSet<_>>();
-    // Off record, build_plan still forces the minimal preflight: the
-    // submodules, the pin gate and the Cargo.lock gate.
-    // The pinned-root command consumes its prepared script producer and locked
-    // input fetch even off record. test.detcore_unit also requires the
-    // prepared-nextest record, so its declared build chain is retained.
-    // Unrelated manifest builds remain outside this focused selection; name
-    // the exact required set explicitly.
-    let expected_off_record = [
-        "pre.submodules".to_string(),
-        PIN_GATE_TAG.to_string(),
-        CARGO_LOCK_GATE_TAG.to_string(),
-        "test.detcore_unit".to_string(),
-        "build.rust_scripts_in_pinned_root".to_string(),
-        "setup.pinned_root_fetch".to_string(),
-        "build.buck_release_artifact".to_string(),
-        "build.e2e_artifact_in_pinned_root".to_string(),
-        "build.liteinst_runtime_in_pinned_root".to_string(),
-        "build.workspace_compile_in_pinned_root".to_string(),
-        "build.workspace_in_pinned_root".to_string(),
-    ]
-    .into_iter()
+    // dh-kra8l9: the off-record flag skips only the ledger row and the
+    // receipt, and decides no part of the plan but the one named exception
+    // (the driver's self-test leaf, on the record only). The off-record plan
+    // is compared byte for byte with the same request on the record, less
+    // that leaf (check_on_record_exception), and its IDs with dagrun's
+    // closure of the request plus the whole preflight. test.detcore_unit
+    // declares its pinned-root build chain and gate.manifest, which brings
+    // gate.manifest's own producers (setup.manifest_plan, build.rust_scripts).
+    // This replaced a fixed 11-ID expectation with a narrower off-record
+    // preflight (the submodules, the pin gate and the Cargo.lock gate) that
+    // left gate.manifest and those producers out: the expectation is now that
+    // superset, compared exactly, and equal to the on-record plan less the
+    // self-test leaf.
+    let on_record_args = parse_argv(&[
+        "--only".into(),
+        "portable".into(),
+        "test.detcore_unit".into(),
+        "--no-label-pr".into(),
+    ])
+    .map_err(|code| format!("only bracket: on-record selection failed with exit {code}"))?;
+    let on_record = build_plan(root, &on_record_args, &std::env::temp_dir())?;
+    // The one named exception: on the record the plan also runs the driver's
+    // self-test leaf (dh-2w6af2); nothing else may differ.
+    check_on_record_exception(
+        "portable",
+        &portable,
+        &on_record.cfg,
+        &off_record.cfg,
+        false,
+    )
+    .map_err(|error| {
+        format!(
+            "only bracket: the off-record plan differs from the on-record plan of the same request: {error}"
+        )
+    })?;
+    // test.detcore_unit declares gate.manifest, so its closure holds the gate
+    // and both producers in either mode. pre.cargo_lock's closure holds none
+    // of them: off the record it used to plan only the submodules, the pin
+    // gate and itself. Its plan must be the on-record one, the whole
+    // preflight with its closure.
+    let mut cargo_lock_plans = Vec::new();
+    for off_record in [false, true] {
+        let mut argv = vec![
+            "--only".to_string(),
+            "portable".to_string(),
+            CARGO_LOCK_GATE_TAG.to_string(),
+            "--no-label-pr".to_string(),
+        ];
+        if off_record {
+            argv.insert(0, ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.to_string());
+        }
+        let args = parse_argv(&argv).map_err(|code| {
+            format!("only bracket: {CARGO_LOCK_GATE_TAG} selection failed with exit {code}")
+        })?;
+        cargo_lock_plans.push(build_plan(root, &args, &std::env::temp_dir())?.cfg);
+    }
+    let cargo_lock_tags =
+        |cfg: &DagConfig| cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    let expected_cargo_lock = dagrun::select_steps_by_tags(
+        &portable,
+        &[
+            "pre.submodules",
+            PIN_GATE_TAG,
+            CARGO_LOCK_GATE_TAG,
+            RUST_SCRIPT_PRODUCER_TAG,
+            validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+            "gate.manifest",
+        ]
+        .map(str::to_string),
+        false,
+    )?;
+    // Off the record the plan is exactly the whole preflight with its
+    // closure; on the record it is that plan plus the driver's self-test
+    // leaf, the one named exception, and nothing else.
+    let exception = check_on_record_exception(
+        "portable",
+        &portable,
+        &cargo_lock_plans[0],
+        &cargo_lock_plans[1],
+        false,
+    );
+    if exception.is_err()
+        || cargo_lock_tags(&cargo_lock_plans[1]) != cargo_lock_tags(&expected_cargo_lock)
+    {
+        return Err(format!(
+            "only bracket: {CARGO_LOCK_GATE_TAG} does not plan the whole preflight on and off the record: expected={:?} on={:?} off={:?} ({})",
+            cargo_lock_tags(&expected_cargo_lock),
+            cargo_lock_tags(&cargo_lock_plans[0]),
+            cargo_lock_tags(&cargo_lock_plans[1]),
+            exception.err().unwrap_or_default()
+        ));
+    }
+    let expected_off_record = dagrun::select_steps_by_tags(
+        &portable,
+        &[
+            "pre.submodules".to_string(),
+            PIN_GATE_TAG.to_string(),
+            CARGO_LOCK_GATE_TAG.to_string(),
+            RUST_SCRIPT_PRODUCER_TAG.to_string(),
+            validate_plan::MANIFEST_PLAN_PRODUCER_TAG.to_string(),
+            "gate.manifest".to_string(),
+            "test.detcore_unit".to_string(),
+        ],
+        false,
+    )?
+    .steps
+    .iter()
+    .map(Step::tag)
     .collect::<BTreeSet<_>>();
     let check_off_record_tags = |tags: &BTreeSet<String>| -> Result<(), String> {
         if tags != &expected_off_record {
             return Err(format!(
-                "only bracket: off-record selection did not retain exactly requested ID plus minimal preflight and required pinned-root producers: expected={expected_off_record:?} actual={tags:?}"
+                "only bracket: off-record selection did not select exactly the requested ID and the preflight with their whole dependency closure: expected={expected_off_record:?} actual={tags:?}"
             ));
         }
         Ok(())
@@ -8119,6 +8408,8 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         "setup.pinned_root_fetch",
         "build.workspace_in_pinned_root",
         "build.e2e_artifact_in_pinned_root",
+        "gate.manifest",
+        "setup.manifest_plan",
     ] {
         let mut missing = off_record_tags.clone();
         if !missing.remove(required) || check_off_record_tags(&missing).is_ok() {
@@ -8127,10 +8418,18 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
             ));
         }
     }
+    // A node outside the closure is still refused: the first portable node
+    // that test.detcore_unit's closure does not hold.
+    let outside = all_tags
+        .difference(&expected_off_record)
+        .next()
+        .cloned()
+        .ok_or("only bracket: every portable node is in test.detcore_unit's closure")?;
     let mut unrelated = off_record_tags.clone();
-    if !unrelated.insert("setup.manifest_plan".into()) || check_off_record_tags(&unrelated).is_ok()
-    {
-        return Err("only bracket: unrelated manifest producer was not refused".into());
+    if !unrelated.insert(outside.clone()) || check_off_record_tags(&unrelated).is_ok() {
+        return Err(format!(
+            "only bracket: node {outside}, outside the closure, was not refused"
+        ));
     }
 
     let unknown_args = parse_argv(&[
@@ -8199,26 +8498,29 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         &unrelated_args,
         &std::env::temp_dir().join("validate-only-unrelated-plan"),
     )?;
-    if unrelated_plan
-        .cfg
-        .steps
-        .iter()
-        .any(|step| step.job.starts_with("manifest_plan"))
-    {
-        return Err(
-            "only bracket: unrelated test.detcore_unit selection admitted a manifest-plan producer"
-                .into(),
-        );
-    }
+    // dh-kra8l9: this check refused any manifest-plan producer here. The
+    // closure now holds setup.manifest_plan, gate.manifest's declared
+    // producer, so the check is the exact closure equality instead (a
+    // superset; any node outside the closure is still refused).
+    check_off_record_tags(
+        &unrelated_plan
+            .cfg
+            .steps
+            .iter()
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>(),
+    )?;
 
     // Reproduce the focused manifest selection that used to reach dagrun with a
-    // dangling pinned-root edge. `--only` intentionally drops unrelated build
-    // dependencies, but both the host and pinned-root manifest commands invoke
-    // target/debug/test-harness. A fresh checkout must therefore retain the
-    // canonical host producer of the test harness and the in-image guest
-    // build without restoring gate.manifest. Since dh-63c2n3 the portable
-    // lane has no host guest build: the public name build.manifest_guests
-    // resolves to its pinned-root twin, and the host copy must not run.
+    // dangling pinned-root edge, and that F3's RUN 3744 ran without
+    // build.e2e_artifact_in_pinned_root (dh-kra8l9). Both the host and
+    // pinned-root manifest commands invoke target/debug/test-harness, and the
+    // e2e nodes read the e2e artifact, so a fresh checkout needs every
+    // producer: the selection is the request plus the preflight (the same on
+    // and off the record) with their whole dependency closure, gate.manifest
+    // included, compared exactly. Since dh-63c2n3 the portable lane has no host guest
+    // build: the public name build.manifest_guests resolves to its pinned-root
+    // twin, and the host copy must not run.
     let manifest_args = parse_argv(&[
         ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
         "--only".into(),
@@ -8246,6 +8548,9 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         "e2e.manifest_applications",
         "e2e.manifest_c_programs",
         "e2e.manifest_system_utils",
+        // RUN 3744's missing producer, and the gate the e2e nodes declare.
+        "build.e2e_artifact_in_pinned_root",
+        "gate.manifest",
     ] {
         if !manifest_tags.contains(required) {
             return Err(format!(
@@ -8258,9 +8563,34 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
             "only bracket: focused portable manifest selection runs the host guest build build.manifest_guests, which the portable lane no longer has: {manifest_tags:?}"
         ));
     }
-    if manifest_tags.contains("gate.manifest") || manifest_tags.contains("lint.clippy") {
+    // dh-kra8l9: this check refused gate.manifest here, along with
+    // lint.clippy. gate.manifest is a declared dependency of these e2e nodes,
+    // so it is now required (above). Every node outside the closure,
+    // lint.clippy among them, is still refused by the exact equality below.
+    let expected_manifest = dagrun::select_steps_by_tags(
+        &portable,
+        &[
+            "pre.submodules",
+            PIN_GATE_TAG,
+            CARGO_LOCK_GATE_TAG,
+            RUST_SCRIPT_PRODUCER_TAG,
+            validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+            "gate.manifest",
+            "build.manifest_guests_in_pinned_root",
+            "e2e.manifest_applications",
+            "e2e.manifest_c_programs",
+            "e2e.manifest_system_utils",
+        ]
+        .map(str::to_string),
+        false,
+    )?
+    .steps
+    .iter()
+    .map(Step::tag)
+    .collect::<BTreeSet<_>>();
+    if manifest_tags != expected_manifest || manifest_tags.contains("lint.clippy") {
         return Err(format!(
-            "only bracket: focused manifest selection broadened into unrelated validation: {manifest_tags:?}"
+            "only bracket: focused manifest selection is not exactly its dependency closure: expected={expected_manifest:?} actual={manifest_tags:?}"
         ));
     }
     let pinned_manifest_build = manifest_plan
@@ -8323,6 +8653,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
             "pre.reverie_pin_on_host",
         ),
     ] {
+        let mut record_mode_plans = Vec::new();
         for off_record in [false, true] {
             let mut argv = vec!["--only".into(), lane.into(), target.into()];
             if off_record {
@@ -8331,6 +8662,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
             let args = parse_argv(&argv)
                 .map_err(|code| format!("only bracket: {lane} parser exited {code}"))?;
             let hosted = build_plan(root, &args, &std::env::temp_dir())?;
+            record_mode_plans.push(hosted.cfg.clone());
             let tags = hosted
                 .cfg
                 .steps
@@ -8343,10 +8675,60 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
                 || tags
                     .iter()
                     .any(|tag| tag.ends_with("_in_pinned_root") || tag == "setup.pinned_root_fetch")
-                || (off_record && tags.iter().any(|tag| tag.starts_with("gate.")))
             {
                 return Err(format!(
                     "only bracket: {lane} changed focused host preparation (off_record={off_record}): {tags:?}"
+                ));
+            }
+            // dh-kra8l9: off record this refused every gate.* node, under a
+            // narrower off-record preflight. The plan is now the same on and
+            // off the record but for the driver's self-test leaf on the
+            // record (check_on_record_exception, compared byte for byte after
+            // this loop): the request plus the lane's whole preflight with
+            // their dependency closure, in the lane's own graph, compared
+            // exactly (a superset; any node outside the closure is still
+            // refused).
+            let preflight: &[&str] = if lane == "hosted-privileged" {
+                &[
+                    "pre.reverie_pin_on_host",
+                    "build.rust_scripts_on_host",
+                    "setup.manifest_plan_on_host",
+                    "gate.manifest_on_host",
+                ]
+            } else {
+                &[
+                    "pre.submodules",
+                    PIN_GATE_TAG,
+                    CARGO_LOCK_GATE_TAG,
+                    RUST_SCRIPT_PRODUCER_TAG,
+                    validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+                    "gate.manifest",
+                ]
+            };
+            let lane_graph = dagrun::select_steps_by_labels(&committed, &[lane.to_string()])?;
+            // On the record the request also carries the driver's self-test
+            // leaf when the lane holds it (the one named exception).
+            let self_test_leaf = if off_record {
+                None
+            } else {
+                on_record_self_test_leaf(lane, &lane_graph)
+            };
+            let expected_hosted = dagrun::select_steps_by_tags(
+                &lane_graph,
+                &std::iter::once(target)
+                    .chain(preflight.iter().copied())
+                    .map(str::to_string)
+                    .chain(self_test_leaf)
+                    .collect::<Vec<_>>(),
+                false,
+            )?
+            .steps
+            .iter()
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
+            if tags != expected_hosted || !tags.iter().any(|tag| tag.starts_with("gate.manifest")) {
+                return Err(format!(
+                    "only bracket: {lane} focused host preparation is not exactly its dependency closure (off_record={off_record}): expected={expected_hosted:?} actual={tags:?}"
                 ));
             }
             // The host guest build waits for the manifest-plan producer that
@@ -8375,6 +8757,19 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
                 ));
             }
         }
+        let lane_graph = dagrun::select_steps_by_labels(&committed, &[lane.to_string()])?;
+        check_on_record_exception(
+            lane,
+            &lane_graph,
+            &record_mode_plans[0],
+            &record_mode_plans[1],
+            false,
+        )
+        .map_err(|error| {
+            format!(
+                "only bracket: {lane} {target} plans differently on and off the record: {error}"
+            )
+        })?;
     }
 
     // The old privileged public name build.manifest_guests resolves to one
@@ -8492,7 +8887,7 @@ fn only_plan_bracket(root: &Path) -> Result<(), String> {
         return Err("only bracket: selecting IDs changed ci/dag/validate.json".into());
     }
     println!(
-        "  only plan: requested IDs plus committed preflight selected through dagrun; old privileged public IDs map explicitly, unknown portable and privileged IDs refuse, outside dependencies drop, selected edges remain, nested scheduler absent, and source/selected-step bytes are guarded both ways"
+        "  only plan: requested IDs plus committed preflight selected through dagrun with their whole dependency closure, the same on and off the record but for the driver's self-test leaf on the record; old privileged public IDs map explicitly, unknown portable and privileged IDs refuse, every edge remains, nested scheduler absent, and source/selected-step bytes are guarded both ways"
     );
     Ok(())
 }
@@ -8609,6 +9004,169 @@ mod focused_only_tests {
             ["build.manifest_guests", "cpuid.faulting", "no.such_node"].map(String::from),
         )
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod scorecard_corpus_tests {
+    use super::*;
+
+    /// The readers are exactly the committed nodes that run the commands tier
+    /// of the scorecard self-test or the script unit tests.
+    #[test]
+    fn the_corpus_readers_are_the_committed_commands_tier_and_script_test_nodes() {
+        let (committed, _, _) = load_committed_validation_dag(&test_source_root()).unwrap();
+        let readers = committed
+            .steps
+            .iter()
+            .filter(|step| reads_scorecard_corpus(step))
+            .map(Step::tag)
+            .collect::<BTreeSet<_>>();
+        let expected = [
+            "check.script_unit_tests",
+            "check.script_unit_tests_on_host",
+            "quick-super-selftest.scorecard_commands",
+            "selftest.scorecard_commands",
+        ]
+        .map(String::from)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        assert_eq!(readers, expected);
+    }
+
+    /// The lookup follows scorecard.rs's order, and finds nothing for a
+    /// fresh clone.
+    #[test]
+    fn an_existing_ledger_is_found_where_the_scorecard_looks() {
+        let temp = tempfile::tempdir().unwrap();
+        let checkout = temp.path().join("work/hermit");
+        std::fs::create_dir_all(&checkout).unwrap();
+        let none = |_: &str| None;
+        assert_eq!(existing_test_ledger(&checkout, none), None);
+        let sibling = temp.path().join("work/hermit_test_ledger");
+        std::fs::create_dir_all(sibling.join(".git")).unwrap();
+        assert_eq!(existing_test_ledger(&checkout, none), Some(sibling));
+        let env = |name: &str| match name {
+            TEST_LEDGER_ROOT_ENV => Some(std::ffi::OsString::from("/explicit")),
+            PARENT_ENV => Some(std::ffi::OsString::from("/parent")),
+            _ => None,
+        };
+        assert_eq!(
+            existing_test_ledger(&checkout, env),
+            Some(PathBuf::from("/explicit"))
+        );
+        let parent_only = |name: &str| (name == PARENT_ENV).then(|| "/parent".into());
+        assert_eq!(
+            existing_test_ledger(&checkout, parent_only),
+            Some(PathBuf::from("/parent/hermit_test_ledger"))
+        );
+    }
+
+    /// A failed or nonsensical fetch is an error naming what happened; the
+    /// refusal names the readers and the remedy.
+    #[test]
+    fn a_failed_fetch_refuses_by_name_with_the_remedy() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = temp.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path
+        };
+        let failing = script(
+            "fail.sh",
+            "echo 'fatal: unable to access github.com' >&2; exit 128",
+        );
+        let error = prepare_scorecard_corpus(&failing, temp.path()).unwrap_err();
+        assert!(error.contains("unable to access github.com"), "{error}");
+        let nonsense = script("nonsense.sh", "echo /nonexistent");
+        let error = prepare_scorecard_corpus(&nonsense, temp.path()).unwrap_err();
+        assert!(error.contains("not a prepared repository"), "{error}");
+        let good = script(
+            "good.sh",
+            "d=\"$1/corpus\"; mkdir -p \"$d/.git\"; echo \"$d\"",
+        );
+        let dir = prepare_scorecard_corpus(&good, temp.path()).unwrap();
+        assert!(dir.join(".git").is_dir(), "{}", dir.display());
+        let readers = vec!["quick-super-selftest.scorecard_commands".to_string()];
+        let summary = scorecard_corpus_refusal("quick", &readers, "git exited 128");
+        let text = format!("{:?}", summary.detail);
+        for needle in [
+            "refused by: scorecard self-test corpus",
+            "quick-super-selftest.scorecard_commands",
+            "git exited 128",
+            "https://github.com/rrnewton/hermit_test_ledger.git",
+            TEST_LEDGER_ROOT_ENV,
+            SCORECARD_CORPUS_PREPARER,
+        ] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert_eq!(summary.exit_code, 75);
+    }
+}
+
+#[cfg(test)]
+mod all_unless_level_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Args, u8> {
+        parse_argv(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+    }
+
+    /// `make validate` passes --all-unless-level in place of --all. With no
+    /// level it is exactly --all; a level, in any spelling, runs that level;
+    /// a level word that is an option's value names no level.
+    #[test]
+    fn all_unless_level_is_all_until_the_parser_sees_a_level() {
+        for rest in [&[][..], &["--keep-going"][..], &["--baseline", "full"][..]] {
+            let with_all = parse(&[&["--all"][..], rest].concat()).unwrap();
+            let unless = parse(&[&[ALL_UNLESS_LEVEL_OPTION][..], rest].concat()).unwrap();
+            assert!(unless.force_full, "{rest:?}");
+            assert_eq!(unless.level, Level::Full, "{rest:?}");
+            assert!(unless.focused.is_none(), "{rest:?}");
+            assert_eq!(
+                (unless.force_full, unless.level, unless.baseline.is_some()),
+                (
+                    with_all.force_full,
+                    with_all.level,
+                    with_all.baseline.is_some()
+                ),
+                "{rest:?}"
+            );
+        }
+        let dag = parse(&[ALL_UNLESS_LEVEL_OPTION, "--write-constructed-dag", "quick"]).unwrap();
+        assert!(dag.force_full && dag.level == Level::Full);
+        for (spelling, level) in [
+            ("--quick", Level::Quick),
+            ("quick", Level::Quick),
+            ("--portable", Level::PortableOnly),
+            ("--portable-only", Level::PortableOnly),
+            ("portable-only", Level::PortableOnly),
+            ("super", Level::Super),
+            ("full", Level::Full),
+        ] {
+            let args = parse(&[ALL_UNLESS_LEVEL_OPTION, spelling, "--keep-going"]).unwrap();
+            assert!(!args.force_full, "{spelling}");
+            assert_eq!(args.level, level, "{spelling}");
+        }
+        // A focused mode whose lane value is a level word is refused, as with
+        // --all, instead of being read as the quick level.
+        assert_eq!(
+            parse(&["--all", "--only", "quick", "e2e.manifest_compat"]).err(),
+            Some(2)
+        );
+        assert_eq!(
+            parse(&[
+                ALL_UNLESS_LEVEL_OPTION,
+                "--only",
+                "quick",
+                "e2e.manifest_compat"
+            ])
+            .err(),
+            Some(2)
+        );
     }
 }
 
@@ -9968,12 +10526,13 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
     let guarded = guarded_command_source(&tag, &step.cmd)?;
     if guarded != step.cmd {
         const PREFIX: &str = "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo ";
-        let separator = format!(
-            " -- bash -c {} bash ",
-            validate_plan::shell_quote(
-                hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD
-            )
-        );
+        let guard = if hermit_manifest_plan::validation_dag::family_image_reference(&tag).is_some()
+        {
+            hermit_manifest_plan::validation_dag::TEST_NODE_COMMAND_GUARD
+        } else {
+            hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD
+        };
+        let separator = format!(" -- bash -c {} bash ", validate_plan::shell_quote(guard));
         let (forwarded, payload) = step
             .cmd
             .strip_prefix(PREFIX)
@@ -9984,6 +10543,8 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
         let expected_proc_locks_runtime =
             matches!(tag.as_str(), "e2e.manifest_c_programs" | "quick.e2e_verify");
         let mut proc_locks_runtime = false;
+        let expected_family = hermit_manifest_plan::validation_dag::family_image_reference(&tag);
+        let mut family_digest: Option<&str> = None;
         while let Some(option) = words.next() {
             match option {
                 "--env" => {
@@ -9997,6 +10558,12 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
                         return Err(format!("{tag} has an ambiguous pinned-root environment"));
                     }
                 }
+                "--digest" if expected_family.is_some() && family_digest.is_none() => {
+                    let Some(value) = words.next() else {
+                        return Err(format!("{tag} has an ambiguous pinned-root environment"));
+                    };
+                    family_digest = Some(value);
+                }
                 "--proc-locks-runtime" if expected_proc_locks_runtime && !proc_locks_runtime => {
                     proc_locks_runtime = true;
                 }
@@ -10004,6 +10571,7 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
             }
         }
         if proc_locks_runtime != expected_proc_locks_runtime
+            || family_digest != expected_family
             || payload != validate_plan::shell_quote(&guarded)
             || ["DAGRUN_TEST_COUNTS_PATH", "E2E_RESULT_ROOT", "E2E_RUN_ID"]
                 .iter()
@@ -12908,17 +13476,83 @@ fn frozen_run_admission_refusal(
     }
 }
 
+/// The front door's routing decision about who is calling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CallerClass {
+    Agent(String),
+    Human(String),
+}
+
+/// Ask the front door (`scripts/validate-front-door.sh --classify`) to classify
+/// this process's caller. The script is the single implementation of the
+/// decision; the driver re-asks rather than trusting its flag.
+fn front_door_classify() -> Result<CallerClass, String> {
+    let script = repo_root().join(FRONT_DOOR_SCRIPT);
+    let output = Command::new("bash")
+        .arg(&script)
+        .arg("--classify")
+        .output()
+        .map_err(|error| format!("cannot run {}: {error}", script.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} --classify exited {}",
+            script.display(),
+            output
+                .status
+                .code()
+                .map_or_else(|| "by signal".into(), |code| code.to_string())
+        ));
+    }
+    parse_caller_class(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_caller_class(stdout: &str) -> Result<CallerClass, String> {
+    let line = stdout.lines().next().unwrap_or_default().trim();
+    match line.split_once(' ') {
+        Some(("agent", reason)) => Ok(CallerClass::Agent(reason.to_string())),
+        Some(("human", reason)) => Ok(CallerClass::Human(reason.to_string())),
+        _ => Err(format!("unrecognized classification {line:?}")),
+    }
+}
+
 /// A local off-the-record run is an iteration tool, not a cheaper publication
 /// path. It therefore requires an explicitly narrowed profile; full-cost
 /// validation and every publishable result stay in ci-hub. It may run on a
 /// dirty tree: it publishes nothing, and reproducing a fix before committing it
 /// is what it is for.
+///
+/// The one exception is the front door's human route (owner, Slack 7286-7287,
+/// 2026-11-21): a human at a terminal gets the FULL validate in place, still
+/// off the record. `--human-off-the-record` asks for it, and the front door's
+/// classifier must agree that the caller is not an agent.
 fn local_off_the_record_refusal(args: &Args) -> Option<String> {
+    local_off_the_record_refusal_with(args, &mut front_door_classify)
+}
+
+fn local_off_the_record_refusal_with(
+    args: &Args,
+    classify: &mut dyn FnMut() -> Result<CallerClass, String>,
+) -> Option<String> {
     if !args.allow_local_off_the_record_run {
         return None;
     }
     if args.show_plan {
         return None;
+    }
+    if args.human_off_the_record {
+        return match classify() {
+            Ok(CallerClass::Human(_)) => None,
+            Ok(CallerClass::Agent(reason)) => Some(format!(
+                "validate: REFUSED — {HUMAN_OFF_THE_RECORD_OPTION} is the human route of \
+                 `make validate`, and this caller is an agent ({reason}).\n\
+                 Agents validate through `ci-hub validate-run`; quick or focused iteration \
+                 stays available with {ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION}."
+            )),
+            Err(error) => Some(format!(
+                "validate: REFUSED — {HUMAN_OFF_THE_RECORD_OPTION} needs the front door's \
+                 caller classification, which failed: {error}"
+            )),
+        };
     }
     if args.focused.is_none() && args.level != Level::Quick && args.selected.is_none() {
         return Some(format!(
@@ -12929,6 +13563,221 @@ fn local_off_the_record_refusal(args: &Args) -> Option<String> {
         ));
     }
     None
+}
+
+/// The script that fetches exactly the pinned hermit_test_ledger objects the
+/// scorecard self-test reads (SELF_TEST_CORPUS in scorecard.rs), anonymously,
+/// and prints the directory it prepared.
+const SCORECARD_CORPUS_PREPARER: &str = "ci/prepare-scorecard-self-test-corpus.sh";
+/// Where scorecard.rs reads that corpus when it is outside the parent workspace.
+const TEST_LEDGER_ROOT_ENV: &str = "DEV_HERMIT_TEST_LEDGER_ROOT";
+
+/// A node that reads the scorecard self-test corpus: the commands tier of the
+/// scorecard self-test, or the script unit tests, which run that tier too.
+fn reads_scorecard_corpus(step: &Step) -> bool {
+    step.cmd
+        .contains("test-harness selftest scorecard_commands")
+        || step.cmd.contains("./scripts/run-script-tests.sh")
+}
+
+/// The ledger scorecard.rs's ledger_root would read without fetching, in its
+/// own order: DEV_HERMIT_TEST_LEDGER_ROOT, then
+/// $DEV_HERMIT_PARENT/hermit_test_ledger, then a hermit_test_ledger checkout
+/// beside an ancestor of the checkout. None for a fresh clone.
+fn existing_test_ledger(
+    root: &Path,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(explicit) = var(TEST_LEDGER_ROOT_ENV).filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(explicit));
+    }
+    if let Some(parent) = var(PARENT_ENV).filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(parent).join("hermit_test_ledger"));
+    }
+    root.ancestors()
+        .map(|parent| parent.join("hermit_test_ledger"))
+        .find(|path| path.join(".git").exists())
+}
+
+/// Fetch the pinned corpus into a fresh directory under `scratch` with
+/// SCORECARD_CORPUS_PREPARER, which verifies every object it fetched.
+fn prepare_scorecard_corpus(preparer: &Path, scratch: &Path) -> Result<PathBuf, String> {
+    let parent = scratch.join("hermit-scorecard-corpus");
+    std::fs::create_dir_all(&parent)
+        .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    let output = Command::new(preparer)
+        .arg(&parent)
+        .output()
+        .map_err(|error| format!("cannot run {}: {error}", preparer.display()))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail = stderr.lines().rev().take(3).collect::<Vec<_>>();
+        return Err(format!(
+            "{} exited with {}: {}",
+            preparer.display(),
+            output.status,
+            tail.into_iter().rev().collect::<Vec<_>>().join(" | ")
+        ));
+    }
+    let printed = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let dir = PathBuf::from(&printed);
+    if printed.is_empty() || !dir.join(".git").exists() {
+        return Err(format!(
+            "{} printed {printed:?}, which is not a prepared repository",
+            preparer.display()
+        ));
+    }
+    Ok(dir)
+}
+
+/// The refusal for a corpus that is missing and could not be fetched.
+fn scorecard_corpus_refusal(profile: &str, readers: &[String], error: &str) -> Box<RunSummary> {
+    Box::new(RunSummary::refused(
+        75,
+        profile,
+        "scorecard self-test corpus",
+        vec![
+            format!(
+                "{} need the pinned hermit_test_ledger objects, none was found, and fetching \
+                 them failed: {error}",
+                readers.join(", ")
+            ),
+            format!(
+                "remedy: clone https://github.com/rrnewton/hermit_test_ledger.git and export \
+                 {TEST_LEDGER_ROOT_ENV}=<that checkout>, or run `{SCORECARD_CORPUS_PREPARER} DIR` \
+                 and export {TEST_LEDGER_ROOT_ENV}=<the directory it prints>"
+            ),
+        ],
+    ))
+}
+
+/// Before any node runs: a selected node that reads the scorecard self-test
+/// corpus needs the pinned hermit_test_ledger objects. Inside the dev-hermit
+/// harness they are its checkout. A fresh clone has none, so they are fetched
+/// anonymously into this run's TMPDIR and DEV_HERMIT_TEST_LEDGER_ROOT is
+/// exported to the nodes (they all run on the host). If the fetch fails, the
+/// run refuses at once, naming the remedy, instead of failing those nodes as
+/// product failures minutes later. A boxing re-exec inherits the exported
+/// variable, so it never fetches twice.
+fn admit_scorecard_corpus(
+    root: &Path,
+    cfg: &DagConfig,
+    second: Option<&DagConfig>,
+    profile: &str,
+) -> Result<(), Box<RunSummary>> {
+    let readers = std::iter::once(cfg)
+        .chain(second)
+        .flat_map(|cfg| cfg.steps.iter())
+        .filter(|step| reads_scorecard_corpus(step))
+        .map(Step::tag)
+        .collect::<Vec<_>>();
+    if readers.is_empty() || existing_test_ledger(root, |name| std::env::var_os(name)).is_some() {
+        return Ok(());
+    }
+    match prepare_scorecard_corpus(&root.join(SCORECARD_CORPUS_PREPARER), &std::env::temp_dir()) {
+        Ok(dir) => {
+            eprintln!(
+                "validate: no hermit_test_ledger checkout here; fetched its pinned scorecard \
+                 self-test corpus into {} for {}",
+                dir.display(),
+                readers.join(", ")
+            );
+            std::env::set_var(TEST_LEDGER_ROOT_ENV, &dir);
+            Ok(())
+        }
+        Err(error) => Err(scorecard_corpus_refusal(profile, &readers, &error)),
+    }
+}
+
+/// The census base a counted node compares its listed tests against
+/// (ci/census-check.sh): one suite's file, or a per-suite directory. ci-hub
+/// supplies one to every validate it runs; a plain run (a person's
+/// `make validate`, a fresh clone) has neither and needs neither.
+const CENSUS_BASE_ENVS: [&str; 2] = ["HERMIT_CENSUS_BASE_LISTED_IDS", "HERMIT_CENSUS_BASE_DIR"];
+/// The case filter a counted node applies (ci/run-nextest-counted.sh). A
+/// node with one lists only the matching cases, and census-check skips the
+/// base comparison for it (--case-selected).
+const NEXTEST_FILTER_EXPR_ENV: &str = "HERMIT_NEXTEST_FILTER_EXPR";
+/// The case IDs a --tests run names for one counted node, space-separated
+/// (inject_case_filters). ci/run-nextest-counted.sh fails the node, before
+/// any test runs, when one of them is not in the node's listing, naming it:
+/// a name that matches nothing can never pass with zero tests run.
+const NEXTEST_SELECTED_CASES_ENV: &str = "HERMIT_NEXTEST_SELECTED_CASES";
+/// The one selection mode that selects cases: --tests puts
+/// HERMIT_NEXTEST_FILTER_EXPR into the selected steps' own env
+/// (inject_case_filters). Every other mode, --selected included, runs whole
+/// nodes.
+const CASE_SELECTING_MODE: &str = "tests";
+
+/// Drop a case selection inherited from the caller (HERMIT_NEXTEST_FILTER_EXPR
+/// or HERMIT_NEXTEST_SELECTED_CASES), naming each. Cases are selected only
+/// per step, by --tests; an inherited filter would make every counted node
+/// list only the matching cases and skip the census comparison while the run
+/// read as a whole-suite run, and inherited case names would fail every
+/// counted node that does not list them. Returns whether a value was dropped.
+fn drop_inherited_case_filter() -> bool {
+    let mut dropped = false;
+    for name in [NEXTEST_FILTER_EXPR_ENV, NEXTEST_SELECTED_CASES_ENV] {
+        if std::env::var_os(name).is_some_and(|value| !value.is_empty()) {
+            eprintln!(
+                "validate: ignoring {name} from the environment: only --tests selects cases, \
+                 per step"
+            );
+            dropped = true;
+        }
+        std::env::remove_var(name);
+    }
+    dropped
+}
+
+/// Why this run's counted test nodes compared no test list with main's, or
+/// None when they did. ci/run-nextest-counted.sh compares a node's listed
+/// tests with the base exactly when one of CENSUS_BASE_ENVS is non-empty and
+/// the node has no HERMIT_NEXTEST_FILTER_EXPR. Every counted node inherits
+/// the driver's environment (host-side directly, pinned-root through
+/// PINNED_ROOT_FORWARDED_ENV), so this reads the same variables; the one
+/// step-level source of a filter is the case-selecting mode. run() drops an
+/// inherited filter first (drop_inherited_case_filter), so in a real run the
+/// filter clause never fires; it keeps the predicate true on its own.
+fn census_not_compared_reason(
+    selection_mode: &str,
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<String> {
+    if selection_mode == CASE_SELECTING_MODE {
+        return Some(format!(
+            "{selection_mode} run: its counted nodes listed only the selected cases (a per-step \
+             {NEXTEST_FILTER_EXPR_ENV}), so no test list was compared with main's"
+        ));
+    }
+    if var(NEXTEST_FILTER_EXPR_ENV).is_some_and(|value| !value.is_empty()) {
+        return Some(format!(
+            "{NEXTEST_FILTER_EXPR_ENV} is set: every counted node listed only the matching \
+             cases, so no test list was compared with main's"
+        ));
+    }
+    if CENSUS_BASE_ENVS
+        .iter()
+        .any(|name| var(name).is_some_and(|value| !value.is_empty()))
+    {
+        return None;
+    }
+    Some(format!(
+        "no census base supplied ({}): each counted node checked its own test list, but none \
+         was compared with main's for vanished tests",
+        CENSUS_BASE_ENVS.join(", ")
+    ))
+}
+
+/// Mark a ledger row whose counted nodes compared no test list with main's:
+/// `census_checked: false` and the reason. A row whose nodes did compare
+/// carries neither key. Readers decide what an unchecked row is worth:
+/// ci-hub never reads one as green evidence, and the tree cache and the
+/// selective baseline never reuse one (validate_history::pass_row_qualifies).
+fn add_census_marker(record: &mut serde_json::Value, reason: Option<String>) {
+    if let Some(reason) = reason {
+        record["census_checked"] = serde_json::json!(false);
+        record["census_not_checked_reason"] = serde_json::json!(reason);
+    }
 }
 
 /// Construct the refusal for an unadmitted product run. Production supplies
@@ -13575,10 +14424,11 @@ fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
     let committed = committed_rust_script_producer(root)?;
     if committed.timeout != RUST_SCRIPT_PRODUCER_WALL_SECONDS
         || committed.cpu_timeout != 7200
-        // Width 16 and the 7/10-GiB memory pair since 2026-10-16, when the
-        // producer began overlapping its release build with the other phases.
-        || committed.hint.rss_baseline_bytes != Some(7 * 1024 * 1024 * 1024)
-        || committed.hint.hard_mem_max_bytes != Some(10 * 1024 * 1024 * 1024)
+        // Width 16 since 2026-10-16, when the producer began overlapping its
+        // release build with the other phases. The 9/13-GiB memory pair since
+        // 2026-11-22: cold fresh-clone builds peaked at 8.2 and 8.3 GiB.
+        || committed.hint.rss_baseline_bytes != Some(9 * 1024 * 1024 * 1024)
+        || committed.hint.hard_mem_max_bytes != Some(13 * 1024 * 1024 * 1024)
         || committed.hint.preferred_inner_jobs != Some(16)
     {
         return Err(format!(
@@ -14837,9 +15687,9 @@ mod locked_cargo_tests {
     /// A stale committed Cargo.lock fails the first Cargo call of every
     /// focused plan: `--only LANE NODE` for each node that makes a
     /// lock-resolving Cargo call, in each lane that carries the node, on and
-    /// off the record. Off the record the plan's only preflight is
-    /// pre.submodules, the pin and pre.cargo_lock, so the node's own call runs
-    /// beside the lock gate. Each first call, run as written against a stale
+    /// off the record (one plan since dh-kra8l9; both modes stay checked, so a
+    /// plan that came to differ by record mode would still be covered). Each
+    /// first call, run as written against a stale
     /// lock file in a fixture, must refuse it and leave it byte-identical, and
     /// its mutant without --locked must rewrite it.
     #[test]
@@ -14875,11 +15725,27 @@ mod locked_cargo_tests {
                 }
             }
         }
+        // dh-kra8l9: every focused plan holds its whole dependency closure and
+        // the whole preflight, on and off the record, so lint.clippy waits on
+        // gate.manifest and its locked manifest-plan build, and its own Cargo
+        // call is never the first one (this guard used to pin it as first off
+        // the record). The guard is now that the
+        // plan still contributes first calls, and that lint.clippy's is not
+        // among them, each first call checked against the stale lock below.
+        let lint_plan = "--allow-local-off-the-record-run --only full lint.clippy: ";
         assert!(
-            first.values().flatten().any(|plan| {
-                plan == "--allow-local-off-the-record-run --only full lint.clippy: lint.clippy"
-            }),
-            "off the record, lint.clippy's own Cargo call no longer runs first: {first:?}"
+            first
+                .values()
+                .flatten()
+                .any(|plan| plan.starts_with(lint_plan)),
+            "off the record, --only full lint.clippy contributes no first Cargo call: {first:?}"
+        );
+        assert!(
+            !first
+                .values()
+                .flatten()
+                .any(|plan| plan == &format!("{lint_plan}lint.clippy")),
+            "off the record, lint.clippy's own Cargo call runs before its closure's: {first:?}"
         );
         let scratch = tempfile::tempdir().unwrap();
         locked_cargo::check_stale_lock_twins(&first, scratch.path()).unwrap();
@@ -14915,13 +15781,49 @@ mod case_selection_tests {
     }
 
     #[test]
-    fn filter_expr_uses_binary_and_exact_test_name() {
+    fn filter_expr_matches_each_result_id_form_exactly() {
+        // A library unit test's result ID is <package>$<test>: its package
+        // and kind(lib). The library's binary name (hermit_detcore) differs
+        // from its package.
         assert_eq!(
-            case_filter_expr("hermit-run::cli$cli::some_test").as_deref(),
-            Some("(binary(cli) & test(=cli::some_test))")
+            case_filter_expr("hermit-detcore$scheduler::tests::picks").as_deref(),
+            Some("(package(=hermit-detcore) & kind(lib) & test(=scheduler::tests::picks))")
         );
-        assert_eq!(case_filter_expr("no-dollar-sign"), None);
-        assert_eq!(case_filter_expr("a::b$"), None);
+        // Every other kind's is <package>::<binary name>$<test>: an
+        // integration test, a bin whose binary name is its library's too
+        // (so the library is excluded), and a proc-macro, whose nextest
+        // binary ID is the bare package.
+        for (case, expr) in [
+            (
+                "hermit-run::cli$cli::some_test",
+                "(package(=hermit-run) & binary(=cli) & not kind(lib) & test(=cli::some_test))",
+            ),
+            (
+                "hermit-run::hermit$tests::parses",
+                "(package(=hermit-run) & binary(=hermit) & not kind(lib) & test(=tests::parses))",
+            ),
+            (
+                "hermit-macros::hermit_macros$expands",
+                "(package(=hermit-macros) & binary(=hermit_macros) & not kind(lib) & \
+                 test(=expands))",
+            ),
+        ] {
+            assert_eq!(case_filter_expr(case).as_deref(), Some(expr), "{case}");
+        }
+        for case in [
+            "no-dollar-sign",
+            "a::b$",
+            "$name",
+            "::cli$name",
+            "pkg::$name",
+            "pkg::a::b$name",
+            // nextest's binary ID for a bin is not a result ID.
+            "pkg::bin/x$name",
+            "pkg$two words",
+            "pkg@stress-1$name",
+        ] {
+            assert_eq!(case_filter_expr(case), None, "{case}");
+        }
     }
 
     #[test]
@@ -14996,7 +15898,12 @@ mod case_selection_tests {
     }
 
     #[test]
-    fn case_plan_prunes_the_verdict_gate_but_keeps_producers() {
+    fn case_plan_takes_the_whole_dependency_closure_gate_included() {
+        // dh-kra8l9: a --tests plan is the case node plus the preflight with
+        // their whole dependency closure in the portable lane, compared
+        // exactly. This test used to assert that gate.manifest was pruned by
+        // name; it is a declared dependency of test.cli, so it is now
+        // required, and the expectation is that superset.
         let args = parse_argv(&[
             "--tests".to_string(),
             "test.cli::hermit-run::cli$some_test".to_string(),
@@ -15008,7 +15915,30 @@ mod case_selection_tests {
             plan.cfg.steps.iter().map(|step| step.tag()).collect();
         assert!(tags.contains("test.cli"), "{tags:?}");
         assert!(tags.contains("build.rust_scripts"), "{tags:?}");
-        assert!(!tags.contains("gate.manifest"), "{tags:?}");
+        assert!(tags.contains("gate.manifest"), "{tags:?}");
+        let committed = validate_plan::validation_config(&root).unwrap();
+        let portable = dagrun::select_steps_by_labels(&committed, &["portable".into()]).unwrap();
+        let expected = dagrun::select_steps_by_tags(
+            &portable,
+            &[
+                "test.cli",
+                "pre.submodules",
+                PIN_GATE_TAG,
+                CARGO_LOCK_GATE_TAG,
+                RUST_SCRIPT_PRODUCER_TAG,
+                validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+            ]
+            .map(str::to_string),
+            false,
+        )
+        .unwrap()
+        .steps
+        .iter()
+        .map(Step::tag)
+        .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(tags, expected);
+        let violations = plan_closure_violations(&committed, &plan.cfg);
+        assert!(violations.is_empty(), "{violations:#?}");
     }
 
     #[test]
@@ -15039,22 +15969,81 @@ mod case_selection_tests {
 
     #[test]
     fn case_plan_off_record_portable_case_is_not_refused() {
-        // The off-record preflight drops the producer nodes; a
-        // portable case whose only unplanned committed deps sit
-        // behind the pruned gate.manifest must still plan (it runs
-        // today). The dependency walk prunes the gate.manifest edge
-        // instead of counting the gate's own producers as missing.
+        // dh-kra8l9: a portable case plans off the record exactly as on it;
+        // the off-record flag skips only the ledger row and the receipt. This
+        // used to check only that test.cli planned, under a narrower
+        // off-record preflight whose dependency walk pruned gate.manifest. It
+        // now also requires gate.manifest and its producers, and the same plan
+        // bytes as on the record.
+        let root = test_source_root();
+        let plan_for = |off_record: bool| {
+            let mut argv = vec![
+                "--tests".to_string(),
+                "test.cli::hermit-run::cli$some_test".to_string(),
+                "--no-label-pr".to_string(),
+            ];
+            if off_record {
+                argv.insert(0, "--allow-local-off-the-record-run".to_string());
+            }
+            build_plan(&root, &parse_argv(&argv).unwrap(), &std::env::temp_dir()).unwrap()
+        };
+        let off = plan_for(true);
+        let tags: std::collections::BTreeSet<String> =
+            off.cfg.steps.iter().map(|step| step.tag()).collect();
+        for required in [
+            "test.cli",
+            "gate.manifest",
+            "setup.manifest_plan",
+            "build.rust_scripts",
+        ] {
+            assert!(tags.contains(required), "lacks {required}: {tags:?}");
+        }
+        assert_eq!(
+            dag_to_json(&off.cfg),
+            dag_to_json(&plan_for(false).cfg),
+            "--tests plans differently on and off the record"
+        );
+    }
+
+    #[test]
+    fn case_plan_keeps_a_non_case_node_the_portable_lane_lacks() {
+        // dh-kra8l9 review: --tests held back every tag that the committed
+        // DAG holds and the portable lane does not, not only case nodes, so a
+        // preflight node that lost its portable label was silently left out
+        // of the plan. Plant exactly that: pre.cargo_lock keeps its node but
+        // loses the label. Only case nodes outside the lane are held back
+        // (and refused by name); this non-case node must stay selected, from
+        // the committed DAG, as --only selects it.
+        let root = test_source_root();
+        let (mut committed, path, bytes) = load_committed_validation_dag(&root).unwrap();
+        committed
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == CARGO_LOCK_GATE_TAG)
+            .expect("the committed DAG holds pre.cargo_lock")
+            .labels
+            .retain(|label| label != "portable");
+        // No portable node depends on it, so the planted portable lane really
+        // lacks it; otherwise the lane's closure would bring it back.
+        let portable = dagrun::select_steps_by_labels(&committed, &["portable".into()]).unwrap();
+        assert!(
+            !portable
+                .steps
+                .iter()
+                .any(|step| step.tag() == CARGO_LOCK_GATE_TAG),
+            "the planted portable lane still holds {CARGO_LOCK_GATE_TAG}"
+        );
         let args = parse_argv(&[
-            "--allow-local-off-the-record-run".to_string(),
             "--tests".to_string(),
             "test.cli::hermit-run::cli$some_test".to_string(),
         ])
         .unwrap();
-        let root = test_source_root();
-        let plan = build_plan(&root, &args, &std::env::temp_dir()).unwrap();
-        let tags: std::collections::BTreeSet<String> =
-            plan.cfg.steps.iter().map(|step| step.tag()).collect();
+        let plan = build_plan_from(&root, &args, (committed.clone(), path, bytes)).unwrap();
+        let tags: BTreeSet<String> = plan.cfg.steps.iter().map(Step::tag).collect();
+        assert!(tags.contains(CARGO_LOCK_GATE_TAG), "dropped: {tags:?}");
         assert!(tags.contains("test.cli"), "{tags:?}");
+        let violations = plan_closure_violations(&committed, &plan.cfg);
+        assert!(violations.is_empty(), "{violations:#?}");
     }
 
     #[test]
@@ -15077,12 +16066,54 @@ mod case_selection_tests {
         ));
     }
 
+    /// Every planned step keeps every committed edge, and each of its
+    /// dependencies (plain and artifact) is planned: the plan is the closure
+    /// of what it holds, with nothing dropped. Returns each violation.
+    fn plan_closure_violations(committed: &DagConfig, cfg: &DagConfig) -> Vec<String> {
+        let committed_by_tag: BTreeMap<String, &Step> = committed
+            .steps
+            .iter()
+            .map(|step| (step.tag(), step))
+            .collect();
+        let planned: BTreeSet<String> = cfg.steps.iter().map(Step::tag).collect();
+        let mut violations = Vec::new();
+        for step in &cfg.steps {
+            let tag = step.tag();
+            let Some(source) = committed_by_tag.get(&tag) else {
+                violations.push(format!("{tag} is not a committed node"));
+                continue;
+            };
+            let edges = |step: &Step| {
+                step.dependency_tags()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            };
+            if edges(step) != edges(source) {
+                violations.push(format!(
+                    "{tag} lost committed edges: planned {:?}, committed {:?}",
+                    edges(step),
+                    edges(source)
+                ));
+            }
+            for dependency in step.dependency_tags() {
+                if !planned.contains(dependency) {
+                    violations.push(format!("{tag} needs {dependency}, which is not planned"));
+                }
+            }
+        }
+        violations
+    }
+
     #[test]
     fn only_plan_accepts_nodes_from_other_lanes_but_not_unknown_tags() {
         // A rerun of a finished run's failed set names nodes from every
         // lane that run executed. privileged-pmu.preemption is not in the
-        // portable lane subset; the plan must still build (committed-DAG
-        // fallback), while a tag no DAG knows still refuses by name.
+        // portable lane subset; the plan must still build, from the
+        // committed DAG, the complete graph that holds it, while a tag no DAG
+        // knows still refuses by name. dh-kra8l9 strengthened this: each named
+        // node's WHOLE closure (dagrun's transitive_deps over the committed
+        // DAG) is planned with every edge intact, where the dependencies used
+        // to be dropped.
         let root = test_source_root();
         let args = parse_argv(&[
             "--only".to_string(),
@@ -15095,6 +16126,21 @@ mod case_selection_tests {
             plan.cfg.steps.iter().map(|step| step.tag()).collect();
         assert!(tags.contains("test.cli"), "{tags:?}");
         assert!(tags.contains("privileged-pmu.preemption"), "{tags:?}");
+        let committed = validate_plan::validation_config(&root).unwrap();
+        let closure = dagrun::transitive_deps(&committed.steps);
+        for node in ["test.cli", "privileged-pmu.preemption"] {
+            let missing = closure[node]
+                .iter()
+                .filter(|dependency| !tags.contains(*dependency))
+                .collect::<Vec<_>>();
+            assert!(missing.is_empty(), "{node} lacks {missing:?}");
+            assert!(
+                !closure[node].is_empty(),
+                "{node} has no dependency to check"
+            );
+        }
+        let violations = plan_closure_violations(&committed, &plan.cfg);
+        assert!(violations.is_empty(), "{violations:#?}");
 
         let unknown = parse_argv(&[
             "--only".to_string(),
@@ -15107,6 +16153,278 @@ mod case_selection_tests {
             Err(error) => error,
         };
         assert!(error.contains("no.such_node"), "{error}");
+    }
+
+    #[test]
+    fn only_selects_every_node_of_every_lane_with_its_whole_dependency_closure() {
+        // dh-kra8l9: for EVERY node of EVERY lane, `validate --only LANE NODE`
+        // plans exactly the same graph on and off the record but for the
+        // driver's self-test leaf on the record (check_on_record_exception;
+        // otherwise the off-record flag skips only the ledger row and the
+        // receipt), and that plan is exactly the node with its whole closure
+        // over plain and artifact edges plus the closure of the lane's
+        // preflight list, plus, on the record, that leaf with its closure,
+        // every committed edge intact. The oracle is dagrun's own transitive_deps over the
+        // committed DAG. The selection used to drop every edge to an
+        // unselected node, so F3's RUN 3744 ran e2e.manifest_system_utils
+        // without build.e2e_artifact_in_pinned_root and failed after its
+        // setup; off the record it also planned a narrower preflight.
+        let root = test_source_root();
+        let committed = validate_plan::validation_config(&root).unwrap();
+        let closure = dagrun::transitive_deps(&committed.steps);
+        let labels: BTreeSet<String> = committed
+            .steps
+            .iter()
+            .flat_map(|step| step.labels.iter().cloned())
+            .collect();
+        // build_plan parses the 2.7 MB committed DAG on every call; the 1,040
+        // plans below share one parse through build_plan_from.
+        let loaded = load_committed_validation_dag(&root).unwrap();
+        let plan_for = |lane: &str, node: &str, off_record: bool| -> Result<Plan, String> {
+            let mut argv = vec![
+                "--only".to_string(),
+                lane.to_string(),
+                node.to_string(),
+                "--no-label-pr".to_string(),
+            ];
+            if off_record {
+                argv.insert(0, ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.to_string());
+            }
+            let args = parse_argv(&argv).map_err(|code| format!("parser exited {code}"))?;
+            build_plan_from(&root, &args, loaded.clone())
+        };
+        let mut checked = 0usize;
+        let mut expected = 0usize;
+        let mut checked_nodes = BTreeSet::new();
+        // Each problem is filed under its selection's label.
+        let mut failures: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for lane in &labels {
+            let lane_cfg =
+                dagrun::select_steps_by_labels(&committed, std::slice::from_ref(lane)).unwrap();
+            let mut plans = Vec::new();
+            for node in lane_cfg.steps.iter().map(Step::tag) {
+                expected += 1;
+                let label = format!("--only {lane} {node}");
+                let (on, off) = match (plan_for(lane, &node, false), plan_for(lane, &node, true)) {
+                    (Ok(on), Ok(off)) => (on, off),
+                    (on, off) => {
+                        let problems = failures.entry(label).or_default();
+                        for (mode, result) in [("on", on), ("off", off)] {
+                            if let Err(error) = result {
+                                problems.push(format!("refused {mode} the record: {error}"));
+                            }
+                        }
+                        continue;
+                    }
+                };
+                let planned: BTreeSet<String> = on.cfg.steps.iter().map(Step::tag).collect();
+                let problems = failures.entry(label.clone()).or_default();
+                // The one named exception: on the record the plan also runs
+                // the driver's self-test leaf (dh-2w6af2). Nothing else may
+                // differ, in either direction.
+                // Only a request that names the leaf may hold it off the record.
+                let request_holds_leaf =
+                    on_record_self_test_leaf(lane, &lane_cfg).as_deref() == Some(node.as_str());
+                if let Err(error) = check_on_record_exception(
+                    lane,
+                    &lane_cfg,
+                    &on.cfg,
+                    &off.cfg,
+                    request_holds_leaf,
+                ) {
+                    problems.push(format!("plans differently on and off the record: {error}"));
+                }
+                if !planned.contains(&node) {
+                    problems.push("the node itself is not planned".to_string());
+                }
+                for dependency in &closure[&node] {
+                    if !planned.contains(dependency) {
+                        problems.push(format!("lacks {dependency}"));
+                    }
+                }
+                problems.extend(plan_closure_violations(&committed, &on.cfg));
+                checked += 1;
+                checked_nodes.insert(node.clone());
+                plans.push((label, node, planned));
+            }
+            // Exactness: a plan is exactly the node with its own closure plus
+            // the closure of the lane's preflight list, both from the oracle
+            // over the committed DAG, so no node over-selects or misses a
+            // preflight node. This bound used to be the intersection of the
+            // lane's own plans, which a node wrongly added to every plan (by
+            // a mapping, say) would have joined. A wrong entry in the
+            // preflight list itself is outside what this can see. The plans
+            // checked here are the on-record ones, so the bound also holds
+            // the driver's self-test leaf with its closure where the lane
+            // carries it: the one named exception, required, not tolerated.
+            let mut preflight = focused_preflight(lane);
+            preflight.extend(on_record_self_test_leaf(lane, &lane_cfg));
+            let mut preflight_closure: BTreeSet<String> = BTreeSet::new();
+            for tag in &preflight {
+                match closure.get(tag) {
+                    Some(dependencies) => {
+                        preflight_closure.insert(tag.clone());
+                        preflight_closure.extend(dependencies.iter().cloned());
+                    }
+                    None => failures
+                        .entry(format!("--only {lane} (preflight)"))
+                        .or_default()
+                        .push(format!("the committed DAG lacks preflight node {tag}")),
+                }
+            }
+            for (label, node, planned) in plans {
+                let mut exact = preflight_closure.clone();
+                exact.insert(node.clone());
+                exact.extend(closure[&node].iter().cloned());
+                let extra: Vec<&String> = planned.difference(&exact).collect();
+                if !extra.is_empty() {
+                    failures.entry(label.clone()).or_default().push(format!(
+                        "plans node(s) outside its closure and the lane's preflight closure: {extra:?}"
+                    ));
+                }
+                let missing: Vec<&String> = preflight_closure.difference(&planned).collect();
+                if !missing.is_empty() {
+                    failures
+                        .entry(label)
+                        .or_default()
+                        .push(format!("lacks preflight closure node(s): {missing:?}"));
+                }
+            }
+        }
+        failures.retain(|_, problems| !problems.is_empty());
+        let problems: Vec<String> = failures
+            .iter()
+            .flat_map(|(label, problems)| {
+                problems
+                    .iter()
+                    .map(move |problem| format!("{label}: {problem}"))
+            })
+            .collect();
+        assert!(
+            failures.is_empty(),
+            "{} of {expected} selections failed, with {} problem(s); the first 20: {:#?}",
+            failures.len(),
+            problems.len(),
+            problems.iter().take(20).collect::<Vec<_>>()
+        );
+        assert!(checked > 0, "no lane node was checked");
+        assert_eq!(checked, expected);
+        // Every node that declares artifact_deps was checked, so each one's
+        // producers are planned with it.
+        let artifact_consumers: BTreeSet<String> = committed
+            .steps
+            .iter()
+            .filter(|step| !step.artifact_deps.is_empty())
+            .map(Step::tag)
+            .collect();
+        assert!(
+            !artifact_consumers.is_empty(),
+            "no node declares artifact_deps"
+        );
+        let unchecked: Vec<&String> = artifact_consumers.difference(&checked_nodes).collect();
+        assert!(
+            unchecked.is_empty(),
+            "artifact consumer(s) in no lane, never checked: {unchecked:?}"
+        );
+    }
+
+    #[test]
+    fn only_plans_run_3744_with_its_e2e_artifact_producer() {
+        // F3's RUN 3744 selected `--only portable e2e.manifest_system_utils`
+        // and ran a plan without build.e2e_artifact_in_pinned_root, so the
+        // node failed on a missing /src/target/ci/hermit-e2e-artifact.path.
+        for off_record in [false, true] {
+            let mut argv = vec![
+                "--only".to_string(),
+                "portable".to_string(),
+                "e2e.manifest_system_utils".to_string(),
+            ];
+            if off_record {
+                argv.insert(0, ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.to_string());
+            }
+            let root = test_source_root();
+            let plan =
+                build_plan(&root, &parse_argv(&argv).unwrap(), &std::env::temp_dir()).unwrap();
+            let tags: BTreeSet<String> = plan.cfg.steps.iter().map(Step::tag).collect();
+            for producer in [
+                "build.e2e_artifact_in_pinned_root",
+                "build.workspace_compile_in_pinned_root",
+                "build.liteinst_runtime_in_pinned_root",
+                "build.manifest_guests_in_pinned_root",
+                "setup.pinned_root_fetch",
+            ] {
+                assert!(
+                    tags.contains(producer),
+                    "{argv:?} lacks {producer}: {tags:?}"
+                );
+            }
+            let committed = validate_plan::validation_config(&root).unwrap();
+            let violations = plan_closure_violations(&committed, &plan.cfg);
+            assert!(violations.is_empty(), "{argv:?}: {violations:#?}");
+        }
+    }
+
+    #[test]
+    fn a_focused_closure_refuses_a_missing_or_retired_dependency_by_name() {
+        let committed = validate_plan::validation_config(&test_source_root()).unwrap();
+        let template = &committed.steps[0];
+        let step = |tag: &str, deps: &[&str], labels: &[&str]| {
+            let (group, job) = tag.split_once('.').unwrap();
+            let mut step = template.clone();
+            step.group = group.into();
+            step.job = job.into();
+            step.deps = deps.iter().map(|dep| dep.to_string()).collect();
+            step.artifact_deps = Vec::new();
+            step.labels = labels.iter().map(|label| label.to_string()).collect();
+            step
+        };
+        // A dependency the graph does not hold refuses, naming who needs it.
+        let graph = DagConfig {
+            steps: vec![
+                step("test.consumer", &["build.producer"], &["lane"]),
+                step("build.producer", &["build.absent"], &[]),
+            ],
+            ..Default::default()
+        };
+        let tags = BTreeSet::from(["test.consumer".to_string()]);
+        let error = select_focused_closure(&graph, "lane lane", &graph, &tags).unwrap_err();
+        assert!(
+            error.contains("build.producer needs build.absent"),
+            "{error}"
+        );
+        assert!(error.contains("lane lane"), "{error}");
+        // A retired node in the closure (a committed node no label's
+        // selection runs) refuses by name, through refuse_retired_nodes.
+        let mut committed_with_retired = graph.clone();
+        committed_with_retired.steps = vec![
+            step("test.consumer", &["build.producer"], &[]),
+            step("build.producer", &[], &[]),
+            step("test.other", &[], &["lane"]),
+        ];
+        let error = select_focused_closure(
+            &committed_with_retired,
+            "the committed DAG",
+            &committed_with_retired,
+            &tags,
+        )
+        .unwrap_err();
+        assert!(error.contains("retired node(s)"), "{error}");
+        assert!(error.contains("test.consumer"), "{error}");
+        // A complete graph selects the closure, every edge intact.
+        let complete = DagConfig {
+            steps: vec![
+                step("test.consumer", &["build.producer"], &["lane"]),
+                step("build.producer", &[], &[]),
+                step("test.unrelated", &[], &["lane"]),
+            ],
+            ..Default::default()
+        };
+        let selected = select_focused_closure(&complete, "lane lane", &complete, &tags).unwrap();
+        assert_eq!(
+            selected.steps.iter().map(Step::tag).collect::<Vec<_>>(),
+            ["test.consumer", "build.producer"]
+        );
+        assert_eq!(selected.steps[0].deps, ["build.producer"]);
     }
 
     #[test]
@@ -15126,26 +16444,48 @@ mod case_selection_tests {
         assert!(error.contains("e2e.manifest_compat"), "{error}");
         assert!(error.contains("cannot select cases"), "{error}");
 
-        let cases = parse_case_ids(["test.cli::hermit-run::cli$some_test"].into_iter()).unwrap();
+        let cases = parse_case_ids(
+            [
+                "test.cli::hermit-run::cli$some_test",
+                "test.cli::hermit-run::cli$no_such_test",
+            ]
+            .into_iter(),
+        )
+        .unwrap();
         inject_case_filters(&mut steps, &cases).unwrap();
         let cli = steps.iter().find(|s| s.tag() == "test.cli").unwrap();
         assert_eq!(
-            cli.env
-                .get("HERMIT_NEXTEST_FILTER_EXPR")
-                .map(String::as_str),
-            Some("(binary(cli) & test(=some_test))")
+            cli.env.get(NEXTEST_FILTER_EXPR_ENV).map(String::as_str),
+            Some(
+                "(package(=hermit-run) & binary(=cli) & not kind(lib) & test(=some_test)) | \
+                 (package(=hermit-run) & binary(=cli) & not kind(lib) & test(=no_such_test))"
+            )
         );
+        // The counted wrapper checks these names against the node's listing
+        // and fails the node naming any it does not list
+        // (ci/run-nextest-counted.sh, check_selected_cases_listed).
         assert_eq!(
-            cli.env.get("NEXTEST_EXPECTED_EXECUTED").map(String::as_str),
-            Some("1")
+            cli.env.get(NEXTEST_SELECTED_CASES_ENV).map(String::as_str),
+            Some("hermit-run::cli$some_test hermit-run::cli$no_such_test")
         );
+        // The wrapper derives the executed count from its own listing; a
+        // count injected here would be ignored, so none is.
+        assert!(!cli.env.contains_key("NEXTEST_EXPECTED_EXECUTED"));
+        // A node with no named case gets neither variable.
+        let other = steps
+            .iter()
+            .find(|s| s.tag() == "test.hermit_unit")
+            .unwrap();
+        assert!(!other.env.contains_key(NEXTEST_FILTER_EXPR_ENV));
+        assert!(!other.env.contains_key(NEXTEST_SELECTED_CASES_ENV));
     }
 }
 
 /// Parse `node::case` test-case IDs into node tag -> case IDs. A case ID is
 /// the runner's result ID as printed in run records (`test_cases` vector):
-/// `<crate>::<binary>$<test name>` for nextest producers. Node tags contain
-/// no `::`, so the first `::` is the separator.
+/// for nextest producers `<package>$<test name>` (a library unit test) or
+/// `<package>::<binary name>$<test name>`. Node tags contain no `::`, so
+/// the first `::` is the separator.
 fn parse_case_ids<'a>(
     entries: impl Iterator<Item = &'a str>,
 ) -> Result<std::collections::BTreeMap<String, Vec<String>>, String> {
@@ -15181,23 +16521,46 @@ fn parse_case_ids<'a>(
     Ok(cases)
 }
 
-/// The nextest filter expression selecting exactly one recorded case ID
-/// (`<crate>::<binary>$<test name>`), or None if the ID is not nextest-shaped.
+/// The nextest filter expression selecting exactly one recorded case ID, or
+/// None if the ID is not nextest-shaped. A case ID is the run record's
+/// result ID (displayed_test_id in ci/manifest-plan/src/nextest_cpu.rs):
+/// `<package>$<test name>` for a library's unit tests and
+/// `<package>::<binary name>$<test name>` for every other target kind. The
+/// part before `$` is not nextest's binary ID (a bin's is
+/// `<package>::bin/<name>`, a proc-macro's the bare package), so the
+/// expression matches the parts the ID names: the package and kind(lib) for
+/// the library form; the package, binary(=<name>) and not kind(lib) for the
+/// rest. A library and a bin may share a binary name (hermit-run's are both
+/// `hermit`), so the second form must exclude the library. A package or
+/// binary name nextest does not know is refused by nextest's filter parser,
+/// which names it, before anything is listed.
 fn case_filter_expr(case: &str) -> Option<String> {
-    let (prefix, name) = case.split_once('$')?;
-    let binary = prefix.rsplit("::").next()?;
-    if binary.is_empty()
+    let (binary, name) = case.split_once('$')?;
+    let (package, binary_name) = match binary.split_once("::") {
+        Some((package, binary_name)) => (package, Some(binary_name)),
+        None => (binary, None),
+    };
+    let target_name = |part: &str| {
+        !part.is_empty()
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    };
+    if !target_name(package)
+        || binary_name.is_some_and(|binary_name| !target_name(binary_name))
         || name.is_empty()
-        || !binary
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
         || !name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':' | '$'))
     {
         return None;
     }
-    Some(format!("(binary({binary}) & test(={name}))"))
+    Some(match binary_name {
+        None => format!("(package(={package}) & kind(lib) & test(={name}))"),
+        Some(binary_name) => format!(
+            "(package(={package}) & binary(={binary_name}) & not kind(lib) & test(={name}))"
+        ),
+    })
 }
 
 /// Inject the case filter for every selected node. Only nextest nodes can
@@ -15225,22 +16588,26 @@ fn inject_case_filters(
             let Some(expr) = case_filter_expr(case) else {
                 return Err(format!(
                     "node {} cannot select case {case:?}: it is not a nextest result ID \
-                     (<crate>::<binary>$<test name>); select case IDs from a run record's \
-                     test_cases vector",
+                     (<package>$<test name> for a library unit test, \
+                     <package>::<binary name>$<test name> otherwise); select case IDs \
+                     from a run record's test_cases vector",
                     step.tag()
                 ));
             };
             exprs.push(expr);
         }
+        // The counted wrapper ANDs this with the node's own filtersets
+        // (nextest ORs separate -E options), so the selection only narrows
+        // the node's population.
         step.env
-            .insert("HERMIT_NEXTEST_FILTER_EXPR".to_string(), exprs.join(" | "));
-        // The counted wrapper refuses when the executed count differs from
-        // the expectation, so a case that does not exist in this node fails
-        // loudly instead of silently passing with zero tests run.
-        step.env.insert(
-            "NEXTEST_EXPECTED_EXECUTED".to_string(),
-            node_cases.len().to_string(),
-        );
+            .insert(NEXTEST_FILTER_EXPR_ENV.to_string(), exprs.join(" | "));
+        // The counted wrapper checks every named case against the node's
+        // `nextest list` before any test runs and fails the node, naming
+        // each case it does not list, so a case that does not exist here,
+        // or that the node's own filter excludes, can never pass unrun.
+        // (Its executed == listed rule then makes every named case run.)
+        step.env
+            .insert(NEXTEST_SELECTED_CASES_ENV.to_string(), node_cases.join(" "));
     }
     Ok(())
 }
@@ -15779,46 +17146,14 @@ fn select_from_committed_decision(
     }
 }
 
-/// Add only the canonical manifest executable preparation needed by focused
-/// commands. Ordinary build prerequisites remain outside --only; every ID and
-/// dependency retained here is read from the committed source without rewriting.
-fn retain_focused_manifest_producers(cfg: &DagConfig, tags: &mut BTreeSet<String>) {
+/// A requested guest build resolves to its pinned-root twin. Since dh-63c2n3
+/// the host copy is not in the local lanes at all (only the hosted lanes keep
+/// it), so the public name `build.manifest_guests` selects the twin in its
+/// place; a lane that still has the host copy keeps it and gains the twin
+/// beside it. This maps names only: what a focused selection runs besides
+/// the requested nodes is their dependency closure ([`select_focused_closure`]).
+fn map_focused_guest_builds(cfg: &DagConfig, tags: &mut BTreeSet<String>) {
     let available = cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
-    // A node that requires the prepared-nextest record consumes
-    // target/ci/nextest-binaries/current.json from disk. That file is written
-    // only by build.workspace_in_pinned_root, reached through
-    // build.e2e_artifact_in_pinned_root. Dropping that declared chain leaves
-    // the node to fail in seconds with a missing-file error, so retain the
-    // full transitive build closure of any such consumer.
-    let consumes_prepared_nextest = cfg
-        .steps
-        .iter()
-        .filter(|step| tags.contains(&step.tag()))
-        .any(|step| step.cmd.contains("HERMIT_PREPARED_NEXTEST_REQUIRED"));
-    if consumes_prepared_nextest {
-        let by_tag: std::collections::BTreeMap<String, &Step> =
-            cfg.steps.iter().map(|step| (step.tag(), step)).collect();
-        let mut stack: Vec<String> = tags.iter().cloned().collect();
-        let mut seen: BTreeSet<String> = BTreeSet::new();
-        while let Some(tag) = stack.pop() {
-            if !seen.insert(tag.clone()) {
-                continue;
-            }
-            if let Some(step) = by_tag.get(&tag) {
-                for dep in &step.deps {
-                    if dep.starts_with("build.") && available.contains(dep) {
-                        tags.insert(dep.clone());
-                        stack.push(dep.clone());
-                    }
-                }
-            }
-        }
-    }
-    // A requested guest build resolves to its pinned-root twin. Since
-    // dh-63c2n3 the host copy is not in the local lanes at all (only the
-    // hosted lanes keep it), so the public name `build.manifest_guests`
-    // selects the twin in its place; a lane that still has the host copy
-    // keeps it and gains the twin beside it.
     let requested_guest_builds = tags
         .iter()
         .filter(|tag| {
@@ -15837,51 +17172,6 @@ fn retain_focused_manifest_producers(cfg: &DagConfig, tags: &mut BTreeSet<String
             tags.remove(&host);
         }
         tags.insert(twin);
-    }
-    let required_producer = |tag: &str| {
-        let tag = tag.strip_prefix("quick-super-").unwrap_or(tag);
-        let tag = tag.strip_suffix("_on_host").unwrap_or(tag);
-        matches!(
-            tag,
-            "setup.manifest_plan"
-                | "setup.manifest_plan_in_pinned_root"
-                | "build.rust_scripts"
-                | "build.rust_scripts_in_pinned_root"
-                | "setup.pinned_root_fetch"
-                // The strict compatibility corpus reads fixtures this node
-                // writes under the run's own state directory, so a focused
-                // run of e2e.manifest_compat must produce them itself.
-                | "compatprep.fixtures"
-        )
-    };
-    loop {
-        let mut additions = cfg
-            .steps
-            .iter()
-            .filter(|step| tags.contains(&step.tag()))
-            .flat_map(|step| step.deps.iter())
-            .filter(|dependency| required_producer(dependency) && !tags.contains(*dependency))
-            .cloned()
-            .collect::<Vec<_>>();
-        // The host manifest-plan build no longer waits for the rust-script
-        // producer, but every node that waits for it also runs rust-scripts
-        // (gate.manifest, the E2E buckets), so a focused run keeps the two
-        // producers together, as the dependency once did.
-        for tag in tags.iter() {
-            if let Some(prefix) = tag.strip_suffix(validate_plan::MANIFEST_PLAN_PRODUCER_TAG) {
-                let scripts = format!("{prefix}{RUST_SCRIPT_PRODUCER_TAG}");
-                if (prefix.is_empty() || prefix == "quick-super-")
-                    && available.contains(&scripts)
-                    && !tags.contains(&scripts)
-                {
-                    additions.push(scripts);
-                }
-            }
-        }
-        if additions.is_empty() {
-            break;
-        }
-        tags.extend(additions);
     }
 }
 
@@ -15903,28 +17193,245 @@ fn keep_ancestor_baseline(
     })
 }
 
-/// Select focused tags (with dependency closure) from the lane subset,
-/// falling back to the full committed DAG when the lane subset does not
-/// know a requested tag. A rerun of a finished run's failed set names
-/// nodes from every lane that run executed (portable, privileged,
-/// buck-e2e); refusing such a node because the focused lane subset omits
-/// it makes a one-command rerun impossible. Tags unknown to the
-/// committed DAG itself still refuse, naming them.
-fn select_focused_steps(
+/// The lane's `selftest.validate_rs` tag, when the lane graph carries one.
+fn validate_rs_self_test_tag(lane: &str, lane_cfg: &DagConfig) -> Option<String> {
+    let tag = if matches!(lane, "quick" | "super") {
+        "quick-super-selftest.validate_rs"
+    } else {
+        "selftest.validate_rs"
+    };
+    lane_cfg
+        .steps
+        .iter()
+        .any(|step| step.tag() == tag)
+        .then(|| tag.to_string())
+}
+
+/// What a focused closure does with `selftest.validate_rs`. Pure so every
+/// combination is unit-testable without a repository or a plan.
+#[derive(Debug, PartialEq, Eq)]
+enum ValidateRsSelfTestAction {
+    /// Insert the node's tag into the focused selection.
+    Add,
+    /// Do not insert it; print this named reason instead of passing
+    /// silently.
+    NotRun(&'static str),
+}
+
+/// The one rule for the validation driver's own self-test in focused
+/// closures: every on-record focused closure in a lane that carries the
+/// node includes it, because it is a leaf no dependency closure reaches,
+/// and a targeted land gate that changes the driver must not skip the
+/// driver's own brackets. The exclusions are the run forms that publish
+/// no evidence or repeat a base run's work: case-selected (`--tests`)
+/// runs, off-record local runs, and ci-hub composition reruns (the base
+/// run at the same commit already ran the node; a flaky rerun failure
+/// would refuse an otherwise-green composition). Lanes without the node
+/// (privileged, hosted-privileged) name the hole instead of passing
+/// silently.
+fn validate_rs_self_test_action(
+    on_record: bool,
+    case_selected: bool,
+    lane_has_node: bool,
+    composition_rerun: bool,
+) -> ValidateRsSelfTestAction {
+    if case_selected {
+        return ValidateRsSelfTestAction::NotRun("case-selected mode");
+    }
+    if composition_rerun {
+        return ValidateRsSelfTestAction::NotRun(
+            "ci-hub composition rerun (the base run at this commit already ran it)",
+        );
+    }
+    if !on_record {
+        return ValidateRsSelfTestAction::NotRun("off-record local run");
+    }
+    if !lane_has_node {
+        return ValidateRsSelfTestAction::NotRun("lane carries no such node");
+    }
+    ValidateRsSelfTestAction::Add
+}
+
+/// Apply [`validate_rs_self_test_action`] to a focused selection: insert
+/// the node's tag, or print the named NOT-run line for this run form.
+///
+/// This is the ONE exception to the focused plan's rule that the record mode
+/// decides no part of the plan (dh-kra8l9): an on-record `--only` plan in a
+/// lane that carries the node also runs the driver's own self-test leaf, and
+/// an off-record plan skips it (no recursion through the self-test's own
+/// off-record fixture child, and no self-test cost on each local
+/// iteration). Both lines go to stderr, so a plan printed as JSON on stdout
+/// stays free of them.
+fn maybe_add_validate_rs_self_test(
+    lane: &str,
     lane_cfg: &DagConfig,
-    committed: &DagConfig,
-    tags: &[String],
-) -> Result<DagConfig, String> {
-    match dagrun::select_steps_by_tags(lane_cfg, tags, true) {
-        Ok(cfg) => Ok(cfg),
-        Err(_) => {
-            let cfg = dagrun::select_steps_by_tags(committed, tags, true)?;
-            // Backstop: the requests were checked before any mapping, and a
-            // live node's dependencies are live, so this never fires today.
-            refuse_retired_nodes(committed, cfg.steps.iter().map(Step::tag))?;
-            Ok(cfg)
+    tags: &mut BTreeSet<String>,
+    on_record: bool,
+    case_selected: bool,
+) {
+    let tag = validate_rs_self_test_tag(lane, lane_cfg);
+    let composition_rerun = std::env::var_os("CI_HUB_COMPOSITION_BASE_RUN").is_some();
+    match validate_rs_self_test_action(on_record, case_selected, tag.is_some(), composition_rerun) {
+        ValidateRsSelfTestAction::Add => {
+            let tag = tag.expect("Add requires the lane to carry the node");
+            if tags.insert(tag.clone()) {
+                eprintln!("Focused validation: {tag} added (always on on-record focused closures)");
+            }
+        }
+        ValidateRsSelfTestAction::NotRun(reason) => {
+            eprintln!("selftest.validate_rs NOT run: {reason}");
         }
     }
+}
+
+/// The self-test leaf an on-record `--only` plan of `lane` gains through the
+/// one record-mode exception, decided by the driver's own rule
+/// ([`validate_rs_self_test_action`]); `None` when the rule adds nothing.
+fn on_record_self_test_leaf(lane: &str, lane_cfg: &DagConfig) -> Option<String> {
+    let tag = validate_rs_self_test_tag(lane, lane_cfg);
+    let composition_rerun = std::env::var_os("CI_HUB_COMPOSITION_BASE_RUN").is_some();
+    match validate_rs_self_test_action(true, false, tag.is_some(), composition_rerun) {
+        ValidateRsSelfTestAction::Add => tag,
+        ValidateRsSelfTestAction::NotRun(_) => None,
+    }
+}
+
+/// Check the one record-mode exception between the plans of one `--only`
+/// request on and off the record. The on-record plan must hold the lane's
+/// self-test leaf whenever the driver's rule adds it, and must equal the
+/// off-record plan byte for byte once that leaf is taken out. The off-record
+/// plan may hold the leaf only when the request itself does
+/// (`request_holds_leaf`: it names the leaf); then the two plans must be equal
+/// outright. Every other difference is refused, in both directions. Returns
+/// the leaf it accounted for.
+fn check_on_record_exception(
+    lane: &str,
+    lane_cfg: &DagConfig,
+    on: &DagConfig,
+    off: &DagConfig,
+    request_holds_leaf: bool,
+) -> Result<Option<String>, String> {
+    let tags = |cfg: &DagConfig| cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
+    let extra = on_record_self_test_leaf(lane, lane_cfg);
+    let mut on_without = on.clone();
+    if let Some(extra) = &extra {
+        if !tags(on).contains(extra) {
+            return Err(format!(
+                "the on-record plan lacks the driver's self-test leaf {extra}"
+            ));
+        }
+        if tags(off).contains(extra) != request_holds_leaf {
+            let (plan_state, request_state) = if request_holds_leaf {
+                ("lacks", "names")
+            } else {
+                ("holds", "does not name")
+            };
+            return Err(format!(
+                "the off-record plan {plan_state} the driver's self-test leaf {extra}, but the request {request_state} it"
+            ));
+        }
+        if !request_holds_leaf {
+            on_without.steps.retain(|step| step.tag() != *extra);
+        }
+    }
+    if dag_to_json(&on_without) != dag_to_json(off) {
+        let (on_tags, off_tags) = (tags(&on_without), tags(off));
+        return Err(format!(
+            "the plans differ on and off the record beyond the driver's self-test leaf ({}): only on the record {:?}, only off it {:?} (the step bytes differ if both are empty)",
+            extra.as_deref().unwrap_or("none added in this lane"),
+            on_tags.difference(&off_tags).collect::<Vec<_>>(),
+            off_tags.difference(&on_tags).collect::<Vec<_>>()
+        ));
+    }
+    Ok(extra)
+}
+
+/// The focused selection (`--only`, `--tests`): the requested nodes and every
+/// node they transitively depend on, over plain and artifact edges
+/// (`Step::dependency_tags`, the edges dagrun's own `transitive_deps` walks).
+/// A validate checkout holds no output its plan did not produce, so a focused
+/// run never assumes a dependency's output is already there (dh-kra8l9: a
+/// focused e2e node whose artifact producer was dropped failed two seconds
+/// into its payload, after a fifteen-minute setup).
+///
+/// The closure is computed in ONE graph, `graph`, and nothing is ever filled
+/// in from another: a dependency `graph` does not hold, or a retired node
+/// anywhere in the closure, refuses by name before anything runs. No node is
+/// left out by name, gate.manifest included: the audit gates every node that
+/// declares it, so every focused run that selects such a node runs it.
+fn select_focused_closure(
+    graph: &DagConfig,
+    graph_name: &str,
+    committed: &DagConfig,
+    tags: &BTreeSet<String>,
+) -> Result<DagConfig, String> {
+    let by_tag: BTreeMap<String, &Step> =
+        graph.steps.iter().map(|step| (step.tag(), step)).collect();
+    let mut closure: BTreeSet<String> = BTreeSet::new();
+    let mut unknown: BTreeSet<String> = BTreeSet::new();
+    let mut unsatisfied: BTreeSet<String> = BTreeSet::new();
+    let mut stack: Vec<(String, Option<String>)> =
+        tags.iter().map(|tag| (tag.clone(), None)).collect();
+    while let Some((tag, needed_by)) = stack.pop() {
+        let Some(step) = by_tag.get(&tag) else {
+            match needed_by {
+                None => {
+                    unknown.insert(tag);
+                }
+                Some(parent) => {
+                    unsatisfied.insert(format!("{parent} needs {tag}"));
+                }
+            }
+            continue;
+        };
+        if !closure.insert(tag.clone()) {
+            continue;
+        }
+        for dependency in step.dependency_tags() {
+            stack.push((dependency.to_string(), Some(tag.clone())));
+        }
+    }
+    if !unknown.is_empty() {
+        let mut known = by_tag.keys().cloned().collect::<Vec<_>>();
+        known.sort();
+        return Err(format!(
+            "focused selection names unknown step tag(s) in {graph_name}: {}. Known tags: {}",
+            unknown.into_iter().collect::<Vec<_>>().join(", "),
+            known.join(", ")
+        ));
+    }
+    if !unsatisfied.is_empty() {
+        return Err(format!(
+            "focused selection cannot satisfy a dependency in {graph_name}, which does not hold it, so nothing runs: {}",
+            unsatisfied.into_iter().collect::<Vec<_>>().join("; ")
+        ));
+    }
+    refuse_retired_nodes(committed, closure.iter().cloned())?;
+    // This line goes to stderr, so it never mixes into a plan printed as JSON
+    // on stdout (three older name-mapping lines on the --only path still
+    // print to stdout: privileged public names, portable public names and
+    // guest builds).
+    eprintln!(
+        "Focused validation: {} selected tag(s) (the request after name mapping, plus the lane preflight) with their dependency closure in {graph_name}, {} node(s): {}",
+        tags.len(),
+        closure.len(),
+        closure.iter().cloned().collect::<Vec<_>>().join(", ")
+    );
+    // The selection is dependency-closed, so dagrun's closure mode must return
+    // exactly these nodes with every edge intact. Check it: if dagrun's walk
+    // and this one ever disagree, the plan would differ from the closure just
+    // printed, so refuse loudly instead.
+    let selected =
+        dagrun::select_steps_by_tags(graph, &closure.iter().cloned().collect::<Vec<_>>(), false)?;
+    let selected_tags: BTreeSet<String> = selected.steps.iter().map(Step::tag).collect();
+    if selected_tags != closure {
+        return Err(format!(
+            "focused selection in {graph_name}: dagrun's closure differs from validate's, so nothing runs: only dagrun's {:?}, only validate's {:?}",
+            selected_tags.difference(&closure).collect::<Vec<_>>(),
+            closure.difference(&selected_tags).collect::<Vec<_>>()
+        ));
+    }
+    Ok(selected)
 }
 
 /// Refuse, by name, any of `tags` that is a retired node: a committed node
@@ -15935,8 +17442,9 @@ fn select_focused_steps(
 /// `gate.manifest`, so it could start before `setup.manifest_plan` builds the
 /// test-harness it runs. `--only` and `--tests` check the names they are
 /// given, before any public-name or guest-build mapping, so a retired name is
-/// neither run through the committed-DAG fallback of
-/// [`select_focused_steps`] nor quietly swapped for another node. A name the
+/// neither selected from the committed DAG nor quietly swapped for another
+/// node; [`select_focused_closure`] also checks every node of the closure it
+/// selects, so no retired node enters a focused plan as a dependency. A name the
 /// committed DAG does not hold is not retired; it is left to the selection's
 /// own unknown-name refusal. The refusal names each live replacement: the
 /// node's pinned-root twin and hosted variant, with the labels each carries.
@@ -15948,11 +17456,15 @@ fn refuse_retired_nodes(
         .steps
         .iter()
         .flat_map(|step| step.labels.iter().cloned())
-        .collect::<BTreeSet<_>>();
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    // One selection over every label: the union of the labels' dependency
+    // closures is the closure of their union.
     let mut live = BTreeSet::new();
-    for label in &labels {
+    if !labels.is_empty() {
         live.extend(
-            dagrun::select_steps_by_labels(committed, std::slice::from_ref(label))?
+            dagrun::select_steps_by_labels(committed, &labels)?
                 .steps
                 .iter()
                 .map(Step::tag),
@@ -15998,12 +17510,133 @@ fn refuse_retired_nodes(
     ))
 }
 
+/// The preflight a focused selection (`--only LANE`, and `--tests`, which is
+/// the portable lane) adds to its requested nodes: the lane's checkout gates
+/// and its manifest gate with that gate's producers. It is the same on and off
+/// the record: the off-record flag skips only the ledger row and the receipt.
+/// The one record-mode exception, the driver's self-test leaf on the record,
+/// is added beside it by [`add_focused_preflight`].
+fn focused_preflight(lane: &str) -> Vec<String> {
+    let preflight: &[&str] = if lane == "hosted-privileged" {
+        &[
+            "pre.reverie_pin_on_host",
+            "build.rust_scripts_on_host",
+            "setup.manifest_plan_on_host",
+            "gate.manifest_on_host",
+        ]
+    } else {
+        &[
+            "pre.submodules",
+            PIN_GATE_TAG,
+            CARGO_LOCK_GATE_TAG,
+            RUST_SCRIPT_PRODUCER_TAG,
+            validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+            "gate.manifest",
+        ]
+    };
+    preflight
+        .iter()
+        .filter_map(|tag| {
+            // pre.cargo_lock carries no quick/super label yet (admitting a
+            // new quick node also needs the quick dependency-closed source
+            // table), so a focused quick/super selection must not request
+            // a tag its lane graph does not contain.
+            if matches!(lane, "quick" | "super") && *tag == CARGO_LOCK_GATE_TAG {
+                return None;
+            }
+            if matches!(lane, "quick" | "super")
+                && matches!(
+                    *tag,
+                    RUST_SCRIPT_PRODUCER_TAG
+                        | validate_plan::MANIFEST_PLAN_PRODUCER_TAG
+                        | "gate.manifest"
+                )
+            {
+                Some(format!("quick-super-{tag}"))
+            } else {
+                Some((*tag).to_string())
+            }
+        })
+        .collect()
+}
+
+/// The closure of `tags` ([`select_focused_closure`]) in ONE graph: the lane's
+/// graph when it holds every tag (requested and preflight alike; a lane graph
+/// is itself dependency-closed), else the committed DAG, the complete graph.
+/// For tags the lane holds, both graphs give the same closure, plan bytes and
+/// refusals: dagrun's label selection returns the committed steps unmodified,
+/// closed over the same edges. Only the graph named in the output differs.
+/// Falling back keeps every tag the lane lacks instead of dropping it: a
+/// rerun of a finished run's failed set names nodes from every lane that run
+/// executed, and a preflight node that lost its lane label is still planned.
+/// A lane graph is never spliced with the committed DAG.
+fn select_focused_in_one_graph(
+    committed: &DagConfig,
+    lane_cfg: &DagConfig,
+    lane: &str,
+    tags: &BTreeSet<String>,
+) -> Result<DagConfig, String> {
+    let lane_tags: BTreeSet<String> = lane_cfg.steps.iter().map(Step::tag).collect();
+    if tags.iter().all(|tag| lane_tags.contains(tag)) {
+        select_focused_closure(lane_cfg, &format!("lane {lane}"), committed, tags)
+    } else {
+        select_focused_closure(committed, "the committed DAG", committed, tags)
+    }
+}
+
+/// Add to a focused selection what every focused plan of `lane` adds to its
+/// requested nodes: the lane's [`focused_preflight`], then the ONE record-mode
+/// exception ([`maybe_add_validate_rs_self_test`]: on the record, an `--only`
+/// plan also runs the driver's own self-test leaf), then the public
+/// guest-build name mapping. `--only` and `--tests` both come through here,
+/// so the exception lives in this one place.
+fn add_focused_preflight(
+    lane: &str,
+    lane_cfg: &DagConfig,
+    tags: &mut BTreeSet<String>,
+    on_record: bool,
+    case_selected: bool,
+) {
+    tags.extend(focused_preflight(lane));
+    maybe_add_validate_rs_self_test(lane, lane_cfg, tags, on_record, case_selected);
+    map_focused_guest_builds(lane_cfg, tags);
+}
+
+/// The `--only LANE NODE[,...]` selection: the requested nodes, after their
+/// public-name mappings, plus what [`add_focused_preflight`] adds, each with
+/// its whole dependency closure, in one graph ([`select_focused_in_one_graph`]).
+/// `on_record` decides only the one named exception there; everything else
+/// is the same on and off the record.
+fn only_selection(
+    committed: &DagConfig,
+    lane: &str,
+    nodes: &str,
+    on_record: bool,
+) -> Result<DagConfig, String> {
+    let lane_cfg = dagrun::select_steps_by_labels(committed, &[lane.to_string()])?;
+    let mut tags = requested_step_ids(nodes, "--only")?;
+    refuse_retired_nodes(committed, tags.iter().cloned())?;
+    map_privileged_public_tags(&mut tags, lane);
+    map_hosted_portable_tags(&lane_cfg, &mut tags, lane);
+    add_focused_preflight(lane, &lane_cfg, &mut tags, on_record, false);
+    select_focused_in_one_graph(committed, &lane_cfg, lane, &tags)
+}
+
 /// Runtime plan boundary: every executable path is a selection from the one
 /// committed `ci/dag/validate.json`. The maintenance generator is separate and
 /// never reaches this function.
 fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
-    let (committed, source_path, source_bytes) = load_committed_validation_dag(root)?;
+    build_plan_from(root, args, load_committed_validation_dag(root)?)
+}
 
+/// [`build_plan`] over the committed DAG already loaded by
+/// [`load_committed_validation_dag`] (its config, path and bytes), so a
+/// caller that plans many selections parses the file once.
+fn build_plan_from(
+    root: &Path,
+    args: &Args,
+    (committed, source_path, source_bytes): (DagConfig, PathBuf, Vec<u8>),
+) -> Result<Plan, String> {
     if let Some(Focused::TestCases { cases }) = &args.focused {
         // Like --only on the portable lane (same preflight, same dependency
         // closure), plus a per-node case filter injected as step env below.
@@ -16012,40 +17645,41 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         let nodes = cases.keys().cloned().collect::<Vec<_>>().join(",");
         let mut tags = requested_step_ids(&nodes, "--tests")?;
         refuse_retired_nodes(&committed, tags.iter().cloned())?;
-        // No gate.manifest in a case-focused plan: the gate is a verdict
-        // audit (manifest correspondence, footprint freshness), not a
-        // producer of anything the selected cases consume. A --tests run
-        // is a partial, explicitly-selected run; the full profile still
-        // gates every product node on it.
-        let preflight: &[&str] = if args.allow_local_off_the_record_run {
-            &["pre.submodules", PIN_GATE_TAG, CARGO_LOCK_GATE_TAG]
-        } else {
-            &[
-                "pre.submodules",
-                PIN_GATE_TAG,
-                CARGO_LOCK_GATE_TAG,
-                RUST_SCRIPT_PRODUCER_TAG,
-                validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
-            ]
-        };
-        tags.extend(preflight.iter().map(|tag| (*tag).to_string()));
-        retain_focused_manifest_producers(&lane_cfg, &mut tags);
-        let mut cfg =
-            select_focused_steps(&lane_cfg, &committed, &tags.into_iter().collect::<Vec<_>>())?;
-        // A case node whose committed build/setup dependencies the
-        // focused plan does not contain (a privileged-test node, whose
-        // producers sit outside the portable lane subset) would fail
-        // minutes later inside run-in-pinned-root with an error that
-        // reads as the change's failure. Refuse here, naming them.
-        // gate.manifest is deliberately pruned from every case plan
-        // (it audits verdicts; it produces nothing a case consumes),
-        // so it never counts as missing.
-        let planned: BTreeSet<String> = cfg.steps.iter().map(|step| step.tag()).collect();
+        add_focused_preflight(
+            &lane,
+            &lane_cfg,
+            &mut tags,
+            !args.allow_local_off_the_record_run,
+            true,
+        );
+        // Only a CASE node the portable lane does not hold (a
+        // privileged-test node) is held back from the selection: the refusal
+        // below names it, with the dependencies the lane lacks (dh-koqvv).
+        // Every other tag is selected exactly as --only selects it, in one
+        // graph, so a preflight node the lane lacks is planned from the
+        // committed DAG, never dropped. A tag no DAG knows still refuses as
+        // unknown.
+        let lane_tags: BTreeSet<String> = lane_cfg.steps.iter().map(Step::tag).collect();
         let committed_by_tag: BTreeMap<String, &Step> = committed
             .steps
             .iter()
             .map(|step| (step.tag(), step))
             .collect();
+        let selected: BTreeSet<String> = tags
+            .iter()
+            .filter(|tag| {
+                !cases.contains_key(*tag)
+                    || lane_tags.contains(*tag)
+                    || !committed_by_tag.contains_key(*tag)
+            })
+            .cloned()
+            .collect();
+        let mut cfg = select_focused_in_one_graph(&committed, &lane_cfg, &lane, &selected)?;
+        // A case node the plan does not hold, or whose committed
+        // dependencies the plan does not contain (a privileged-test node,
+        // whose producers sit outside the portable lane), would otherwise
+        // run without them or not at all. Refuse here, naming them.
+        let planned: BTreeSet<String> = cfg.steps.iter().map(|step| step.tag()).collect();
         for node in cases.keys() {
             let mut missing: BTreeSet<String> = BTreeSet::new();
             let mut stack: Vec<String> = vec![node.clone()];
@@ -16055,29 +17689,28 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
                     continue;
                 }
                 if let Some(step) = committed_by_tag.get(&tag) {
-                    for dep in &step.deps {
-                        // Prune the walk at gate.manifest: it is
-                        // deliberately absent from every case plan, so
-                        // neither it nor anything only it needs (its
-                        // producer deps) counts as a case dependency.
-                        if dep == "gate.manifest" {
-                            continue;
-                        }
+                    for dep in step.dependency_tags() {
                         if !planned.contains(dep) {
-                            missing.insert(dep.clone());
+                            missing.insert(dep.to_string());
                         }
-                        stack.push(dep.clone());
+                        stack.push(dep.to_string());
                     }
                 }
             }
+            let profile = args
+                .focused
+                .as_ref()
+                .expect("matched focused mode")
+                .profile();
             if !missing.is_empty() {
                 return Err(format!(
-                    "test selection names cases of {node}, whose dependencies {} are not in profile {}; select the node with --selected or choose a profile that has them",
+                    "test selection names cases of {node}, whose dependencies {} are not in profile {profile}; select the node with --selected or choose a profile that has them",
                     missing.iter().cloned().collect::<Vec<_>>().join(", "),
-                    args.focused
-                        .as_ref()
-                        .expect("matched focused mode")
-                        .profile(),
+                ));
+            }
+            if !planned.contains(node) {
+                return Err(format!(
+                    "test selection names cases of {node}, which profile {profile} does not have; select the node with --selected or choose a profile that has it"
                 ));
             }
         }
@@ -16096,54 +17729,14 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         };
         return finish_selection_for(args, plan, source_path, source_bytes);
     }
+
     if let Some(Focused::Only { lane, nodes }) = &args.focused {
-        let lane_cfg = dagrun::select_steps_by_labels(&committed, std::slice::from_ref(lane))?;
-        let mut tags = requested_step_ids(nodes, "--only")?;
-        refuse_retired_nodes(&committed, tags.iter().cloned())?;
-        map_privileged_public_tags(&mut tags, lane);
-        map_hosted_portable_tags(&lane_cfg, &mut tags, lane);
-        let preflight: &[&str] = match (lane.as_str(), args.allow_local_off_the_record_run) {
-            ("hosted-privileged", true) => &["pre.reverie_pin_on_host"],
-            ("hosted-privileged", false) => &[
-                "pre.reverie_pin_on_host",
-                "build.rust_scripts_on_host",
-                "setup.manifest_plan_on_host",
-                "gate.manifest_on_host",
-            ],
-            (_, true) => &["pre.submodules", PIN_GATE_TAG, CARGO_LOCK_GATE_TAG],
-            (_, false) => &[
-                "pre.submodules",
-                PIN_GATE_TAG,
-                CARGO_LOCK_GATE_TAG,
-                RUST_SCRIPT_PRODUCER_TAG,
-                validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
-                "gate.manifest",
-            ],
-        };
-        tags.extend(preflight.iter().filter_map(|tag| {
-            // pre.cargo_lock carries no quick/super label yet (admitting a
-            // new quick node also needs the quick dependency-closed source
-            // table), so a focused quick/super selection must not request
-            // a tag its lane graph does not contain.
-            if matches!(lane.as_str(), "quick" | "super") && *tag == CARGO_LOCK_GATE_TAG {
-                return None;
-            }
-            if matches!(lane.as_str(), "quick" | "super")
-                && matches!(
-                    *tag,
-                    RUST_SCRIPT_PRODUCER_TAG
-                        | validate_plan::MANIFEST_PLAN_PRODUCER_TAG
-                        | "gate.manifest"
-                )
-            {
-                Some(format!("quick-super-{tag}"))
-            } else {
-                Some((*tag).to_string())
-            }
-        }));
-        retain_focused_manifest_producers(&lane_cfg, &mut tags);
-        let cfg =
-            select_focused_steps(&lane_cfg, &committed, &tags.into_iter().collect::<Vec<_>>())?;
+        let cfg = only_selection(
+            &committed,
+            lane,
+            nodes,
+            !args.allow_local_off_the_record_run,
+        )?;
         let plan = Plan {
             planned_test_nodes: test_nodes_of(&cfg),
             cfg,
@@ -19086,9 +20679,11 @@ fn exit_fold_bracket() -> Result<(), String> {
     Ok(())
 }
 
-/// Fast exit 127 is useful missing-artifact guidance only in `--only`, whose
-/// documented contract deliberately drops build dependencies. It is never a
-/// verdict override and is not inferred for full or other focused profiles.
+/// The `--only` nodes that exited 127 (command not found) in under 5 s, for a
+/// hint. `--only` plans every node's whole dependency closure, so such a node's
+/// producers ran in the same plan: a fast 127 most likely means a missing host
+/// tool or a typo in the node command. It is never a verdict override and is
+/// not inferred for full or other focused profiles.
 fn possible_missing_artifact_nodes<'a>(
     selection_mode: &str,
     outcomes: &'a [StepOutcome],
@@ -21636,11 +23231,30 @@ fn guarded_command_source(tag: &str, command: &str) -> Result<String, String> {
             .position(|arg| arg == "--")
             .ok_or_else(|| format!("retry bounds: {tag} has no pinned-root command boundary"))?;
         let tail = &argv[boundary..];
+        // Guard acceptance is tied to the tag, mirroring generation:
+        // family-mapped test nodes use the test-node guard, every
+        // other pinned node the build guard (seat F7/F8).
+        // Switched tags have no pre-digest spelling: accept only the
+        // current guard. Unmapped tags keep the parent behaviour too:
+        // only the current build guard (the legacy spelling stays a
+        // generation-side refresh input, never a validate-side one).
+        let (_current_guard, accepted_guards): (&str, &[&str]) =
+            if hermit_manifest_plan::validation_dag::family_image_reference(tag).is_some() {
+                (
+                    hermit_manifest_plan::validation_dag::TEST_NODE_COMMAND_GUARD,
+                    &[hermit_manifest_plan::validation_dag::TEST_NODE_COMMAND_GUARD],
+                )
+            } else {
+                (
+                    hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD,
+                    &[hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD],
+                )
+            };
         if tail.len() != 6
             || tail[1] != "bash"
             || tail[2] != "-c"
             || tail[4] != "bash"
-            || tail[3] != hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD
+            || !accepted_guards.contains(&tail[3].as_str())
         {
             return Err(format!(
                 "retry bounds: {tag} has an unrecognized pinned-root invocation"
@@ -21710,6 +23324,13 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
             // Selects the schema-4 result report; the cells and their retries
             // are unchanged.
             "--diagnostic-results" => {}
+            // Every flag the generator emits into a committed harness command
+            // is modelled here, or this policy refuses that node's command.
+            // This one plans each selected test's parity golden CPU profile as
+            // an unfiltered run of it would; the cells and their retries are
+            // unchanged, and test-harness refuses it without --backend ptrace
+            // or with an exact --test.
+            "--parity-plan-of-selected-tests" => {}
             "--lane" | "--category" | "--test" | "--mode" | "--backend" | "--exclude-backend"
             | "--exclude-category" | "--label" | "--results" | "--junit" | "--jobs" => {
                 index += 1;
@@ -22802,6 +24423,7 @@ exec env -u HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER -u HERMIT_TEST_WALL_TIMEOUT_MULTI
         for name in [
             "run-split-validate.sh",
             "retry-fetch.sh",
+            "cargo-proxy.sh",
             "run-in-pinned-root.sh",
             "image.digest",
         ] {
@@ -26218,10 +27840,120 @@ fn product_front_door_bracket() -> Result<(), String> {
         return Err("off-the-record quick run was incorrectly refused".into());
     }
 
+    human_off_the_record_bracket(&full)?;
+
     println!(
         "  product front door: publishing requires authority; quick/focused local iteration \
-         is off the record; full local forms and diagnostics bracketed"
+         is off the record; a front-door human may run full off the record, an agent may not; \
+         full local forms and diagnostics bracketed"
     );
+    Ok(())
+}
+
+/// The front door's human route: `--human-off-the-record` lifts the narrowing
+/// rule only when the classifier says human, refuses an agent and a failed
+/// classification, and is the only form that ever consults the classifier.
+fn human_off_the_record_bracket(plain_full: &Args) -> Result<(), String> {
+    let human_full = parse_argv(&[HUMAN_OFF_THE_RECORD_OPTION.into(), "full".into()])
+        .map_err(|code| format!("human off-the-record full form did not parse: exit {code}"))?;
+    if !human_full.allow_local_off_the_record_run
+        || !human_full.human_off_the_record
+        || human_full.label_pr
+    {
+        return Err(
+            "--human-off-the-record must imply the off-the-record run and disable labels".into(),
+        );
+    }
+    let mut asked = 0;
+    let mut human = || -> Result<CallerClass, String> {
+        asked += 1;
+        Ok(CallerClass::Human("no agent ancestor".into()))
+    };
+    if let Some(refusal) = local_off_the_record_refusal_with(&human_full, &mut human) {
+        return Err(format!(
+            "a front-door human's full run was refused: {refusal}"
+        ));
+    }
+    if asked != 1 {
+        return Err(format!(
+            "the human route consulted the classifier {asked} times, not once"
+        ));
+    }
+
+    let mut agent = || -> Result<CallerClass, String> {
+        Ok(CallerClass::Agent(
+            "agent ancestor process 7 is claude".into(),
+        ))
+    };
+    let refusal = local_off_the_record_refusal_with(&human_full, &mut agent)
+        .ok_or("an agent's --human-off-the-record full run was not refused")?;
+    if !refusal.contains("agent ancestor process 7 is claude")
+        || !refusal.contains("ci-hub validate-run")
+    {
+        return Err(format!(
+            "the agent refusal lost its reason or route: {refusal}"
+        ));
+    }
+
+    let mut broken =
+        || -> Result<CallerClass, String> { Err("planted classifier failure".to_string()) };
+    let refusal = local_off_the_record_refusal_with(&human_full, &mut broken)
+        .ok_or("a failed classification did not refuse the human route")?;
+    if !refusal.contains("planted classifier failure") {
+        return Err(format!(
+            "the failed-classification refusal lost its cause: {refusal}"
+        ));
+    }
+
+    // Every other form decides without the classifier: the narrowing rule
+    // still refuses a plain full run, and a plan display stays inert.
+    let mut never = || -> Result<CallerClass, String> {
+        Err("the classifier must not be consulted here".into())
+    };
+    let plain = local_off_the_record_refusal_with(plain_full, &mut never)
+        .ok_or("a plain off-the-record full run was not refused")?;
+    if !plain.contains("full-cost validate belongs in ci-hub") {
+        return Err(format!("the plain full refusal changed: {plain}"));
+    }
+    let human_plan = parse_argv(&[
+        HUMAN_OFF_THE_RECORD_OPTION.into(),
+        "full".into(),
+        "--show-plan".into(),
+    ])
+    .map_err(|code| format!("human off-the-record plan form did not parse: exit {code}"))?;
+    if let Some(refusal) = local_off_the_record_refusal_with(&human_plan, &mut never) {
+        return Err(format!(
+            "a human off-the-record plan display was refused: {refusal}"
+        ));
+    }
+
+    for (stdout, expected) in [
+        (
+            "agent environment marker CLAUDECODE is set\n",
+            Ok(CallerClass::Agent(
+                "environment marker CLAUDECODE is set".into(),
+            )),
+        ),
+        (
+            "human no agent ancestor, agent environment marker or herdr agent pane\n",
+            Ok(CallerClass::Human(
+                "no agent ancestor, agent environment marker or herdr agent pane".into(),
+            )),
+        ),
+        ("robot beep\n", Err(())),
+        ("", Err(())),
+    ] {
+        let parsed = parse_caller_class(stdout);
+        match (&parsed, &expected) {
+            (Ok(got), Ok(want)) if got == want => {}
+            (Err(_), Err(())) => {}
+            _ => return Err(format!("classification {stdout:?} parsed as {parsed:?}")),
+        }
+    }
+
+    // The real script answers through the real wiring. Which class it reports
+    // depends on who runs the self-test, so only the shape is pinned.
+    front_door_classify().map_err(|error| format!("the real front door: {error}"))?;
     Ok(())
 }
 
@@ -26419,7 +28151,7 @@ fn product_front_door_process_bracket() -> Result<(), String> {
                 }
             }
         }
-        Ok(())
+        human_flag_from_an_agent_process_case(&executable, &git_dir, &tmp)
     })();
 
     let cleanup = std::fs::remove_dir_all(&tmp).map_err(|error| {
@@ -26431,8 +28163,8 @@ fn product_front_door_process_bracket() -> Result<(), String> {
     match (result, cleanup) {
         (Ok(()), Ok(())) => {
             println!(
-                "  product front door process: full/focused/nested missing-authority runs refused \
-                 before validation state"
+                "  product front door process: full/focused/nested missing-authority runs, and an \
+                 agent's --human-off-the-record full run, refused before validation state"
             );
             Ok(())
         }
@@ -26442,6 +28174,86 @@ fn product_front_door_process_bracket() -> Result<(), String> {
             Err(format!("{problem}; cleanup also failed: {cleanup_problem}"))
         }
     }
+}
+
+/// The human route through the real entry path: an agent that hands
+/// `--human-off-the-record` straight to the driver is refused by the front
+/// door's own classifier, here reached through an agent environment marker, so
+/// the outcome does not depend on who runs the self-test. The planted checkout
+/// carries the real `scripts/validate-front-door.sh`, which the driver runs as
+/// `--classify`, and the refusal must come before any validation state exists.
+fn human_flag_from_an_agent_process_case(
+    executable: &Path,
+    git_dir: &str,
+    tmp: &Path,
+) -> Result<(), String> {
+    let label = "human-flag-from-an-agent";
+    let parent = tmp.join(label);
+    let checkout = parent.join("hermit");
+    let script = checkout.join(FRONT_DOOR_SCRIPT);
+    let fail = |what: &str, error: std::io::Error| {
+        format!("front-door process bracket: {label}: {what}: {error}")
+    };
+    std::fs::create_dir_all(script.parent().expect("the front door lives in scripts/"))
+        .map_err(|error| fail("cannot create the planted checkout", error))?;
+    std::fs::create_dir_all(parent.join("ci-hub"))
+        .map_err(|error| fail("cannot create ci-hub/", error))?;
+    std::fs::write(
+        parent.join(".gitmodules"),
+        "[submodule \"hermit\"]\n\tpath = hermit\n\turl = self-test://unused\n",
+    )
+    .map_err(|error| fail("cannot write .gitmodules", error))?;
+    std::fs::copy(repo_root().join(FRONT_DOOR_SCRIPT), &script)
+        .map_err(|error| fail("cannot copy the front door", error))?;
+
+    let output = Command::new(executable)
+        .args([
+            HUMAN_OFF_THE_RECORD_OPTION,
+            "full",
+            SKIP_INNER_DIRTY_WORKING_TREE_AND_REBASE_FRESHNESS_CHECKS_OPTION,
+        ])
+        .current_dir(&checkout)
+        .env("GIT_DIR", git_dir)
+        .env("GIT_WORK_TREE", &checkout)
+        .env("CLAUDECODE", "1")
+        .env_remove("HERMIT_VALIDATE_STOP_TEST_MODE")
+        .env_remove("VALIDATE_STOP_TEST_AUTHORITY_STATUS_JSON")
+        .env_remove("HERMIT_VALIDATE_STOP_TEST_EXIT_EARLY")
+        .env_remove(PARENT_ENV)
+        .env_remove(TOOL_ROOT_ENV)
+        .env_remove(validate_runtime::ACTIVE_ENV)
+        .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_PID")
+        .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_FILE")
+        .output()
+        .map_err(|error| fail("cannot launch the driver", error))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let rendered = format!("{}{}", stdout, String::from_utf8_lossy(&output.stderr));
+    if output.status.code() != Some(i32::from(COULD_NOT_RUN_EXIT_CODE))
+        || !rendered.contains(
+            "is the human route of `make validate`, and this caller is an agent \
+             (environment marker CLAUDECODE is set)",
+        )
+        || stdout.lines().last() != Some("FINAL_VALIDATE_STATUS: COULD_NOT_RUN")
+    {
+        return Err(format!(
+            "front-door process bracket: {label} escaped/refused incorrectly: status={:?} \
+             output={rendered}",
+            output.status.code()
+        ));
+    }
+    for unexpected in [
+        checkout.join("target/validation"),
+        checkout.join("ignored/validate"),
+        parent.join("ledger"),
+    ] {
+        if unexpected.exists() {
+            return Err(format!(
+                "front-door process bracket: {label} created side effect before refusal: {}",
+                unexpected.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Aggregate libtest `executed` / `filtered` counts from typed step outcomes.
@@ -29427,6 +31239,10 @@ fn write_ledger_with_snapshot(
         ),
     };
     add_raw_census(&mut record, census);
+    add_census_marker(
+        &mut record,
+        census_not_compared_reason(&ctx.selection_mode, |name| std::env::var_os(name)),
+    );
     // Fail closed: no census, no green claim — an explicit red signal.
     if !matches!(&retries, Some(Ok(_))) {
         record["landing_signal"] = serde_json::json!("red");
@@ -31841,6 +33657,8 @@ fn run(
     };
     std::env::remove_var(BUILD_MODE_ENV);
     std::env::remove_var(RUN_MODE_ENV);
+    // Cases are selected only per step, by --tests (drop_inherited_case_filter).
+    drop_inherited_case_filter();
     if let Err(error) =
         check_ambient_build_modes(ambient_build_mode.as_deref(), ambient_run_mode.as_deref())
     {
@@ -33070,6 +34888,16 @@ fn run(
     if let Err(summary) = validate_pinned_image::admit(&root, &execution_plan, &plan.profile) {
         return *summary;
     }
+    // A selected node that reads the scorecard self-test corpus gets it now,
+    // before any node runs, or the run refuses here by name with the remedy.
+    if let Err(summary) = admit_scorecard_corpus(
+        &root,
+        &execution_plan.cfg,
+        execution_plan.second.as_ref(),
+        &plan.profile,
+    ) {
+        return *summary;
+    }
 
     match run_timeout {
         Some(secs) => eprintln!(
@@ -34224,16 +36052,16 @@ fn run(
         .as_ref()
         .map(|retained| retained.evidence.clone())
         .unwrap_or(coverage);
-    // `--only` deliberately drops build dependencies, so a fast 127 there is
-    // useful evidence of an absent prerequisite. It is still a red result and
-    // only a possibility: exit 127 can also mean a missing host tool or typo.
+    // `--only` plans every node's whole dependency closure, so a fast 127 there
+    // is not a dropped prerequisite: the node's producers ran in this plan. It
+    // most likely means a missing host tool or a typo, and it stays a red result.
     let missing_artifact = possible_missing_artifact_nodes(plan.selection_mode, &outcomes);
     if !missing_artifact.is_empty() {
         eprintln!(
             "validate: NOTE: {} --only node(s) exited 127 (command not found) in under 5s: {}. \
-             Because --only drops outside dependencies, this MAY mean a required build artifact \
-             is absent; it remains a RED test/configuration failure. Build the named dependencies \
-             and re-run, or inspect the node command for a missing tool or typo.",
+             --only planned each node's whole dependency closure, so its dependencies WERE \
+             planned; this most likely means a missing host tool or a typo in the node command. \
+             It remains a RED test/configuration failure.",
             missing_artifact.len(),
             missing_artifact.join(", ")
         );
@@ -34502,6 +36330,16 @@ fn run(
                 .into(),
         ),
     }
+    // The census line: whether the counted nodes compared their test lists
+    // with main's (a supplied base), or only checked their own.
+    detail.push(
+        match census_not_compared_reason(plan.selection_mode, |name| std::env::var_os(name)) {
+            Some(reason) => format!("census: {reason}"),
+            None => "census: each counted node compared its test list with main's (the \
+                     supplied base) and checked that it lists tests"
+                .into(),
+        },
+    );
     let individual_test_results_complete = test_summary_errors.is_empty();
     detail.extend(test_summary_errors);
     if args.allow_local_off_the_record_run {
@@ -35542,6 +37380,7 @@ mod committed_selection_preservation_tests {
         for path in [
             "ci/hermetic/run-split-validate.sh",
             "ci/hermetic/retry-fetch.sh",
+            "ci/hermetic/cargo-proxy.sh",
             "ci/check-shard-coverage.sh",
             "ci/debug-shard-success.sh",
             "ci/dag/validate.json",
@@ -35854,17 +37693,50 @@ mod committed_selection_preservation_tests {
             let plan = build_plan(root, &args, temp.path()).unwrap();
             let mut expected = expected.clone();
             if only {
-                // A focused run keeps the run-owned fixtures the corpus reads
-                // and the bucket's harness and script producers;
-                // --ignore-selected-deps runs exactly what was named.
-                expected.extend([
+                // dh-kra8l9: a focused run is the request plus the lane's
+                // whole preflight (the checkout gates, and the manifest gate
+                // with its two producers) with their whole dependency
+                // closure, compared exactly. The plan is the same on and off
+                // the record. --ignore-selected-deps runs exactly what was
+                // named. The focused expectation used to be the request, the
+                // preflight and a hand-kept list (the run-owned fixtures the
+                // corpus reads, the bucket's harness and script producers).
+                // Each of those must be a declared dependency of the
+                // requested nodes themselves: they are checked against the
+                // request's own closure, without the preflight (which names
+                // two of them), so each check can still fail.
+                let committed = validate_plan::validation_config(root).unwrap();
+                let lane = dagrun::select_steps_by_labels(&committed, &["hosted-portable".into()])
+                    .unwrap();
+                let closure_of = |request: &[String]| {
+                    dagrun::select_steps_by_tags(&lane, request, false)
+                        .unwrap()
+                        .steps
+                        .iter()
+                        .map(Step::tag)
+                        .collect::<BTreeSet<_>>()
+                };
+                let mut request = expected.iter().cloned().collect::<Vec<String>>();
+                let request_closure = closure_of(&request);
+                for producer in [
+                    "compatprep.fixtures_on_host",
+                    validate_plan::MANIFEST_PLAN_PRODUCER_TAG,
+                    RUST_SCRIPT_PRODUCER_TAG,
+                ] {
+                    assert!(
+                        request_closure.contains(producer),
+                        "the request's own closure lacks {producer}"
+                    );
+                }
+                request.extend([
                     "pre.submodules".into(),
                     PIN_GATE_TAG.into(),
                     CARGO_LOCK_GATE_TAG.into(),
-                    "compatprep.fixtures_on_host".into(),
-                    validate_plan::MANIFEST_PLAN_PRODUCER_TAG.into(),
                     RUST_SCRIPT_PRODUCER_TAG.into(),
+                    validate_plan::MANIFEST_PLAN_PRODUCER_TAG.into(),
+                    "gate.manifest".into(),
                 ]);
+                expected = closure_of(&request);
             }
             assert_eq!(
                 plan.cfg
@@ -35985,10 +37857,11 @@ mod committed_selection_preservation_tests {
             ),
         ] {
             for off_record in [false, true] {
+                // dh-kra8l9: off the record the plan now holds the target's
+                // whole closure, its manifest gate included, so the failed
+                // gate is exercised off the record too (it used to be
+                // skipped there, the gate being absent).
                 for failed_gate in [pin, gate] {
-                    if off_record && failed_gate == gate {
-                        continue;
-                    }
                     let temp = tempfile::tempdir().unwrap();
                     let sentinel = temp.path().join("target-ran");
                     let mut argv = vec!["--only".into(), lane.into(), target.into()];
@@ -36785,7 +38658,9 @@ printf finalized >target/finalized
                 .unwrap();
         // 4 since privileged-test.binder_cli_cases (PR 4742) added the
         // plain liteinst cli selection to the privileged lane: 3 before.
-        assert_eq!(privileged_selections.len(), 4);
+        // 5 since privileged-test.autofs_cases added the liteinst
+        // mount_introspection selection (dh-b1go3k): 4 before.
+        assert_eq!(privileged_selections.len(), 5);
         assert!(
             privileged_selections
                 .values()
@@ -37890,6 +39765,84 @@ mod prepared_command_tests {
             }
         }
     }
+
+    #[test]
+    fn unmapped_tag_refuses_the_legacy_guard_spelling() {
+        // Seat Low 2 (0c80e547): re-allowing the legacy guard for an
+        // unmapped tag must fail a test. The legacy spelling is a
+        // generation-side refresh input only.
+        let root = test_source_root();
+        let cfg = validate_plan::validation_config(&root).unwrap();
+        let pinned = cfg
+            .steps
+            .iter()
+            .find(|step| step.tag() == "build.workspace_in_pinned_root")
+            .unwrap();
+        assert!(
+            hermit_manifest_plan::validation_dag::family_image_reference(&pinned.tag()).is_none(),
+            "fixture tag must stay unmapped"
+        );
+        guarded_command_source(&pinned.tag(), &pinned.cmd).unwrap();
+        let mut argv = shell_words::split(&pinned.cmd).unwrap();
+        let boundary = argv.iter().position(|arg| arg == "--").unwrap();
+        argv[boundary + 3] =
+            hermit_manifest_plan::validation_dag::LEGACY_PINNED_ROOT_COMMAND_GUARD.into();
+        let legacy_cmd = format!(
+            "{} {}",
+            argv[0],
+            argv[1..]
+                .iter()
+                .map(|arg| validate_plan::shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let err = guarded_command_source(&pinned.tag(), &legacy_cmd).unwrap_err();
+        assert!(
+            err.contains("unrecognized pinned-root invocation"),
+            "legacy guard must be refused, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rs_self_test_action_covers_every_combination() {
+        // Add is exactly: on-record, not case-selected, the lane carries
+        // the node, and not a composition rerun. Every other combination
+        // is a named NotRun, with case-selected taking precedence over
+        // composition, which takes precedence over off-record, which
+        // takes precedence over a lane without the node.
+        for on_record in [false, true] {
+            for case_selected in [false, true] {
+                for lane_has_node in [false, true] {
+                    for composition_rerun in [false, true] {
+                        let action = validate_rs_self_test_action(
+                            on_record,
+                            case_selected,
+                            lane_has_node,
+                            composition_rerun,
+                        );
+                        let expected = if case_selected {
+                            ValidateRsSelfTestAction::NotRun("case-selected mode")
+                        } else if composition_rerun {
+                            ValidateRsSelfTestAction::NotRun(
+                                "ci-hub composition rerun (the base run at this commit already ran it)",
+                            )
+                        } else if !on_record {
+                            ValidateRsSelfTestAction::NotRun("off-record local run")
+                        } else if !lane_has_node {
+                            ValidateRsSelfTestAction::NotRun("lane carries no such node")
+                        } else {
+                            ValidateRsSelfTestAction::Add
+                        };
+                        assert_eq!(
+                            action, expected,
+                            "on_record={on_record} case_selected={case_selected} \
+                             lane_has_node={lane_has_node} composition_rerun={composition_rerun}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -38506,8 +40459,11 @@ mod submodule_service_tests {
         std::fs::write(root.join("payload"), b"same source\n").unwrap();
         std::fs::set_permissions(root.join("payload"), std::fs::Permissions::from_mode(0o644))
             .unwrap();
+        std::fs::write(root.join("tool"), b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(root.join("tool"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
         symlink("payload", root.join("link")).unwrap();
-        git(&root, &["add", "--", "payload", "link"]);
+        git(&root, &["add", "--", "payload", "tool", "link"]);
         git(
             &root,
             &["commit", "--quiet", "-m", "source binding fixture"],
@@ -38547,6 +40503,34 @@ mod submodule_service_tests {
             std::fs::Permissions::from_mode(0o644),
         )
         .unwrap();
+        // Executable as git reads it: the owner's execute bit alone. A clean
+        // source whose tracked executable (100755) is 0700 matches its 0755
+        // clone, and group or other execute bits without the owner's leave a
+        // 100644 file non-executable.
+        std::fs::set_permissions(root.join("tool"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        assert_submodule_fixture_source(&root, &copied, &pin).unwrap();
+        std::fs::set_permissions(
+            copied.join("payload"),
+            std::fs::Permissions::from_mode(0o654),
+        )
+        .unwrap();
+        assert_submodule_fixture_source(&root, &copied, &pin).unwrap();
+        std::fs::set_permissions(
+            copied.join("payload"),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        // A copy whose exec state really differs (0644 against the 100755
+        // entry) still fails by name.
+        std::fs::set_permissions(copied.join("tool"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        assert_eq!(
+            assert_submodule_fixture_source(&root, &copied, &pin).unwrap_err(),
+            format!("{source_refusal}tool")
+        );
+        std::fs::set_permissions(copied.join("tool"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
         std::fs::remove_file(copied.join("link")).unwrap();
         symlink("other-target", copied.join("link")).unwrap();
         assert_eq!(
@@ -38953,6 +40937,266 @@ mod scorecard_cutover_tests {
         }
     }
 
+    /// The census predicate over the run's own inputs, with a fake
+    /// environment: no process environment is read or changed.
+    #[test]
+    fn census_comparison_is_judged_from_the_base_the_nodes_were_given() {
+        fn env<'a>(
+            pairs: &'a [(&'a str, &'a str)],
+        ) -> impl Fn(&str) -> Option<std::ffi::OsString> + 'a {
+            move |name| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| std::ffi::OsString::from(value))
+            }
+        }
+        for base in CENSUS_BASE_ENVS {
+            let pairs = [(base, "/base")];
+            assert_eq!(
+                census_not_compared_reason("full", env(&pairs)),
+                None,
+                "{base}"
+            );
+            // --selected runs whole nodes, so it compares like any other mode.
+            assert_eq!(census_not_compared_reason("selected", env(&pairs)), None);
+            let reason = census_not_compared_reason(CASE_SELECTING_MODE, env(&pairs)).unwrap();
+            assert!(reason.starts_with("tests run:"), "{reason}");
+            // A stray filter in a run with a base: every node lists a subset
+            // and skips the comparison, so the run is not compared.
+            let stray = [(base, "/base"), (NEXTEST_FILTER_EXPR_ENV, "test(=x)")];
+            let reason = census_not_compared_reason("full", env(&stray)).unwrap();
+            assert!(
+                reason.starts_with("HERMIT_NEXTEST_FILTER_EXPR is set"),
+                "{reason}"
+            );
+            let empty = [(base, "/base"), (NEXTEST_FILTER_EXPR_ENV, "")];
+            assert_eq!(census_not_compared_reason("full", env(&empty)), None);
+        }
+        for pairs in [
+            &[][..],
+            &[
+                ("HERMIT_CENSUS_BASE_LISTED_IDS", ""),
+                ("HERMIT_CENSUS_BASE_DIR", ""),
+            ][..],
+            &[("HERMIT_CENSUS_BASE_COMMIT", "a")][..],
+        ] {
+            let reason = census_not_compared_reason("full", env(pairs)).unwrap();
+            assert!(reason.starts_with("no census base supplied"), "{reason}");
+        }
+    }
+
+    /// The marker reaches the ROW WRITTEN TO THE LEDGER FILE through
+    /// write_ledger_with_snapshot, the one funnel every run() path writes its
+    /// row through. Each case runs in a re-executed child, so the variables
+    /// live only there and the shared test harness's environment is never
+    /// changed.
+    #[test]
+    fn a_run_without_a_census_base_says_so_in_its_written_row() {
+        const CHILD: &str = "VALIDATE_CENSUS_MARKER_CHILD";
+        if let Some(expect) = std::env::var_os(CHILD) {
+            let temp = tempfile::tempdir().unwrap();
+            let rows = temp.path().join("rows.jsonl");
+            let mut ctx = context(
+                temp.path(),
+                "full",
+                "census-marker-fixture",
+                HEAD.into(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            );
+            ctx.selection_mode = "full".into();
+            ctx.executed_tests = Some(0);
+            ctx.passed_tests = Some(0);
+            write_ledger(
+                &rows,
+                &ctx,
+                &[],
+                &[],
+                &[],
+                &[],
+                &BTreeSet::new(),
+                0.0,
+                75,
+                "",
+                true,
+                serde_json::json!({}),
+                None,
+                None,
+            )
+            .unwrap();
+            let text = std::fs::read_to_string(&rows).unwrap();
+            let row: serde_json::Value =
+                serde_json::from_str(text.lines().last().unwrap()).unwrap();
+            if expect == "unchecked" || expect == "filtered" {
+                let reason_start = if expect == "unchecked" {
+                    "no census base supplied"
+                } else {
+                    "HERMIT_NEXTEST_FILTER_EXPR is set"
+                };
+                assert_eq!(row["census_checked"], false, "{row}");
+                assert!(
+                    row["census_not_checked_reason"]
+                        .as_str()
+                        .is_some_and(|reason| reason.starts_with(reason_start)),
+                    "{row}"
+                );
+            } else {
+                assert!(row.get("census_checked").is_none(), "{row}");
+                assert!(row.get("census_not_checked_reason").is_none(), "{row}");
+            }
+            println!("census marker child: {}", expect.to_string_lossy());
+            return;
+        }
+        for (expect, base) in [
+            ("unchecked", None),
+            ("unchecked", Some(("HERMIT_CENSUS_BASE_DIR", ""))),
+            ("checked", Some(("HERMIT_CENSUS_BASE_DIR", "/base-dir"))),
+            (
+                "checked",
+                Some(("HERMIT_CENSUS_BASE_LISTED_IDS", "/base.listed-ids")),
+            ),
+            ("filtered", Some(("HERMIT_CENSUS_BASE_DIR", "/base-dir"))),
+        ] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "scorecard_cutover_tests::a_run_without_a_census_base_says_so_in_its_written_row",
+                    "--nocapture",
+                ])
+                .current_dir(test_source_root())
+                .env(CHILD, expect);
+            for name in CENSUS_BASE_ENVS {
+                command.env_remove(name);
+            }
+            command.env_remove(NEXTEST_FILTER_EXPR_ENV);
+            if let Some((name, value)) = base {
+                command.env(name, value);
+            }
+            if expect == "filtered" {
+                command.env(NEXTEST_FILTER_EXPR_ENV, "test(=stray)");
+            }
+            let output = command.output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(0), "{base:?}: {stdout}{stderr}");
+            assert!(
+                stdout.contains(&format!("census marker child: {expect}")),
+                "{base:?}: {stdout}{stderr}"
+            );
+        }
+    }
+
+    /// run() drops a case selection inherited from the caller
+    /// (HERMIT_NEXTEST_FILTER_EXPR, HERMIT_NEXTEST_SELECTED_CASES), so a stray
+    /// value can neither narrow every counted node nor fail every node that
+    /// does not list the stray names. Run in a re-executed child, so the
+    /// shared test harness's environment is never changed.
+    #[test]
+    fn an_inherited_case_filter_is_dropped_by_name() {
+        const CHILD: &str = "VALIDATE_CASE_FILTER_DROP_CHILD";
+        if let Some(value) = std::env::var_os(CHILD) {
+            let dropped = drop_inherited_case_filter();
+            assert_eq!(dropped, !value.is_empty());
+            assert!(std::env::var_os(NEXTEST_FILTER_EXPR_ENV).is_none());
+            assert!(std::env::var_os(NEXTEST_SELECTED_CASES_ENV).is_none());
+            println!("case filter drop child: {dropped}");
+            return;
+        }
+        for (filter, cases, dropped) in [
+            ("test(=stray)", "", true),
+            ("", "pkg$stray", true),
+            ("test(=stray)", "pkg$stray", true),
+            ("", "", false),
+        ] {
+            let child = if dropped { "1" } else { "" };
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "scorecard_cutover_tests::an_inherited_case_filter_is_dropped_by_name",
+                    "--nocapture",
+                ])
+                .current_dir(test_source_root())
+                .env(CHILD, child)
+                .env(NEXTEST_FILTER_EXPR_ENV, filter)
+                .env(NEXTEST_SELECTED_CASES_ENV, cases)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let label = format!("{filter:?} {cases:?}");
+            assert_eq!(output.status.code(), Some(0), "{label}: {stdout}{stderr}");
+            assert!(
+                stdout.contains(&format!("case filter drop child: {dropped}")),
+                "{label}: {stdout}{stderr}"
+            );
+            for (name, value) in [
+                (NEXTEST_FILTER_EXPR_ENV, filter),
+                (NEXTEST_SELECTED_CASES_ENV, cases),
+            ] {
+                assert_eq!(
+                    stderr.contains(&format!("ignoring {name} from the environment")),
+                    !value.is_empty(),
+                    "{label}: {stderr}"
+                );
+            }
+        }
+    }
+
+    /// The body of a top-level `fn name(` in this file, up to the next
+    /// top-level item: for wiring tests of calls that only a whole run makes.
+    fn top_level_fn_body(name: &str) -> String {
+        let source =
+            std::fs::read_to_string(test_source_root().join("scripts/validate.rs")).unwrap();
+        let start = source
+            .find(&format!("\nfn {name}("))
+            .unwrap_or_else(|| panic!("no top-level fn {name}"));
+        let rest = &source[start + 1..];
+        let end = rest[1..]
+            .find("\nfn ")
+            .map_or(rest.len(), |offset| offset + 1);
+        rest[..end].to_string()
+    }
+
+    /// Wiring: run() itself drops an inherited case filter, before it parses
+    /// any argument, so no run carries one into its nodes.
+    #[test]
+    fn run_drops_an_inherited_case_filter_before_anything_else_reads_it() {
+        let body = top_level_fn_body("run");
+        let drop = body
+            .find("drop_inherited_case_filter();")
+            .expect("run() must call drop_inherited_case_filter()");
+        let parse = body
+            .find("parse_args()")
+            .expect("run() parses its arguments");
+        assert!(
+            drop < parse,
+            "the filter must be dropped before argument parsing"
+        );
+    }
+
+    /// Wiring: run() admits the scorecard self-test corpus among its pre-node
+    /// admissions, after the host tools and before boxing and the DAG.
+    #[test]
+    fn run_admits_the_scorecard_corpus_before_any_node_runs() {
+        let body = top_level_fn_body("run");
+        let corpus = body
+            .find("admit_scorecard_corpus(")
+            .expect("run() must call admit_scorecard_corpus");
+        let tools = body
+            .find("validate_host_tools::admit(")
+            .expect("run() admits host tools");
+        let boxing = body.find("resolve_cgroups(").expect("run() boxes the run");
+        assert!(
+            tools < corpus,
+            "the corpus admission follows the host-tool admission"
+        );
+        assert!(
+            corpus < boxing,
+            "the corpus is admitted before boxing and the DAG"
+        );
+    }
+
     fn frozen_writer_row(selection_mode: &str) -> serde_json::Value {
         let temp = tempfile::tempdir().unwrap();
         let mut ctx = context(
@@ -39085,7 +41329,15 @@ mod scorecard_cutover_tests {
             assert_eq!(retained["e2e_payload"]["overflow_checks"], !release);
 
             // Give the written identity a qualifying green and ask the Cargo key.
+            // The fixture's writer ran without a census base, so its row
+            // carries the census marker, which alone refuses reuse
+            // (validate_history's own bracket proves that); a qualifying
+            // green is a census-checked one, so the marker is dropped here.
             let mut green = row.clone();
+            if let Some(fields) = green.as_object_mut() {
+                fields.remove("census_checked");
+                fields.remove("census_not_checked_reason");
+            }
             for (field, value) in [
                 ("result", serde_json::json!("pass")),
                 ("failures", serde_json::json!(0)),
@@ -39434,6 +41686,65 @@ mod scorecard_cutover_tests {
             validate_runtime::runner_lock_self_test(sandbox.path()),
             Ok(4)
         );
+    }
+
+    // Every claim, granted or refused, releases its locks while a forked child
+    // still holds duplicates of their descriptors.
+    #[test]
+    fn a_claim_releases_its_locks_while_a_child_holds_their_descriptors() {
+        let sandbox = tempfile::tempdir().unwrap();
+        assert_eq!(
+            validate_runtime::runner_lock_inherited_descriptor_self_test(sandbox.path()),
+            Ok(3)
+        );
+    }
+
+    // The cross-runner test beside sibling threads that spawn without pause, as
+    // a full run of this test binary has them. Each spawn forks the descriptor
+    // table and the child keeps the duplicates until it execs, so a lock that a
+    // claim merely closed stayed held and the next claim was refused: the
+    // cross-runner test failed in every full run and passed alone.
+    #[test]
+    fn the_invocation_lock_is_one_lock_across_runners_while_siblings_spawn() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let spawned = std::sync::Arc::new(AtomicUsize::new(0));
+        let spawners: Vec<_> = (0..8)
+            .map(|_| {
+                let (stop, spawned) = (stop.clone(), spawned.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = Command::new("true").status();
+                        spawned.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while spawned.load(Ordering::Relaxed) < 8 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let started = spawned.load(Ordering::Relaxed);
+        let failures: Vec<_> = (0..16)
+            .filter_map(|_| {
+                let sandbox = tempfile::tempdir().unwrap();
+                match validate_runtime::runner_lock_self_test(sandbox.path()) {
+                    Ok(4) => None,
+                    other => Some(other),
+                }
+            })
+            .collect();
+        stop.store(true, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        assert!(
+            started >= 8,
+            "the sibling spawners had not started: {started}"
+        );
+        assert!(failures.is_empty(), "{failures:?}");
     }
 
     #[test]

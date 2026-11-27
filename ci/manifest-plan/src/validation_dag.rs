@@ -27,6 +27,7 @@ use serde::Deserialize;
 
 use crate::runner::E2E_KERNEL_VERSION_ENV;
 use crate::runner::E2E_MACHINE_SHORTNAME_ENV;
+use crate::validation_dag_static::BUCK_DAEMON_RESOURCE;
 use crate::validation_dag_static::StructuredResultProducerKind;
 
 pub const OUTPUT: &str = "ci/dag/validate.json";
@@ -107,7 +108,22 @@ const PINNED_NATIVE_EXEC_COMPILE_DESC: &str = "Build the native-exec cohort's he
 const PINNED_NATIVE_EXEC_COMPILE_DESCRIPTION: &str = "The Cargo half of the native-exec cohort producer (dh-10l17): builds exactly the cohort selection, -p hermit-run --features liteinst,kvm-native-test-support,native-exec --lib --bins, in the [profile.validate] profile into the cohort target directory (target/cohort-native-exec, from the cohort declaration in nextest_binaries), then the dev-profile nextest-cpu-wrapper the prepare half records. Nothing in it runs a rust-script, so it starts beside build.rust_scripts_in_pinned_root like the workspace compile; it keeps the rust-script environment so a rust-script added here later fails at once. Its only completion consumer is build.hermit_native_exec_in_pinned_root. Why split: measured 2026-11-08 at hermit d9ac2c5e on the development host in a cgroup box at 32 jobs, the unsplit cold build+list took 471.535 s wall and 3055.371 CPU-s (1.5x wall 707 s, above the 600 s bound, and no ceiling exception was taken); this compile half cold took 298.979 s wall and 2502.180 CPU-s, plus 48.837 s and 162.345 CPU-s for the wrapper, so 4200 CPU-s is the next 300-second bucket above 1.5 times their sum (3996) and the 600-second wall covers 1.5 times their summed wall (522). Memory: the cold cohort build peaked at 14631858176 bytes of cgroup memory.peak in the same measurements, so rss_baseline is 14 GiB and the hard cap 18 GiB. preferred_inner_jobs=32 is the measured width.";
 const PINNED_NATIVE_EXEC_PREPARE_DESC: &str =
     "List the native-exec cohort's prepared executables and publish and assert its record";
-const PINNED_NATIVE_EXEC_PREPARE_DESCRIPTION: &str = "The preparation half of the native-exec cohort producer (dh-10l17). Once build.hermit_native_exec_compile_in_pinned_root has built the cohort selection and build.rust_scripts_in_pinned_root has published the tools, nextest-binaries.rs prepare full --build-mode cargo --cohort native-exec lists the test harnesses from that build in the cohort target directory, hashes them, and publishes the one selection at target/ci/nextest-binaries/cohorts/native-exec.json under its own lock; the immediately following assert full --cohort native-exec verifies the published record, so the consumer's ancestry contains the cohort check by construction. The cohort is pinned to cargo build mode by name (it has no Buck harvest twins), so a --build-mode buck run is mixed-mode: this record stays cargo-stamped and its consumers resolve the pin instead of the run mode. It deliberately does not run stage-detcore-liteinst: the assumption, tested by the targeted pinned run in dh-10l17, is that the 81 native-exec cases need the LiteInst runtime only at link time through the embedded native bundle, not the staged artifact. Measured 2026-11-08 at hermit d9ac2c5e on the development host in a cgroup box at 32 jobs: the listing half on the compile node's warm artifacts took 238.299 s wall and 882.438 CPU-s; 1800 CPU-s is the next 300-second bucket above 1.5 times that listing plus prepare's hashing and publication overhead, to be re-derived from this node's first targeted pinned receipt. The 600-second wall covers 1.5 times the measured wall. Memory keeps the compile half's 14-GiB baseline and 18-GiB hard cap from the same cold measurements.";
+const PINNED_NATIVE_EXEC_PREPARE_DESCRIPTION: &str = "The preparation half of the native-exec cohort producer (dh-10l17). Once build.hermit_native_exec_compile_in_pinned_root has built the cohort selection and build.rust_scripts_in_pinned_root has published the tools, nextest-binaries.rs prepare full --build-mode cargo --cohort native-exec lists the test harnesses from that build in the cohort target directory, hashes them, and publishes the one selection at target/ci/nextest-binaries/cohorts/native-exec.json under its own lock; the immediately following assert full --cohort native-exec verifies the published record, so the consumer's ancestry contains the cohort check by construction. The cohort is pinned to cargo build mode by name (it has no Buck harvest twins), so a --build-mode buck run is mixed-mode: this record stays cargo-stamped and its consumers resolve the pin instead of the run mode. It deliberately stages no runtime (neither hermit-install's stage-detcore-liteinst, which installs the qualified one, nor ci/stage-detcore-liteinst.sh, which builds an unqualified one beside the tests): the assumption, tested by the targeted pinned run in dh-10l17, is that the 81 native-exec cases need the LiteInst runtime only at link time through the embedded native bundle, not the staged artifact. Measured 2026-11-08 at hermit d9ac2c5e on the development host in a cgroup box at 32 jobs: the listing half on the compile node's warm artifacts took 238.299 s wall and 882.438 CPU-s; 1800 CPU-s is the next 300-second bucket above 1.5 times that listing plus prepare's hashing and publication overhead, to be re-derived from this node's first targeted pinned receipt. The 600-second wall covers 1.5 times the measured wall. Memory keeps the compile half's 14-GiB baseline and 18-GiB hard cap from the same cold measurements.";
+/// The exec-stop-launcher cohort's pinned producer pair, the same shape as
+/// the native-exec pair and constructed the same way
+/// (`materialize_cohort_producers`).
+pub const PINNED_EXEC_STOP_LAUNCHER_COMPILE_TAG: &str =
+    "build.hermit_exec_stop_launcher_compile_in_pinned_root";
+pub const PINNED_EXEC_STOP_LAUNCHER_PREPARE_TAG: &str =
+    "build.hermit_exec_stop_launcher_in_pinned_root";
+const PINNED_EXEC_STOP_LAUNCHER_COMPILE_JOB: &str =
+    "hermit_exec_stop_launcher_compile_in_pinned_root";
+const PINNED_EXEC_STOP_LAUNCHER_PREPARE_JOB: &str = "hermit_exec_stop_launcher_in_pinned_root";
+const PINNED_EXEC_STOP_LAUNCHER_COMPILE_DESC: &str = "Build the exec-stop-launcher cohort's hermit-run targets and CPU wrapper in the validate profile, beside the workspace compile";
+const PINNED_EXEC_STOP_LAUNCHER_COMPILE_DESCRIPTION: &str = "The Cargo half of the exec-stop-launcher cohort producer: builds exactly the cohort selection, -p hermit-run --features exec-stop-launcher,liteinst --lib --bins, in the [profile.validate] profile into the cohort target directory (target/cohort-exec-stop-launcher, from the cohort declaration in nextest_binaries), then ci/stage-detcore-liteinst.sh --source . --target-dir \"${CARGO_TARGET_DIR:?}\" --profile validate --offline (offline explicitly, by the 2026-11-22 ruling that fixture staging never reaches the network; setup.pinned_root_fetch has already fetched every locked Cargo input), which builds the in-guest Detcore runtime (the detcore-liteinst cdylib) into the same validate deps directory as the test executables, where Hermit finds it when no installation is selected (the default workspace build leaves the default cohort's runtime in the same place, with its own feature resolution; without it the LiteInst cases of test.hermit_exec_stop_launcher fail with the runtime unavailable), then the dev-profile nextest-cpu-wrapper the prepare half records. Before this node existed no validation node or Buck target ran code behind cfg(all(feature = \"exec-stop-launcher\", feature = \"liteinst\")): lint.clippy and doc.rustdoc only type-check it under --all-features. The feature pair gets its own cohort so it never enters the default workspace union or the production binary. Nothing in it runs a rust-script, so it starts beside build.rust_scripts_in_pinned_root like the workspace compile. ci/stage-detcore-liteinst.sh is not hermit-install's stage-detcore-liteinst, which builds, qualifies and installs the packaged runtime into an installation's rsrcs/: it builds an unqualified runtime in the tests' own profile, takes its path from Cargo's compiler-artifact report, and leaves it in their deps directory, never installed. Budgets, by the step_limits rule from build.hermit_native_exec_compile_in_pinned_root, which this node copies (same package and profile, a smaller feature set) and extends with the runtime build: that node's compile half and wrapper took 2502 + 162 CPU-s cold at 32 jobs, so the CPU bound stays 4200, the next 300-second bucket above 1.5 times their sum; the runtime build is not yet measured, so recalibrate from this node's first retained runs. Wall: that node passed at 479.6 and 518.9 s in the post-land runs of e308b558 and 2b2e9ecf and at 592 s, and was WALL-killed at 606 s (P1 bead dh-59uah3), so this node's wall bound is 960 s, the bucket above 1.5 times the kill wall (909 s), with a step_limits::WALL_CEILING_EXCEPTIONS entry. Its only completion consumer is build.hermit_exec_stop_launcher_in_pinned_root.";
+const PINNED_EXEC_STOP_LAUNCHER_PREPARE_DESC: &str =
+    "List the exec-stop-launcher cohort's prepared executables and publish and assert its record";
+const PINNED_EXEC_STOP_LAUNCHER_PREPARE_DESCRIPTION: &str = "The preparation half of the exec-stop-launcher cohort producer. Once build.hermit_exec_stop_launcher_compile_in_pinned_root has built the cohort selection and build.rust_scripts_in_pinned_root has published the tools, nextest-binaries.rs prepare full --build-mode cargo --cohort exec-stop-launcher lists the test harnesses from that build in the cohort target directory, hashes them, and publishes the one selection at target/ci/nextest-binaries/cohorts/exec-stop-launcher.json under its own lock; the immediately following assert full --cohort exec-stop-launcher verifies the published record, so its consumer (test.hermit_exec_stop_launcher) has the cohort check in its ancestry by construction. The cohort is pinned to cargo build mode by name (it has no Buck harvest twins), so a --build-mode buck run is mixed-mode and the run record names it. Budgets are the native-exec prepare's, not yet measured for this selection.";
 pub const PINNED_E2E_ARTIFACT_TAG: &str = "build.e2e_artifact_in_pinned_root";
 pub const HERMIT_BIN_ARTIFACT: &str = "hermit-bin";
 const HERMIT_BIN_SIGNAL_SUFFIX: &str = " --message-format json-render-diagnostics > >(python3 ./ci/cargo-artifact-ready.py hermit-bin)";
@@ -249,6 +265,18 @@ pub const TOOL_SELF_TESTS: &[ToolSelfTest] = &[
         name: "core_build",
         program: "ci/run-with-core-build-test.sh",
         args: &[],
+        run_when_changed: None,
+        manifest_plan_helper: false,
+    },
+    // ci/verify-submodules.sh's refusal cases on scratch repositories. It
+    // tests the checker, not the tree, so it gates nothing; it used to run in
+    // front of the check inside pre.submodules, the root of every lane's
+    // critical path, where it took 86.3 s wall of that node's ~89 s
+    // (2026-11-21). pre.submodules now runs only the check.
+    ToolSelfTest {
+        name: "verify_submodules",
+        program: "ci/verify-submodules.sh",
+        args: &["--self-test"],
         run_when_changed: None,
         manifest_plan_helper: false,
     },
@@ -564,15 +592,33 @@ fn hosted_portable_exclusion_flags() -> String {
     exclusion_flags(HOSTED_PORTABLE_EXCLUDED_BACKENDS)
 }
 
+/// Whether a step's command reaches one of the Buck entry points, the commands that run buck2:
+/// the harvest (ci/harvest-reverie-buck.sh), the release build
+/// (`build-buck-release.rs --validate-dag-build`) and ci/buck-e2e/validate-node in every form but
+/// `--stage-only`, which stages with Cargo (the only runners with a separate stage node,
+/// buck-local and buck-hybrid). `--validate-dag-install`, in the E2E publishers, only installs
+/// the verified binary. This reads the command's text: a step that ran buck2 some other way
+/// would escape it, so it is a backstop for the commands this DAG writes, not a proof.
+fn reaches_buck_entry_point(cmd: &str) -> bool {
+    const VALIDATE_NODE: &str = "ci/buck-e2e/validate-node";
+    cmd.contains("ci/harvest-reverie-buck.sh")
+        || cmd.contains("build-buck-release.rs --validate-dag-build")
+        || cmd
+            .match_indices(VALIDATE_NODE)
+            .any(|(at, _)| !cmd[at + VALIDATE_NODE.len()..].starts_with(" --stage-only"))
+}
+
 fn exclusion_flags(excluded: &[&str]) -> String {
     excluded
         .iter()
         .map(|backend| format!(" --exclude-backend {backend}"))
         .collect()
 }
-// The capacity column is the DAG's one resource_caps entry: a hosted run selects its
-// steps from the same validate.json, so it carries the same 20 slots as a local run.
-const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 15] = [
+// The capacity column is the step's resource's resource_caps entry: a hosted run selects its
+// steps from the same validate.json, so it carries the same capacities as a local run.
+const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 16] = [
+    // --buck-release supports the hosted-portable plan; its one buck2 daemon per checkout.
+    ("build.buck_release_artifact", "buck_daemon", 1, 1),
     ("e2e.manifest_applications", "manifest_guest", 1, 20),
     ("e2e.manifest_bin_c", "manifest_guest", 1, 20),
     ("e2e.manifest_c_programs", "manifest_guest", 8, 20),
@@ -624,6 +670,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.regular_crates",
     "test.hermit_unit",
     "test.hermit_native_exec",
+    "test.hermit_exec_stop_launcher",
     "test.detcore_unit",
     "test.detcore_misc",
     "test.detcore_parallel",
@@ -661,6 +708,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "privileged-test.pmu_buck_chaos_cases",
     "privileged-test.pmu_ptrace_completion_cases",
     "privileged-test.pmu_cli_cases",
+    "privileged-test.autofs_cases",
     "privileged-test.binder_cli_cases",
     "privileged-test.pmu_detcore_time_cases",
     "privileged-cpuid.cpu_profile_v3",
@@ -713,9 +761,14 @@ const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
     // read them. Without forwarding, pinned-root nodes always fail fast.
     "HERMIT_E2E_FAIL_FAST",
     "HERMIT_NEXTEST_FAIL_FAST",
-    // validate --tests sets this on case-selected nextest steps; forwarded
-    // only when set, it carries the case filter into the pinned root.
+    // validate --tests sets these on case-selected nextest steps; forwarded
+    // only when set, they carry the case filter and the named cases into the
+    // pinned root, where the counted wrapper fails the node, naming them,
+    // when a named case is not listed. Without forwarding, a hermetic node
+    // would never see the names and a case that matches nothing would pass
+    // with zero tests run.
     "HERMIT_NEXTEST_FILTER_EXPR",
+    "HERMIT_NEXTEST_SELECTED_CASES",
     "HERMIT_VALIDATE_RELEASE_BUILD_MODE",
     "HERMIT_VALIDATE_BUCK_DOTSLASH",
     "HERMIT_VALIDATE_BUILD_MODE",
@@ -863,9 +916,12 @@ const PROFILES: [Profile; 11] = [
         // read only its pinned-root twin's guests, and hosted-privileged
         // keeps its own privileged-build.manifest_guests_on_host
         // (dh-63c2n3): 12/20 before.
+        // 12/20 since privileged-test.autofs_cases joined the privileged
+        // lane for the two host-limited autofs cases (dh-b1go3k): 11/19
+        // before.
         label: "privileged",
-        direct_steps: 11,
-        selected_steps: 19,
+        direct_steps: 12,
+        selected_steps: 20,
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
@@ -1253,8 +1309,10 @@ fn is_pinned_root_producer(step: &Step) -> bool {
 /// image carries every program its rows name (measured delta before the
 /// move: 25 programs, about 2.0 GiB of closure, dominated by clang and the
 /// JDK), so it runs in the pinned root like the other e2e buckets. The
-/// focused run types below still run on the host against their own Hermit
-/// builds, by their own descriptions.
+/// focused run types below still run on the host: `portablecompat` and
+/// `supercompat` against their own release Hermit builds, and `rrcompat`
+/// against the validation's shared build through `build.host_hermit_link`,
+/// by their own descriptions.
 pub const HOST_MANIFEST_RUNS: &[&str] = &[
     "portablecompat.manifest_compat",
     "sabrecompat.manifest_compat",
@@ -1308,11 +1366,16 @@ pub(crate) const HOST_HERMIT_LINK_TAG: &str = "build.host_hermit_link";
 /// Route the local host consumers of the Hermit producers to the pinned-root
 /// build.
 ///
-/// The focused compatibility run types exercise host-installed programs that
-/// the pinned image does not carry, so they, and the fixtures they read, still
-/// run on the host. They reach the one Hermit through build.host_hermit_link,
-/// which
-/// links the host's target/ci/hermit to the pinned root's published binary; that
+/// The focused compatibility run types exercise host-installed programs.
+/// The pinned image now carries every program their rows name, but they,
+/// and the fixtures they read, still run on the host until those buckets
+/// move into the pinned root or are retired
+/// (https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-u6do9t.md).
+/// In the committed DAG, only `rrcompat` reaches the validation's one
+/// Hermit through `build.host_hermit_link`, which links the host's
+/// target/ci/hermit to the pinned root's published binary;
+/// `portablecompat` instead runs its lane's pinned-root release build
+/// and `supercompat` runs super's own host release build. The linked
 /// binary runs on the host because its loader and libraries are the host nix
 /// store paths the image was built from. No local host step may depend on the
 /// workspace build itself.
@@ -1442,7 +1505,30 @@ fn retire_unconsumed_host_producers(cfg: &mut DagConfig) {
 // each resulting argument before appending it to the original shell payload;
 // preserve literal bytes and the original command's argument placement.
 pub const PINNED_ROOT_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ "$#" -gt 0 ]; then printf -v hermit_extra ' %q' "$@"; hermit_payload+=$hermit_extra; fi && exec bash -c "$hermit_payload""#;
-pub(super) const LEGACY_PINNED_ROOT_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c "$1""#;
+pub const LEGACY_PINNED_ROOT_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c "$1""#;
+pub const TEST_NODE_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-test-dependencies.sh && hermit_payload=$1 && shift && if [ "$#" -gt 0 ]; then printf -v hermit_extra ' %q' "$@"; hermit_payload+=$hermit_extra; fi && exec bash -c "$hermit_payload""#;
+pub const LEGACY_TEST_NODE_COMMAND_GUARD: &str = r#"/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-test-dependencies.sh && exec bash -c "$1""#;
+
+/// Family-to-image map at the container seam (single source in code;
+/// values mirror ci/hermetic/images/*.json receipts and are
+/// cross-validated by the manifest-plan tests against those files).
+/// Build nodes are never mapped: only test-running e2e buckets switch.
+pub fn family_image_reference(tag: &str) -> Option<&'static str> {
+    match tag {
+        "e2e.manifest_system_utils" => Some(
+            "localhost/hermit-hermetic-mini-suite@sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c",
+        ),
+        _ => None,
+    }
+}
+
+fn command_guard_for_tag(tag: &str) -> &'static str {
+    if family_image_reference(tag).is_some() {
+        TEST_NODE_COMMAND_GUARD
+    } else {
+        PINNED_ROOT_COMMAND_GUARD
+    }
+}
 
 fn needs_proc_locks_runtime(tag: &str) -> bool {
     matches!(
@@ -1474,6 +1560,9 @@ fn pinned_root_command(step: &Step) -> String {
         env_names.insert("DAGRUN_OUTER_RUN");
     }
     env_names.extend(step.env.keys().map(String::as_str));
+    if family_image_reference(&step.tag()).is_some() {
+        env_names.insert("HERMIT_VALIDATION_IMAGE");
+    }
     // A width channel that the root does not forward leaves the command at its
     // own default however wide the step was admitted.
     env_names.extend(step.jobs_env.as_deref().filter(|name| !name.is_empty()));
@@ -1487,6 +1576,9 @@ fn pinned_root_command(step: &Step) -> String {
         "--cargo-home".into(),
         "ignored/hermetic/split/cargo".into(),
     ];
+    if let Some(reference) = family_image_reference(&step.tag()) {
+        argv.extend(["--digest".into(), reference.into()]);
+    }
     // Proc-locks snapshots include OFD locks from other PID namespaces. Share
     // the native host lease inode, not one file per container or validation.
     if needs_proc_locks_runtime(&step.tag()) {
@@ -1502,7 +1594,7 @@ fn pinned_root_command(step: &Step) -> String {
         "--".into(),
         "bash".into(),
         "-c".into(),
-        PINNED_ROOT_COMMAND_GUARD.into(),
+        command_guard_for_tag(&step.tag()).into(),
         "bash".into(),
         if step.tag() == "test.regular_crates" {
             step.cmd.replace("./ci/run-nextest-counted.sh", "./ci/run-nextest-counted.sh --calibration-launch-proof /run/hermit-nextest-launch.json")
@@ -1550,15 +1642,84 @@ pub(crate) fn refresh_pinned_root_environment(tag: &str, command: &str) -> Resul
             }
         }
     }
-    let legacy = format!("{} bash ", shell_quote(LEGACY_PINNED_ROOT_COMMAND_GUARD));
-    let current = format!("{} bash ", shell_quote(PINNED_ROOT_COMMAND_GUARD));
-    let payload = if let Some(command) = payload.strip_prefix(&legacy) {
-        format!("{current}{command}")
-    } else if payload.starts_with(&current) {
-        payload.to_owned()
-    } else {
-        return Err(format!("{tag} has an unrecognized pinned-root argv guard"));
-    };
+    let digests: Vec<&str> = words
+        .windows(2)
+        .filter(|pair| pair[0] == "--digest")
+        .map(|pair| pair[1])
+        .collect();
+    match (family_image_reference(tag), digests.as_slice()) {
+        (Some(reference), []) => {
+            let position = refreshed.find(" --env ").unwrap_or(refreshed.len());
+            refreshed.insert_str(position, &format!(" --digest {reference}"));
+        }
+        (Some(_), [_]) => {}
+        _ => {}
+    }
+    // Forward the image stamp only on family-mapped buckets: authored
+    // static commands carry no such token, so insert it with the digest.
+    if family_image_reference(tag).is_some() {
+        let stamp_count = words
+            .windows(2)
+            .filter(|pair| pair[0] == "--env" && pair[1] == "HERMIT_VALIDATION_IMAGE")
+            .count();
+        match stamp_count {
+            0 => refreshed.push_str(" --env HERMIT_VALIDATION_IMAGE"),
+            1 => {}
+            _ => {
+                return Err(format!(
+                    "{tag} forwards HERMIT_VALIDATION_IMAGE more than once"
+                ));
+            }
+        }
+    }
+    match (family_image_reference(tag), digests.as_slice()) {
+        (Some(_), []) => {}
+        (Some(reference), [present]) if *present == reference => {}
+        (Some(_), _) => {
+            return Err(format!(
+                "{tag} has an unexpected family image digest option"
+            ));
+        }
+        (None, []) => {}
+        (None, _) => {
+            return Err(format!("{tag} must not set a family image digest"));
+        }
+    }
+    let (current_guard, accepted_guards): (&str, [&str; 4]) =
+        if family_image_reference(tag).is_some() {
+            // Authored static commands still carry the build guard; the
+            // family switch upgrades them to the test-node guard here.
+            (
+                TEST_NODE_COMMAND_GUARD,
+                [
+                    TEST_NODE_COMMAND_GUARD,
+                    LEGACY_TEST_NODE_COMMAND_GUARD,
+                    PINNED_ROOT_COMMAND_GUARD,
+                    LEGACY_PINNED_ROOT_COMMAND_GUARD,
+                ],
+            )
+        } else {
+            (
+                PINNED_ROOT_COMMAND_GUARD,
+                [
+                    PINNED_ROOT_COMMAND_GUARD,
+                    LEGACY_PINNED_ROOT_COMMAND_GUARD,
+                    PINNED_ROOT_COMMAND_GUARD,
+                    LEGACY_PINNED_ROOT_COMMAND_GUARD,
+                ],
+            )
+        };
+    let current = format!("{} bash ", shell_quote(current_guard));
+    let mut upgraded = None;
+    for guard in accepted_guards {
+        let prefix = format!("{} bash ", shell_quote(guard));
+        if let Some(command) = payload.strip_prefix(&prefix) {
+            upgraded = Some(format!("{current}{command}"));
+            break;
+        }
+    }
+    let payload =
+        upgraded.ok_or_else(|| format!("{tag} has an unrecognized pinned-root argv guard"))?;
     Ok(format!("{refreshed} -- bash -c {payload}"))
 }
 
@@ -1585,25 +1746,27 @@ fn pinned_root_fetch() -> Result<Step, String> {
     Ok(step)
 }
 
-/// One directly constructed pinned producer step of the native-exec cohort
+/// One directly constructed pinned producer step of a non-default cohort's
 /// pair, in the shape `split_pinned_workspace_twin` leaves its halves:
 /// pinned dependencies and environment set, payload wrapped by
 /// `pinned_root_command`. The cohort environment (slug and target
 /// directory) comes from the one cohort declaration, exactly as
 /// `materialize` attaches it to the authored consumer.
-struct NativeExecPinnedStep {
+struct CohortPinnedStep {
+    cohort: crate::nextest_binaries::PreparedCohort,
     job: &'static str,
     desc: &'static str,
     description: &'static str,
     payload: String,
-    deps: &'static [&'static str],
+    deps: Vec<&'static str>,
     est_duration_s: f64,
     timeout: i64,
     cpu_timeout: i64,
 }
 
-fn native_exec_pinned_step(spec: NativeExecPinnedStep) -> Result<Step, String> {
-    let NativeExecPinnedStep {
+fn cohort_pinned_step(spec: CohortPinnedStep) -> Result<Step, String> {
+    let CohortPinnedStep {
+        cohort,
         job,
         desc,
         description,
@@ -1613,84 +1776,156 @@ fn native_exec_pinned_step(spec: NativeExecPinnedStep) -> Result<Step, String> {
         timeout,
         cpu_timeout,
     } = spec;
-    let cohort = crate::nextest_binaries::NATIVE_EXEC_COHORT;
+    let name = cohort.name();
     // Dependencies are assigned after the parse, like the fetch node's:
     // dag_from_json refuses a dependency no step in its own document
     // declares, and these producers depend on nodes of the full graph.
     let text = format!(
-        r#"{{"description":"native-exec pinned producer","steps":[{{"group":"build","job":{job},"desc":{desc},"description":{description},"cmd":{cmd},"deps":[],"env":{{"HERMIT_E2E_EMPTY_WORKDIR":"/test",{cohort_env}:{slug},"CARGO_TARGET_DIR":{target_dir}}},"labels":["full","portable"],"result_manifests":[],"timeout":{timeout},"cpu_timeout":{cpu_timeout},"jobs_flag":"","jobs_env":"CARGO_BUILD_JOBS","hint":{{"est_duration_s":{est_duration_s},"rss_baseline_bytes":15032385536,"hard_mem_max_bytes":19327352832,"classification":"cpu-bound","preferred_inner_jobs":32}},"fail_fast_family":{family}}}]}}"#,
+        r#"{{"description":"{name} pinned producer","steps":[{{"group":"build","job":{job},"desc":{desc},"description":{description},"cmd":{cmd},"deps":[],"env":{{"HERMIT_E2E_EMPTY_WORKDIR":"/test",{cohort_env}:{slug},"CARGO_TARGET_DIR":{target_dir}}},"labels":["full","portable"],"result_manifests":[],"timeout":{timeout},"cpu_timeout":{cpu_timeout},"jobs_flag":"","jobs_env":"CARGO_BUILD_JOBS","hint":{{"est_duration_s":{est_duration_s},"rss_baseline_bytes":15032385536,"hard_mem_max_bytes":19327352832,"classification":"cpu-bound","preferred_inner_jobs":32}},"fail_fast_family":{family}}}]}}"#,
         job = serde_json::to_string(job).expect("constant is serializable"),
         desc = serde_json::to_string(desc).expect("constant is serializable"),
         description = serde_json::to_string(description).expect("constant is serializable"),
         cmd = serde_json::to_string(&payload).expect("constant is serializable"),
         cohort_env = serde_json::to_string(crate::nextest_binaries::COHORT_ENV)
             .expect("constant is serializable"),
-        slug = serde_json::to_string(cohort.env_value().expect("native cohort has a slug"))
-            .expect("constant is serializable"),
+        slug = serde_json::to_string(
+            cohort
+                .env_value()
+                .ok_or("a cohort producer needs a non-default cohort")?
+        )
+        .expect("constant is serializable"),
         target_dir = serde_json::to_string(
             cohort
                 .target_dir()
-                .expect("native cohort has a target directory")
+                .ok_or("a cohort producer needs a cohort target directory")?
         )
         .expect("constant is serializable"),
         family = serde_json::to_string(&format!("build.{job}")).expect("constant is serializable"),
     );
     let mut step = dag_from_json(&text)
-        .map_err(|error| format!("internal native-exec producer node is invalid: {error}"))?
+        .map_err(|error| format!("internal {name} producer node is invalid: {error}"))?
         .steps
         .into_iter()
         .next()
-        .ok_or_else(|| "internal native-exec producer node disappeared".to_string())?;
+        .ok_or_else(|| format!("internal {name} producer node disappeared"))?;
     step.deps = deps.iter().map(|dependency| (*dependency).into()).collect();
     step.cmd = pinned_root_command(&step);
     Ok(step)
 }
 
-/// The native-exec cohort's compile and prepare producers, constructed in
+/// One non-default cohort's producer pair: the consumer whose declared
+/// selection the compile half builds, and each half's identity and budgets.
+struct CohortProducers {
+    cohort: crate::nextest_binaries::PreparedCohort,
+    consumer: &'static str,
+    compile_tag: &'static str,
+    compile_job: &'static str,
+    compile_desc: &'static str,
+    compile_description: &'static str,
+    prepare_job: &'static str,
+    prepare_desc: &'static str,
+    prepare_description: &'static str,
+    /// The compile half's wall bound, by the step_limits rule (its
+    /// description gives the derivation).
+    compile_timeout: i64,
+    /// Whether the compile half also builds the in-guest Detcore runtime
+    /// beside the cohort's test executables (ci/stage-detcore-liteinst.sh),
+    /// as the default workspace build does for the default cohort.
+    stages_liteinst_runtime: bool,
+}
+
+/// Each non-default cohort's producer pair.
+const COHORT_PRODUCERS: [CohortProducers; 2] = [
+    CohortProducers {
+        cohort: crate::nextest_binaries::NATIVE_EXEC_COHORT,
+        consumer: "test.hermit_native_exec",
+        compile_tag: PINNED_NATIVE_EXEC_COMPILE_TAG,
+        compile_job: PINNED_NATIVE_EXEC_COMPILE_JOB,
+        compile_desc: PINNED_NATIVE_EXEC_COMPILE_DESC,
+        compile_description: PINNED_NATIVE_EXEC_COMPILE_DESCRIPTION,
+        prepare_job: PINNED_NATIVE_EXEC_PREPARE_JOB,
+        prepare_desc: PINNED_NATIVE_EXEC_PREPARE_DESC,
+        prepare_description: PINNED_NATIVE_EXEC_PREPARE_DESCRIPTION,
+        compile_timeout: 600,
+        stages_liteinst_runtime: false,
+    },
+    CohortProducers {
+        cohort: crate::nextest_binaries::EXEC_STOP_LAUNCHER_COHORT,
+        consumer: "test.hermit_exec_stop_launcher",
+        compile_tag: PINNED_EXEC_STOP_LAUNCHER_COMPILE_TAG,
+        compile_job: PINNED_EXEC_STOP_LAUNCHER_COMPILE_JOB,
+        compile_desc: PINNED_EXEC_STOP_LAUNCHER_COMPILE_DESC,
+        compile_description: PINNED_EXEC_STOP_LAUNCHER_COMPILE_DESCRIPTION,
+        prepare_job: PINNED_EXEC_STOP_LAUNCHER_PREPARE_JOB,
+        prepare_desc: PINNED_EXEC_STOP_LAUNCHER_PREPARE_DESC,
+        prepare_description: PINNED_EXEC_STOP_LAUNCHER_PREPARE_DESCRIPTION,
+        compile_timeout: 960,
+        stages_liteinst_runtime: true,
+    },
+];
+
+/// The compile-half step that builds the in-guest Detcore runtime
+/// (libdetcore_liteinst.so) into the cohort's validate-profile deps
+/// directory, beside its test executables, where Hermit's resolver finds it
+/// when no installation is selected.
+const EXEC_STOP_LAUNCHER_RUNTIME_STAGING: &str = "./ci/run-with-core-build.sh ./ci/stage-detcore-liteinst.sh --source . --target-dir \"${CARGO_TARGET_DIR:?}\" --profile validate --offline && ";
+
+/// Every non-default cohort's compile and prepare producers, constructed in
 /// their pinned form (no host node consumes them). Called after
 /// `materialize_pinned_root`, whose retention would otherwise drop
 /// authored `_in_pinned_root` jobs; admission is through
 /// `POST_SPLIT_CORE_NODES` like every post-split node.
-fn materialize_native_exec_producers(cfg: &mut DagConfig) -> Result<(), String> {
+fn materialize_cohort_producers(cfg: &mut DagConfig) -> Result<(), String> {
     let environment = crate::validation_dag_static::RUST_SCRIPT_ENVIRONMENT;
-    let selection = crate::nextest_build_selections::for_step("test.hermit_native_exec")
-        .ok_or("test.hermit_native_exec has no declared Cargo build selection")?
-        .join(" ");
-    let compile = native_exec_pinned_step(NativeExecPinnedStep {
-        job: PINNED_NATIVE_EXEC_COMPILE_JOB,
-        desc: PINNED_NATIVE_EXEC_COMPILE_DESC,
-        description: PINNED_NATIVE_EXEC_COMPILE_DESCRIPTION,
-        payload: format!(
-            "{environment}./ci/run-with-core-build.sh cargo build --locked --profile validate {selection} && ./ci/run-with-core-build.sh cargo build --locked -p hermit-manifest-plan --bin nextest-cpu-wrapper"
-        ),
-        deps: &["pre.reverie_pin", PINNED_ROOT_FETCH_TAG],
-        est_duration_s: 350.0,
-        timeout: 600,
-        cpu_timeout: 4200,
-    })?;
-    let prepare = native_exec_pinned_step(NativeExecPinnedStep {
-        job: PINNED_NATIVE_EXEC_PREPARE_JOB,
-        desc: PINNED_NATIVE_EXEC_PREPARE_DESC,
-        description: PINNED_NATIVE_EXEC_PREPARE_DESCRIPTION,
-        payload: format!(
-            "{environment}{}",
-            crate::nextest_binaries::cohort_prepare_command(
-                "full",
-                crate::nextest_binaries::NATIVE_EXEC_COHORT
-            )?
-        ),
-        deps: &[
-            PINNED_NATIVE_EXEC_COMPILE_TAG,
-            PINNED_RUST_SCRIPTS_TAG,
-            "pre.reverie_pin",
-            PINNED_ROOT_FETCH_TAG,
-        ],
-        est_duration_s: 260.0,
-        timeout: 600,
-        cpu_timeout: 1800,
-    })?;
-    cfg.steps.push(compile);
-    cfg.steps.push(prepare);
+    for producers in &COHORT_PRODUCERS {
+        let selection = crate::nextest_build_selections::for_step(producers.consumer)
+            .ok_or_else(|| {
+                format!(
+                    "{} has no declared Cargo build selection",
+                    producers.consumer
+                )
+            })?
+            .join(" ");
+        let staging = if producers.stages_liteinst_runtime {
+            EXEC_STOP_LAUNCHER_RUNTIME_STAGING
+        } else {
+            ""
+        };
+        let compile = cohort_pinned_step(CohortPinnedStep {
+            cohort: producers.cohort,
+            job: producers.compile_job,
+            desc: producers.compile_desc,
+            description: producers.compile_description,
+            payload: format!(
+                "{environment}./ci/run-with-core-build.sh cargo build --locked --profile validate {selection} && {staging}./ci/run-with-core-build.sh cargo build --locked -p hermit-manifest-plan --bin nextest-cpu-wrapper"
+            ),
+            deps: vec!["pre.reverie_pin", PINNED_ROOT_FETCH_TAG],
+            est_duration_s: 350.0,
+            timeout: producers.compile_timeout,
+            cpu_timeout: 4200,
+        })?;
+        let prepare = cohort_pinned_step(CohortPinnedStep {
+            cohort: producers.cohort,
+            job: producers.prepare_job,
+            desc: producers.prepare_desc,
+            description: producers.prepare_description,
+            payload: format!(
+                "{environment}{}",
+                crate::nextest_binaries::cohort_prepare_command("full", producers.cohort)?
+            ),
+            deps: vec![
+                producers.compile_tag,
+                PINNED_RUST_SCRIPTS_TAG,
+                "pre.reverie_pin",
+                PINNED_ROOT_FETCH_TAG,
+            ],
+            est_duration_s: 260.0,
+            timeout: 600,
+            cpu_timeout: 1800,
+        })?;
+        cfg.steps.push(compile);
+        cfg.steps.push(prepare);
+    }
     Ok(())
 }
 
@@ -3073,6 +3308,9 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
     stage.description = "Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, with e2e.buck_cells. On the host it runs ci/buck-e2e/stage --from-cargo (ci/buck-e2e/validate-node --stage-only): a Cargo build in the checkout's target/ of the release test-harness and hermit-manifest-plan (target/release), the validate-profile hermit (target/stage-hermit, copied to target/validate/hermit) and detcore-dbt then the install bundle (target/validate), published with ci/publish-hermit-e2e-artifact.sh; then git archive HEAD and the CI-selected fixtures built from it. It writes ci/buck-e2e/staged/ for HEAD, SOURCE_SHA last, and refuses a tree with uncommitted changes to tracked files. It needs no buck2 and no runner, only the pinned Reverie (pre.reverie_pin): it builds nothing in target/ci or target/debug, so it runs beside build.rust_scripts (target/ci/rust-script-build) and setup.manifest_plan (target/debug), and Cargo's per-profile-directory locks keep the three from waiting on each other. Until 2026-10-05 the stage ran inside e2e.buck_cells, after those two and gate.manifest: in the full validation of hermit f53e746779 on a 284-core host they took 202, 34 and 3 seconds before the 422.74-second e2e.buck_cells began.".into();
     stage.labels = vec![FULL_BUCK_E2E_LABEL.into()];
     stage.cmd = BUCK_STAGE_COMMAND.into();
+    // It stages with Cargo and runs no buck2, so it takes no buck_daemon unit: it does not
+    // wait behind the Buck builds.
+    stage.hint.resources.remove(BUCK_DAEMON_RESOURCE);
     stage.deps = vec!["pre.reverie_pin".into()];
     // ci/buck-e2e/stage with its builds side by side (02eba338ab), cold:
     // 143.3 to 144.2 s wall at 32 jobs and 128.6 s at 96, 2276 to 2312 CPU-s.
@@ -3480,8 +3718,16 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
             }
             step.cmd = step.cmd.replace(previous, "ARGS='run --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --mount=type=tmpfs,target=/test --workdir=/test'");
         }
-        step.env
-            .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
+        // test.record_replay never reads HERMIT_E2E_EMPTY_WORKDIR and
+        // never calls the harness's guest-workdir injection, and
+        // run_node.py gives each of its cases an isolated cwd of its
+        // own. Naming /test for it only makes the runner's workdir
+        // probe skip the whole node on hosts without /test. Every
+        // other pinned-root step keeps the variable.
+        if step.tag() != "test.record_replay" {
+            step.env
+                .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
+        }
         step.deps = step
             .deps
             .iter()
@@ -3551,6 +3797,13 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
         }
         step.deps.sort();
         step.deps.dedup();
+        // Family-composed buckets stamp the image they ran in, so
+        // result rows can never credit another image (seat F6). The
+        // wrapper forwards this name because it is in step env.
+        if let Some(reference) = family_image_reference(&step.tag()) {
+            step.env
+                .insert("HERMIT_VALIDATION_IMAGE".into(), reference.into());
+        }
         if !step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
             step.cmd = pinned_root_command(step);
         } else {
@@ -4264,9 +4517,13 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // the gvisor bucket's three producers.
     // 155 with test.hermit_native_exec, the native-exec cohort's counted
     // consumer (dh-10l17).
-    if expected.len() != 155 {
+    // 156 with test.hermit_exec_stop_launcher, the exec-stop-launcher
+    // cohort's counted consumer.
+    // 157 with privileged-test.autofs_cases, the autofs-capable
+    // privileged node for the two host-limited autofs cases (dh-b1go3k).
+    if expected.len() != 157 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 155",
+            "structured result producer registry has {} entries, expected 157",
             expected.len()
         ));
     }
@@ -4559,8 +4816,16 @@ pub const QUICK_EXCLUDED_CATEGORIES: &[&str] = &["compat"];
 /// requires the committed node to end with it and validate.rs requires it of
 /// the raw publisher, so the omitted cells and the omitted results agree.
 pub fn quick_verify_command() -> String {
+    // --parity-plan-of-selected-tests: this ptrace-only run's own plan
+    // holds no candidate backend for any test, so without it every cell
+    // would keep auto (x86-64-v3 on a qualifying host) where a full run
+    // names the parity golden's x86-64-v2 — which is how
+    // c-programs/arch-prctl-determinism, a guest asserting v2's
+    // normalized arch_prctl answers, drew v3 here and failed while the
+    // full profile passed it explicit. With it each selected test's
+    // golden is planned as a full run of that test plans it.
     let mut command =
-        "target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only"
+        "target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only --parity-plan-of-selected-tests"
             .to_string();
     for category in QUICK_EXCLUDED_CATEGORIES {
         command.push_str(" --exclude-category ");
@@ -5765,11 +6030,31 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
                 ("manifest_guest".into(), 20),
                 ("integration_test_binaries.cli".into(), 1),
                 ("integration_test_binaries.hermit_modes".into(), 1),
+                ("buck_daemon".into(), 1),
             ])
     {
         return Err(format!(
             "top-level validation policy changed: default_step_timeout={} resource_caps={:?}",
             cfg.default_step_timeout, cfg.resource_caps
+        ));
+    }
+    // One buck2 daemon per checkout: a step takes one buck_daemon unit (capped at 1 above)
+    // exactly when its command reaches a Buck entry point, so two such steps of a run never
+    // share, or kill, the checkout's daemon, its CPU is attributed to one step, and the steps
+    // that hold the unit are the ones ci/buck-build-compare.py requires a measurement from.
+    if let Some(step) = cfg.steps.iter().find(|step| {
+        reaches_buck_entry_point(&step.cmd)
+            != (step.hint.resources.get(BUCK_DAEMON_RESOURCE) == Some(&1))
+    }) {
+        return Err(format!(
+            "{} reaches {} Buck entry point but its buck_daemon units are {:?}: a step takes one exactly when it runs buck2",
+            step.tag(),
+            if reaches_buck_entry_point(&step.cmd) {
+                "a"
+            } else {
+                "no"
+            },
+            step.hint.resources.get(BUCK_DAEMON_RESOURCE)
         ));
     }
     let step = |tag: &str| {
@@ -6543,7 +6828,7 @@ pub fn generate(root: &Path) -> Result<DagConfig, String> {
     materialize_hosted_script_unit_tests(&mut refreshed)?;
     materialize_buck_e2e(&mut refreshed)?;
     materialize_pinned_root(&mut refreshed)?;
-    materialize_native_exec_producers(&mut refreshed)?;
+    materialize_cohort_producers(&mut refreshed)?;
     materialize_focused_preflight(&mut refreshed)?;
     materialize_quick_super_budgets(&mut refreshed);
     materialize_pressure_labels(&mut refreshed)?;
@@ -6678,16 +6963,34 @@ mod tests {
         "test.hermit_native_exec",
     ];
 
+    /// The three pinned-root steps the exec-stop-launcher cohort adds: its
+    /// compile and prepare producers and its counted consumer.
+    const PINNED_EXEC_STOP_LAUNCHER_TAGS: [&str; 3] = [
+        PINNED_EXEC_STOP_LAUNCHER_COMPILE_TAG,
+        PINNED_EXEC_STOP_LAUNCHER_PREPARE_TAG,
+        "test.hermit_exec_stop_launcher",
+    ];
+
+    /// The pinned-root step the privileged autofs cases add: their counted
+    /// node proves its host conditions, then runs inside the pinned root.
+    const PINNED_AUTOFS_TAGS: [&str; 1] = ["privileged-test.autofs_cases"];
+
     fn expected_pinned_len(pinned: &[&Step]) -> usize {
-        for tag in PINNED_NATIVE_EXEC_TAGS {
+        for tag in PINNED_NATIVE_EXEC_TAGS
+            .iter()
+            .chain(&PINNED_EXEC_STOP_LAUNCHER_TAGS)
+            .chain(&PINNED_AUTOFS_TAGS)
+        {
             assert!(
-                pinned.iter().any(|step| step.tag() == tag),
-                "native-exec pinned step {tag} missing from pinned-root inventory"
+                pinned.iter().any(|step| step.tag() == *tag),
+                "cohort pinned step {tag} missing from pinned-root inventory"
             );
         }
         // Main's pinned-root inventory was 87 through the 5286 census
-        // landing; the named native-exec steps above are the only delta.
+        // landing; the named cohort steps above are the only delta.
         87 + PINNED_NATIVE_EXEC_TAGS.len()
+            + PINNED_EXEC_STOP_LAUNCHER_TAGS.len()
+            + PINNED_AUTOFS_TAGS.len()
     }
 
     /// The `pre` nodes that no manifest gate waits for, directly or through
@@ -6971,6 +7274,12 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
+        // A kernel release with no headers, so the wrapper's one line about
+        // the running kernel's syscall header is the same on every host.
+        write_executable(
+            &root.join("tools/uname"),
+            b"#!/bin/sh\necho 0.0.0-wrapper-fixture\n",
+        );
         write_executable(
             &root.join("tools/podman"),
             br##"#!/usr/bin/env python3
@@ -6984,11 +7293,13 @@ if args == ['image', 'exists', 'fixture@sha256:000000000000000000000000000000000
 assert args[0] == 'run', args
 boundary = args.index('fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000')
 command = args[boundary + 1:]
-# Authenticate and execute the real affinity prefix before checking the
-# unchanged guard/payload tail; accepting any CPU list would hide widening.
+# Authenticate and execute the real signal-reset and affinity prefixes before
+# checking the unchanged guard/payload tail; accepting any CPU list would hide
+# widening.
+assert command[:2] == ['/bin/env', '--default-signal'], command
 expected_affinity = ','.join(map(str, sorted(os.sched_getaffinity(0))))
-assert command[:3] == ['/bin/taskset', '--cpu-list', expected_affinity], command
-affinity_prefix, command = command[:3], command[3:]
+assert command[2:5] == ['/bin/taskset', '--cpu-list', expected_affinity], command
+prefix, command = command[:5], command[5:]
 assert command[:2] == ['bash', '-c'] and command[3] == 'bash', command
 assert command[2] in json.loads((root / 'guards.json').read_text()), command
 # No ambient NEXTEST_TEST_THREADS leakage: emulate only explicitly forwarded
@@ -7006,7 +7317,7 @@ for name in ['assert-no-network.sh', 'assert-build-dependencies.sh']:
     original = '/src/ci/hermetic/' + name
     assert command[2].count(original) == 1
     command[2] = command[2].replace(original, shlex.quote(str(root / 'ci/hermetic' / name)))
-completed = subprocess.run(affinity_prefix + command, cwd=root, env=env, timeout=5)
+completed = subprocess.run(prefix + command, cwd=root, env=env, timeout=5)
 sys.exit(completed.returncode)
 "##,
         );
@@ -7080,7 +7391,19 @@ sys.exit(37)
             String::from_utf8_lossy(&output.stderr),
         );
         assert_eq!(output.stdout, b"literal-payload-status-37\n");
-        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+        let expected_stderr: &[u8] = if wrapped {
+            b"run-in-pinned-root: the running kernel's uapi headers are absent at \
+/lib/modules/0.0.0-wrapper-fixture/build/arch/x86/include/generated/uapi/asm; \
+the host syscall-table test will fail by name\n"
+        } else {
+            b""
+        };
+        assert_eq!(
+            output.stderr,
+            expected_stderr,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         if wrapped {
             let calls = fs::read_to_string(root.join("podman.jsonl")).unwrap();
             let calls = calls
@@ -7100,9 +7423,10 @@ sys.exit(37)
                 .iter()
                 .position(|arg| arg == "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000")
                 .unwrap();
-            // The fake Podman authenticates and executes all three taskset
-            // arguments; these assertions still address the original payload.
-            let payload = &calls[1][boundary + 4..];
+            // The fake Podman authenticates and executes the two signal-reset
+            // and three taskset arguments; these assertions still address the
+            // original payload.
+            let payload = &calls[1][boundary + 6..];
             assert_eq!(payload[4], unwrapped);
             if step.jobs_env.as_deref() == Some("NEXTEST_TEST_THREADS") {
                 assert_eq!(
@@ -7464,6 +7788,118 @@ sys.exit(37)
     }
 
     #[test]
+    fn family_image_seam_switches_only_system_utils() {
+        let reference = family_image_reference("e2e.manifest_system_utils")
+            .expect("system-utils is family-mapped");
+        // The code constant must mirror the checked receipt exactly.
+        let receipt: serde_json::Value =
+            serde_json::from_str(include_str!("../../hermetic/images/mini-suite.json"))
+                .expect("suite receipt parses");
+        assert_eq!(receipt["image"]["reference"], reference);
+        assert!(
+            reference.ends_with(
+                "sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c"
+            )
+        );
+        for tag in [
+            "e2e.manifest_language_runtimes",
+            "build.workspace_compile_in_pinned_root",
+            "build.manifest_guests_in_pinned_root",
+        ] {
+            assert_eq!(
+                family_image_reference(tag),
+                None,
+                "{tag} must stay monolith"
+            );
+        }
+        let mut step = owner(Vec::new());
+        step.group = "e2e".to_string();
+        step.job = "manifest_system_utils".to_string();
+        step.cmd = "true".to_string();
+        step.env
+            .insert("HERMIT_VALIDATION_IMAGE".into(), reference.into());
+        let command = pinned_root_command(&step);
+        assert!(
+            command.contains(&format!("--digest {reference}")),
+            "system-utils wrapper must pin the suite digest: {command}"
+        );
+        assert!(
+            command.contains("assert-test-dependencies.sh"),
+            "system-utils wrapper must use the test-node guard: {command}"
+        );
+        assert!(!command.contains("assert-build-dependencies.sh"));
+        // Refresh is idempotent on the generated command and refuses a
+        // wrong family digest by name.
+        assert_eq!(
+            refresh_pinned_root_environment("e2e.manifest_system_utils", &command).unwrap(),
+            command
+        );
+        let wrong = command.replace(
+            reference,
+            "localhost/hermit-hermetic-validate@sha256:8cc3da4d4aad5a5322ab6358bfb805c4f3662db1ce5cab217289547cb3f5752f",
+        );
+        assert!(refresh_pinned_root_environment("e2e.manifest_system_utils", &wrong).is_err());
+        // Committed DAG: exactly the system-utils bucket carries it.
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let switched: Vec<String> = committed
+            .steps
+            .iter()
+            .filter(|s| s.cmd.contains("--digest "))
+            .map(|s| s.tag())
+            .collect();
+        assert_eq!(switched, ["e2e.manifest_system_utils"]);
+        // Exactly one forwarder (seat 8:29): only the switched bucket
+        // forwards HERMIT_VALIDATION_IMAGE into its container, so a
+        // stray outer value can never stamp a monolith container.
+        let forwarders: Vec<String> = committed
+            .steps
+            .iter()
+            .filter(|s| s.cmd.contains(" --env HERMIT_VALIDATION_IMAGE"))
+            .map(|s| s.tag())
+            .collect();
+        assert_eq!(forwarders, ["e2e.manifest_system_utils"]);
+        let sysutils = committed
+            .steps
+            .iter()
+            .find(|s| s.tag() == "e2e.manifest_system_utils")
+            .unwrap();
+        assert!(sysutils.cmd.contains("assert-test-dependencies.sh"));
+        assert!(!sysutils.cmd.contains("assert-build-dependencies.sh"));
+        // Payload visibility: the wrapper must forward the stamp name so
+        // the container actually receives HERMIT_VALIDATION_IMAGE (a
+        // dashboard-checkable claim, seat F6).
+        assert!(
+            command.contains(" --env HERMIT_VALIDATION_IMAGE "),
+            "system-utils wrapper must forward HERMIT_VALIDATION_IMAGE: {command}"
+        );
+        assert_eq!(
+            step.env.get("HERMIT_VALIDATION_IMAGE").map(String::as_str),
+            Some(reference)
+        );
+    }
+
+    #[test]
+    fn family_seam_refresh_refuses_unmapped_digest_and_guard() {
+        // An unmapped tag carrying a stray --digest is refused.
+        let mut step = owner(Vec::new());
+        step.cmd = "true".to_string();
+        let authored = pinned_root_command(&step).replace(
+            "run-in-pinned-root.sh ",
+            "run-in-pinned-root.sh --digest localhost/hermit-hermetic-mini-suite@sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c ",
+        );
+        let err = refresh_pinned_root_environment(&step.tag(), &authored).unwrap_err();
+        assert!(err.contains("must not set a family image digest"), "{err}");
+        // An unmapped tag carrying the test-node guard is refused (the
+        // payload no longer matches this tag's accepted guard spellings).
+        let authored = pinned_root_command(&step).replace(
+            "assert-build-dependencies.sh",
+            "assert-test-dependencies.sh",
+        );
+        let err = refresh_pinned_root_environment(&step.tag(), &authored).unwrap_err();
+        assert!(err.contains("unrecognized pinned-root argv guard"), "{err}");
+    }
+
+    #[test]
     fn pinned_wrapper_delivers_keep_going_markers_to_the_payload() {
         // The fake Podman reconstructs the payload environment only from the
         // wrapper's forwarded names, so a marker reaches the payload inside
@@ -7485,14 +7921,28 @@ sys.exit(37)
 
     #[test]
     fn pinned_wrapper_honors_the_cohort_cargo_target_declaration() {
-        // The native steps declare CARGO_TARGET_DIR=target/cohort-native-exec
+        // Each cohort's steps declare CARGO_TARGET_DIR=target/cohort-<slug>
         // in their step env. The wrapper must deliver that declaration as
         // the mounted cohort subdirectory, not force the default
         // /src/target: forcing it (the pre-fix behavior) built the native
         // cohort into the default target while its record verified
         // self-consistently against the wrong target.
-        let cohort = crate::nextest_binaries::NATIVE_EXEC_COHORT;
-        for tag in PINNED_NATIVE_EXEC_TAGS {
+        let cohorts = [
+            (
+                crate::nextest_binaries::NATIVE_EXEC_COHORT,
+                &PINNED_NATIVE_EXEC_TAGS[..],
+            ),
+            (
+                crate::nextest_binaries::EXEC_STOP_LAUNCHER_COHORT,
+                &PINNED_EXEC_STOP_LAUNCHER_TAGS[..],
+            ),
+        ];
+        for (cohort, tag) in cohorts
+            .iter()
+            .flat_map(|(cohort, tags)| tags.iter().map(move |tag| (*cohort, *tag)))
+        {
+            let slug = cohort.env_value().expect("cohort slug");
+            let target = cohort.target_dir().expect("cohort target directory");
             let mut step = owner(Vec::new());
             let (group, job) = tag.split_once('.').unwrap();
             step.group = group.to_string();
@@ -7500,25 +7950,21 @@ sys.exit(37)
             step.cmd = "true".to_string();
             step.env.insert(
                 crate::nextest_binaries::COHORT_ENV.to_string(),
-                cohort.env_value().expect("native cohort slug").to_string(),
+                slug.to_string(),
             );
-            step.env.insert(
-                "CARGO_TARGET_DIR".to_string(),
-                cohort
-                    .target_dir()
-                    .expect("native cohort target directory")
-                    .to_string(),
-            );
+            step.env
+                .insert("CARGO_TARGET_DIR".to_string(), target.to_string());
             let plain = renderer_wrapper_capture(&step, 8, false);
-            assert_eq!(plain["cohort"], "native-exec", "{tag}");
+            assert_eq!(plain["cohort"], slug, "{tag}");
             assert_eq!(
-                plain["cohort_cargo_target_dir"], "target/cohort-native-exec",
+                plain["cohort_cargo_target_dir"], target,
                 "{tag} plain payload must see the declaration itself"
             );
             let wrapped = renderer_wrapper_capture(&step, 8, true);
-            assert_eq!(wrapped["cohort"], "native-exec", "{tag}");
+            assert_eq!(wrapped["cohort"], slug, "{tag}");
             assert_eq!(
-                wrapped["cohort_cargo_target_dir"], "/src/target/cohort-native-exec",
+                wrapped["cohort_cargo_target_dir"],
+                format!("/src/{target}"),
                 "{tag} must keep its declared cohort target inside the pinned root"
             );
         }
@@ -7769,6 +8215,88 @@ sys.exit(37)
             labels_of(&consumed, "build.manifest_guests"),
             ["hosted-portable", "portable"]
         );
+    }
+
+    #[test]
+    fn committed_exec_stop_launcher_nodes_run_exactly_the_required_commands() {
+        // The code behind cfg(all(feature = "exec-stop-launcher", feature =
+        // "liteinst")) runs only in these nodes; pin each command whole so a
+        // later edit cannot narrow the population or drop the runtime
+        // staging without failing here.
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let step = |tag: &str| {
+            committed
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .unwrap_or_else(|| panic!("{tag} is missing from the committed graph"))
+        };
+        let payload = |tag: &str| {
+            crate::nextest_build_selections::execution_command(step(tag))
+                .unwrap_or_else(|error| panic!("{tag}: {error}"))
+        };
+        const PREFIX: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; "#;
+        const CASES: &str =
+            "app::mapped_first_admission::physical_tests::packet_held_tests::mapped_cancel::";
+        let selection =
+            r#"["-p","hermit-run","--features","exec-stop-launcher,liteinst","--lib","--bins"]"#;
+
+        let main = "test.hermit_exec_stop_launcher";
+        assert_eq!(
+            payload(main),
+            format!(
+                "{PREFIX}./ci/run-with-core-build.sh ./ci/run-nextest-counted.sh ${{CI:+--profile ci}} -p hermit-run --features exec-stop-launcher,liteinst --lib --bins -j 1 -E 'not test(/^{CASES}mapped_(?:packet_prepared_same_birth|packet_prepared_other_birth_refuses|packet_prepared_poison_refuses_old_lease|genuine_initializer_returns_before_guest)$/)' -- --skip ptrace_completion::tests::real_random_"
+            )
+        );
+        assert_eq!(
+            step(main).deps,
+            [
+                "build.e2e_artifact_in_pinned_root",
+                "build.hermit_exec_stop_launcher_in_pinned_root",
+                "build.rust_scripts_in_pinned_root",
+                "build.workspace_in_pinned_root",
+                "gate.manifest",
+                "pre.reverie_pin",
+                "setup.pinned_root_fetch",
+            ]
+        );
+
+        let consumer = step(main);
+        assert_eq!(consumer.labels, ["full", "portable"]);
+        assert!(
+            consumer
+                .cmd
+                .starts_with("./ci/hermetic/run-in-pinned-root.sh "),
+            "{main} must run in the pinned root"
+        );
+        assert_eq!(
+            consumer
+                .env
+                .get(crate::nextest_binaries::SELECTION_ENV)
+                .map(String::as_str),
+            Some(selection)
+        );
+        assert_eq!(
+            consumer
+                .env
+                .get(crate::nextest_binaries::COHORT_ENV)
+                .map(String::as_str),
+            Some("exec-stop-launcher")
+        );
+        assert_eq!(
+            consumer.env.get("CARGO_TARGET_DIR").map(String::as_str),
+            Some("target/cohort-exec-stop-launcher")
+        );
+
+        assert_eq!(
+            payload(PINNED_EXEC_STOP_LAUNCHER_COMPILE_TAG),
+            format!(
+                "{PREFIX}./ci/run-with-core-build.sh cargo build --locked --profile validate -p hermit-run --features exec-stop-launcher,liteinst --lib --bins && ./ci/run-with-core-build.sh ./ci/stage-detcore-liteinst.sh --source . --target-dir \"${{CARGO_TARGET_DIR:?}}\" --profile validate --offline && ./ci/run-with-core-build.sh cargo build --locked -p hermit-manifest-plan --bin nextest-cpu-wrapper"
+            )
+        );
+        assert!(payload(PINNED_EXEC_STOP_LAUNCHER_PREPARE_TAG).ends_with(
+            "./ci/nextest-binaries.rs prepare full --build-mode cargo --cohort exec-stop-launcher && ./ci/nextest-binaries.rs assert full --cohort exec-stop-launcher"
+        ));
     }
 
     /// dh-63c2n3, by name: on the committed DAG, the guest-build retirement
@@ -8041,11 +8569,14 @@ sys.exit(37)
         // memory.events `max` to 15032), so the true peak was censored; an
         // Fresh uncapped cold builds at this head (j8, fresh target,
         // cache-inclusive memory.peak): 5.00, 4.54 and 4.28 GiB, anonymous
-        // at most 1.46 GiB polled. Baseline 5 GiB (worst observed), hard
-        // cap 6 GiB, on the host step and its
-        // pinned-root twin alike. setup.manifest_plan_on_host is excluded:
-        // its spec records that the local twin's measurements do not apply
-        // on the hosted-privileged runner.
+        // at most 1.46 GiB polled. Baseline 5 GiB (worst observed). The
+        // 2026-11-25 look-back over retained dagrun profiles then found
+        // real-build peaks to 6.26 GB in this family (setup.manifest_plan
+        // worst 6,258,323,456 B), so the shared hard cap is now 9 GiB (at
+        // least 1.5x each node's worst uncensored peak), on the host step
+        // and its pinned-root twin alike. setup.manifest_plan_on_host is
+        // excluded: its spec records that the local twin's measurements do
+        // not apply on the hosted-privileged runner.
         let cfg = generated_dag();
         let mut saw = false;
         for step in &cfg.steps {
@@ -8062,7 +8593,7 @@ sys.exit(37)
                 );
                 assert_eq!(
                     step.hint.hard_mem_max_bytes,
-                    Some(6 * 1024 * 1024 * 1024),
+                    Some(9 * 1024 * 1024 * 1024),
                     "{}",
                     step.tag()
                 );
@@ -8572,6 +9103,101 @@ sys.exit(37)
                     "{tag} passes --parity-reference; backend parity no longer decides a validation outcome (https://github.com/rrnewton/hermit/issues/3301)"
                 )
             );
+        }
+    }
+
+    /// Exactly the committed steps that run buck2 hold the one buck_daemon unit, in both
+    /// directions: a Buck step that drops it, a step that holds it but runs no buck2, and a
+    /// cap other than 1 are each refused by name.
+    #[test]
+    fn exactly_the_buck_steps_take_the_one_buck_daemon_unit() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
+        assert_invariants(&committed, &cells).unwrap();
+        assert_eq!(committed.resource_caps.get(BUCK_DAEMON_RESOURCE), Some(&1));
+        let holders: BTreeSet<String> = committed
+            .steps
+            .iter()
+            .filter(|step| step.hint.resources.get(BUCK_DAEMON_RESOURCE) == Some(&1))
+            .map(|step| step.tag())
+            .collect();
+        // The three committed steps that run buck2. e2e.buck_stage stages with Cargo, and the
+        // E2E publishers only install the verified binary.
+        assert_eq!(
+            holders,
+            BTreeSet::from([
+                "build.buck_release_artifact".to_string(),
+                "build.reverie_buck".to_string(),
+                "e2e.buck_cells".to_string(),
+            ])
+        );
+        for tag in [
+            "build.reverie_buck",
+            "e2e.buck_cells",
+            "build.buck_release_artifact",
+        ] {
+            let mut planted = committed.clone();
+            planted
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .expect("the committed DAG should have this Buck step")
+                .hint
+                .resources
+                .remove(BUCK_DAEMON_RESOURCE);
+            let error = assert_invariants(&planted, &cells).unwrap_err();
+            assert!(
+                error.starts_with(&format!(
+                    "{tag} reaches a Buck entry point but its buck_daemon units are None"
+                )),
+                "{error}"
+            );
+        }
+        for tag in ["e2e.buck_stage", "build.e2e_artifact_in_pinned_root"] {
+            let mut planted = committed.clone();
+            planted
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == tag)
+                .expect("the committed DAG should have this step")
+                .hint
+                .resources
+                .insert(BUCK_DAEMON_RESOURCE.into(), 1);
+            let error = assert_invariants(&planted, &cells).unwrap_err();
+            assert!(
+                error.starts_with(&format!(
+                    "{tag} reaches no Buck entry point but its buck_daemon units are Some(1)"
+                )),
+                "{error}"
+            );
+        }
+        let mut planted = committed.clone();
+        planted.resource_caps.insert(BUCK_DAEMON_RESOURCE.into(), 2);
+        let error = assert_invariants(&planted, &cells).unwrap_err();
+        assert!(
+            error.starts_with("top-level validation policy changed"),
+            "{error}"
+        );
+    }
+
+    /// The command text decides it: validate-node in every form but --stage-only, the
+    /// harvest, and the release build, but not the release install.
+    #[test]
+    fn buck_entry_points_are_the_commands_that_run_buck2() {
+        for cmd in [
+            "./ci/buck-e2e/validate-node --cells-only",
+            "./ci/buck-e2e/validate-node",
+            "case x in buck) ./ci/harvest-reverie-buck.sh ;; esac",
+            "./ci/buck-e2e/measure-release-build ./scripts/build-buck-release.rs --validate-dag-build --dotslash x",
+        ] {
+            assert!(reaches_buck_entry_point(cmd), "{cmd} runs buck2");
+        }
+        for cmd in [
+            "./ci/buck-e2e/validate-node --stage-only",
+            "buck) ./scripts/build-buck-release.rs --validate-dag-install && x ;;",
+            "./ci/run-nextest-counted.sh -p hermit-run",
+        ] {
+            assert!(!reaches_buck_entry_point(cmd), "{cmd} runs no buck2");
         }
     }
 
@@ -11476,8 +12102,10 @@ sys.exit(37)
         };
         let local = find(&committed, SCRIPT_UNIT_TESTS_TAG);
         let hosted = find(&committed, HOSTED_SCRIPT_UNIT_TESTS_TAG);
-        assert_eq!(local.timeout, 1500);
-        assert_eq!(hosted.timeout, 1500);
+        // Literal on purpose: a wall change must trip a test, not restate
+        // the constant under test. The message pins below derive.
+        assert_eq!(local.timeout, 2400);
+        assert_eq!(hosted.timeout, 2400);
         assert_eq!(hosted.cpu_timeout, local.cpu_timeout);
         assert_eq!(hosted.cmd, local.cmd);
         assert_eq!(hosted.deps, local.deps);
@@ -11556,7 +12184,13 @@ sys.exit(37)
             .unwrap()
             .timeout = 900;
         let error = materialize_hosted_script_unit_tests(&mut rewalled).unwrap_err();
-        assert!(error.contains("not its authored 1500s"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "not its authored {}s",
+                crate::validation_dag_static::SCRIPT_UNIT_TESTS_WALL_SECONDS
+            )),
+            "{error}"
+        );
 
         // The assertion refuses each way of undoing the twin's contract.
         let mutated = |tag: &str, edit: &dyn Fn(&mut Step)| {
@@ -11572,12 +12206,18 @@ sys.exit(37)
         };
         let hosted_wall = mutated(HOSTED_SCRIPT_UNIT_TESTS_TAG, &|step| step.timeout = 900);
         assert!(
-            hosted_wall.contains("not the hosted 1500s"),
+            hosted_wall.contains(&format!(
+                "not the hosted {}s",
+                crate::validation_dag_static::HOSTED_SCRIPT_UNIT_TESTS_WALL_SECONDS
+            )),
             "{hosted_wall}"
         );
         let local_wall = mutated(SCRIPT_UNIT_TESTS_TAG, &|step| step.timeout = 900);
         assert!(
-            local_wall.contains("not its authored 1500s"),
+            local_wall.contains(&format!(
+                "not its authored {}s",
+                crate::validation_dag_static::SCRIPT_UNIT_TESTS_WALL_SECONDS
+            )),
             "{local_wall}"
         );
         for (what, edit) in [
@@ -11654,6 +12294,12 @@ sys.exit(37)
             .timeout = 900;
         let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
         let error = assert_invariants(&changed, &cells).unwrap_err();
-        assert!(error.contains("not the hosted 1500s"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "not the hosted {}s",
+                crate::validation_dag_static::HOSTED_SCRIPT_UNIT_TESTS_WALL_SECONDS
+            )),
+            "{error}"
+        );
     }
 }

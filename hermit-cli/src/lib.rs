@@ -2625,6 +2625,48 @@ impl std::fmt::Display for BackendUnavailable {
 
 impl std::error::Error for BackendUnavailable {}
 
+/// A statically selected application backend (an executable-supplied
+/// adapter, named by its `BackendAdapter::NAME`) is unavailable because a
+/// host prerequisite it explicitly requires is absent. Sibling of
+/// [`BackendUnavailable`], whose `backend` field can only name the four
+/// built-in backends. Only absence may use this type: identity or
+/// integrity failures of a present input keep their ordinary class, so
+/// CI never reads a product/artifact regression as a host gap.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AdapterUnavailable {
+    backend: &'static str,
+    reason: String,
+}
+
+impl AdapterUnavailable {
+    pub fn new(backend: &'static str, reason: impl Into<String>) -> Self {
+        Self {
+            backend,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn backend(&self) -> &'static str {
+        self.backend
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+impl std::fmt::Display for AdapterUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "backend `{}` is unavailable: {}",
+            self.backend, self.reason
+        )
+    }
+}
+
+impl std::error::Error for AdapterUnavailable {}
+
 impl Backend {
     const ALL: [Self; 4] = [Self::Ptrace, Self::Liteinst, Self::InGuestTrap, Self::Kvm];
 
@@ -4042,6 +4084,9 @@ pub fn prepare_in_guest_loader_route_config(
 ) -> Result<DetConfig, sleep_registration_admission::UnreadableSleeperSignalState> {
     let mut config = prepare_backend_config(config, Backend::InGuestTrap);
     config.in_guest_site_patching_off = true;
+    // The loader route starts Detcore before the guest's first
+    // instruction: startup is monitored, and reports say so.
+    config.startup_unmonitored = Some(false);
     sleep_registration_admission::refuse_unreadable_first_pass_launch(&config)?;
     Ok(config)
 }
@@ -4487,6 +4532,11 @@ async fn dispatch_backend(
         crate::sleep_registration_admission::refuse_unreadable_first_pass_launch(&config)?;
     }
     config.launch_image = launched_image(&command);
+    // Ptrace and KVM intercept from the first instruction; the in-guest
+    // branch below records its own (unmonitored) claim.
+    if matches!(backend, Backend::Ptrace | Backend::Kvm) {
+        config.startup_unmonitored = Some(false);
+    }
     if backend == Backend::Kvm {
         return Ok(run_kvm(
             &command,
@@ -4504,6 +4554,11 @@ async fn dispatch_backend(
         {
             let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
             let mut command = command;
+            // This dispatch is the LD_PRELOAD route (the loader route
+            // launches without reaching here): guest startup is unmonitored
+            // until the in-guest runtime arms Detcore, and every run report
+            // must say so. Set on the config every Tool image receives,
+            // below with its sibling in-guest fields.
             refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
             let (launch, _detlog_descriptor) =
                 in_guest_liteinst_launch(&mut command, &in_guest_detlog_forward_policy())?;
@@ -4517,6 +4572,7 @@ async fn dispatch_backend(
             config.in_guest_detlog_forward_policy = _detlog_descriptor
                 .is_some()
                 .then(|| in_guest_detlog_forward_policy().encode());
+            config.startup_unmonitored = Some(true);
             config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
             config.in_guest_refuses_host_timed_producers =
                 in_guest_refuses_host_timed_producers(backend);
@@ -4885,6 +4941,9 @@ async fn dispatch_output_backend(
         crate::sleep_registration_admission::refuse_unreadable_first_pass_launch(&config)?;
     }
     config.launch_image = launched_image(&command);
+    if matches!(backend, Backend::Ptrace | Backend::Kvm) {
+        config.startup_unmonitored = Some(false);
+    }
     if backend == Backend::Kvm {
         return run_kvm(
             &command,
@@ -4901,6 +4960,9 @@ async fn dispatch_output_backend(
         {
             command.stdin(output_backend_stdin()?);
             let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
+            // As in dispatch_backend: this is the LD_PRELOAD route, so the
+            // config every Tool image receives records the unmonitored
+            // startup for every run report.
             refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
             let (launch, _detlog_descriptor) =
                 in_guest_liteinst_launch(&mut command, &in_guest_detlog_forward_policy())?;
@@ -4914,6 +4976,7 @@ async fn dispatch_output_backend(
             config.in_guest_detlog_forward_policy = _detlog_descriptor
                 .is_some()
                 .then(|| in_guest_detlog_forward_policy().encode());
+            config.startup_unmonitored = Some(true);
             config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
             config.in_guest_refuses_host_timed_producers =
                 in_guest_refuses_host_timed_producers(backend);
@@ -10325,6 +10388,40 @@ mod tests {
                 dep(A)
             );
             assert_eq!(parse_reverie_pin(&text), None);
+        }
+
+        fn release_assignment(rev: &str) -> String {
+            format!("HERMIT_REVERIE_PIN = \"{rev}\"\n")
+        }
+
+        #[test]
+        fn a_single_release_revision_is_read() {
+            let text = format!("# HERMIT_REVERIE_PIN = \"{B}\"\n{}", release_assignment(A));
+            assert_eq!(parse_reverie_release_pin(&text).as_deref(), Some(A));
+        }
+
+        #[test]
+        fn duplicate_or_disagreeing_release_revisions_are_refused() {
+            let duplicate = format!("{}{}", release_assignment(A), release_assignment(A));
+            assert_eq!(parse_reverie_release_pin(&duplicate), None);
+            let disagreeing = format!("{}{}", release_assignment(A), release_assignment(B));
+            assert_eq!(parse_reverie_release_pin(&disagreeing), None);
+        }
+
+        #[test]
+        fn malformed_release_revisions_are_refused() {
+            for text in [
+                "HERMIT_REVERIE_PIN = \"beef\"\n",
+                "HERMIT_REVERIE_PIN = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n",
+                "HERMIT_REVERIE_PIN = 1111111111111111111111111111111111111111\n",
+                "PIN = HERMIT_REVERIE_PIN\n",
+            ] {
+                assert_eq!(parse_reverie_release_pin(text), None, "{text:?}");
+            }
+            assert_eq!(
+                parse_reverie_release_pin("HERMIT_VERSION = \"0.5.7\"\n"),
+                None
+            );
         }
     }
 

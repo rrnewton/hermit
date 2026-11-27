@@ -1,9 +1,15 @@
 #!/usr/bin/env -S rust-script --force
+//! Copyright (c) Meta Platforms, Inc. and affiliates.
+//! All rights reserved.
+//!
+//! This source code is licensed under the BSD-style license found in the
+//! LICENSE file in the root directory of this source tree.
+//!
 //! Construct and read dagrun's shared structured test-result record.
 //!
 //! ```cargo
 //! [dependencies]
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "cd9dd5b954178c2e0c6c0118aab31be6c5cd13a5" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "132dd98d1518973ec7d53b0537e53fdb83b62f20" }
 //! serde_json = "1"
 //! ```
 

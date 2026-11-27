@@ -115,7 +115,9 @@ use crate::syscalls::helpers::RestartBlock;
 use crate::syscalls::helpers::get_fd;
 #[cfg(target_arch = "x86_64")]
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
+use crate::syscalls::helpers::nofile_limit;
 use crate::syscalls::helpers::poll_nfds;
+use crate::syscalls::helpers::poll_nfds_exceeds_nofile;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::woken_poll_errno;
 use crate::syscalls::scm_rights::received_descriptors;
@@ -167,6 +169,18 @@ const SELECT_REQUESTED: [i16; 3] = [
     libc::POLLWRBAND | libc::POLLWRNORM | libc::POLLOUT,
     libc::POLLPRI,
 ];
+
+/// The guest address of element `index` of an array of `T` at `start`, by
+/// number. `None` if it is past the top of the address space (or would be
+/// address zero), where Linux faults the access; callers treat that like an
+/// unmapped address. No address value is formed for an element that does not
+/// exist.
+fn guest_element_address<T>(start: usize, index: usize) -> Option<usize> {
+    index
+        .checked_mul(std::mem::size_of::<T>())
+        .and_then(|offset| start.checked_add(offset))
+        .filter(|&address| address != 0)
+}
 
 /// Whether a `poll` has an entry to report.
 fn poll_ready(pollfds: &[libc::pollfd]) -> bool {
@@ -732,12 +746,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let Some(vector) = c.msgvec() else {
                     return false;
                 };
-                let vector = vector.cast::<Mmsghdr>();
+                let vector = vector.as_raw();
                 (0..c.vlen().min(libc::UIO_MAXIOV as u32) as usize).any(|index| {
-                    // SAFETY: only read through guest memory access, which
-                    // fails on an unmapped address.
-                    let entry = unsafe { vector.add(index) };
-                    message_names(guest, Some(entry.cast()))
+                    // An entry past the top of the address space names
+                    // nothing; Linux faults reading it.
+                    let entry = guest_element_address::<Mmsghdr>(vector, index)
+                        .and_then(Addr::<Msghdr>::from_raw);
+                    message_names(guest, entry)
                 })
             }
             _ => false,
@@ -763,9 +778,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             .any(|fd| {
                 let fd = fd as usize;
                 sets.into_iter().flatten().any(|set| {
-                    // SAFETY: only read through guest memory access, which
-                    // fails on an unmapped address.
-                    let word = unsafe { set.cast::<u64>().add(fd / WORD_BITS) };
+                    // A word past the top of the address space is unreadable,
+                    // like an unmapped one.
+                    let Some(word) = guest_element_address::<u64>(set.as_raw(), fd / WORD_BITS)
+                        .and_then(Addr::<u64>::from_raw)
+                    else {
+                        return false;
+                    };
                     guest
                         .memory()
                         .read_value(word)
@@ -1082,9 +1101,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             Syscall::Recvmsg(c) => c.msg().map(AddrMut::as_raw).into_iter().collect(),
             Syscall::Recvmmsg(c) => c.mmsg().map_or_else(Vec::new, |vector| {
                 (0..c.vlen().min(libc::UIO_MAXIOV as u32) as usize)
-                    // SAFETY: only read through guest memory access, which
-                    // fails on an unmapped address.
-                    .map(|index| unsafe { vector.add(index) }.as_raw())
+                    // An entry past the top of the address space keeps its
+                    // place as address zero, which every use below treats as
+                    // unreadable, as Linux does.
+                    .map(|index| {
+                        guest_element_address::<Mmsghdr>(vector.as_raw(), index).unwrap_or(0)
+                    })
                     .collect()
             }),
             _ => unreachable!("only receives with ancillary data reach here"),
@@ -1683,10 +1705,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     self.network_send_resume(guest, fd, id, buffer, sent, &mut bytes)
                         .await;
                 }
+                // `sent < len`, and Linux accepted the first `sent` bytes, so
+                // this stays within the guest's buffer.
                 let call = syscalls::Sendto::new()
                     .with_fd(fd)
-                    // SAFETY: `sent < len` stays within the guest's buffer.
-                    .with_buf(AddrMut::from_raw(unsafe { buffer.add(sent) }.as_raw()))
+                    .with_buf(
+                        guest_element_address::<u8>(buffer.as_raw(), sent)
+                            .and_then(AddrMut::from_raw),
+                    )
                     .with_size(len - sent)
                     .with_flags(
                         (flags & libc::MSG_MORE | libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u32,
@@ -1869,13 +1895,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await
         }
-        // SAFETY: `sent < bytes.len()` stays within the guest's buffer.
-        let unsent = unsafe { buffer.add(sent) };
-        if guest
-            .memory()
-            .read_exact(unsent, &mut bytes[sent..])
-            .is_err()
-        {
+        // `sent < bytes.len()` stays within the guest's buffer; an address
+        // past the top of the address space reads like an unmapped one.
+        let unsent = guest_element_address::<u8>(buffer.as_raw(), sent).and_then(Addr::from_raw);
+        if unsent.is_none_or(|unsent| {
+            guest
+                .memory()
+                .read_exact(unsent, &mut bytes[sent..])
+                .is_err()
+        }) {
             self.network_refuse(
                 guest,
                 "network trace cannot send from a guest buffer that became unreadable while \
@@ -1899,14 +1927,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         nfds: u32,
     ) -> Option<(Vec<libc::pollfd>, Vec<Option<PolledChannel>>)> {
         let address = address?;
-        let open_file_limit = guest
-            .thread_state()
-            .resource_limits
-            .lock()
-            .expect("resource limits mutex poisoned")
-            .get(reverie::syscalls::linux_abi::RLIMIT_NOFILE)
-            .map_or(libc::RLIM64_INFINITY, |limit| limit.current);
-        if u64::from(nfds) > open_file_limit {
+        if poll_nfds_exceeds_nofile(nfds, nofile_limit(guest)) {
             return None;
         }
         let mut pollfds = vec![
@@ -2458,6 +2479,42 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guest array near the top of the address space: element addresses
+    /// are computed by number, and an element past the top is `None` rather
+    /// than a wrapped address (address zero for the second `mmsghdr` of an
+    /// array starting one `mmsghdr` below the top).
+    #[test]
+    fn guest_element_addresses_stop_at_the_top_of_the_address_space() {
+        let size = std::mem::size_of::<Mmsghdr>();
+        let last = usize::MAX - size + 1;
+        assert_eq!(guest_element_address::<Mmsghdr>(last, 0), Some(last));
+        assert_eq!(
+            last.wrapping_add(size),
+            0,
+            "the next entry would wrap to zero"
+        );
+        assert_eq!(guest_element_address::<Mmsghdr>(last, 1), None);
+        assert_eq!(guest_element_address::<Mmsghdr>(last, usize::MAX), None);
+        assert_eq!(
+            guest_element_address::<Mmsghdr>(0x1000, 2),
+            Some(0x1000 + 2 * size)
+        );
+        // A select word: the fd's 64-bit word past the top is None.
+        assert_eq!(
+            guest_element_address::<u64>(usize::MAX - 7, 0),
+            Some(usize::MAX - 7)
+        );
+        assert_eq!(guest_element_address::<u64>(usize::MAX - 7, 1), None);
+        // A byte offset into a send buffer.
+        assert_eq!(guest_element_address::<u8>(usize::MAX, 0), Some(usize::MAX));
+        assert_eq!(guest_element_address::<u8>(usize::MAX, 1), None);
+        assert_eq!(
+            guest_element_address::<u8>(0, 0),
+            None,
+            "zero is never an address"
+        );
+    }
 
     /// <https://github.com/rrnewton/hermit/issues/4929> (the Claude review of
     /// slice 2, round 4, finding 2): a signal that woke a blocking send's wait

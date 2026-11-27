@@ -1482,6 +1482,8 @@ fn record_or_replay_config_with_timer_support(
         in_guest_site_patching_off: false,
         in_guest_reserved_signals: 0,
         in_guest_refuses_host_timed_producers: false,
+        // Record/replay runs only on ptrace: startup is monitored.
+        startup_unmonitored: Some(false),
         in_guest_signal_delivery: false,
         // Record and replay never replay a priority history.
         annotated_priority_replay: false,
@@ -1768,6 +1770,18 @@ mod tests {
         // Already off: stays off.
         disable_timeslice_without_a_timer(&mut config, "again");
         assert_eq!(config.max_timeslice, None);
+    }
+
+    #[test]
+    fn record_or_replay_never_records_host_inputs() {
+        // Pins the record-path argument for the untraced-code binding:
+        // Detcore reads untraced_code_range only while recording host
+        // inputs, so record/replay needs no adapter declaration guard.
+        // If record mode ever starts recording host inputs, this fails
+        // and that argument must be revisited.
+        let config = record_or_replay_config(Path::new("replay-data"));
+        assert!(!config.record_host_inputs);
+        assert_eq!(config.untraced_code_range, None);
     }
 
     #[test]

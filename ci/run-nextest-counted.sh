@@ -103,8 +103,23 @@ function configured_cpu_report_path {
     fi
 }
 
-# The path a caller asked to keep the typed event stream at
-# (HERMIT_NEXTEST_EVENTS_PATH), or `-` when it asked for none.
+# Where to keep the typed event stream:
+# - the path a caller asked for (HERMIT_NEXTEST_EVENTS_PATH);
+# - else, for a counted DAG step of a validation with a durable result root,
+#   $E2E_RESULT_ROOT/nextest-events/<step>.<attempt>.jsonl, so that two runs can be compared
+#   test by test (each test's typed outcome, in both directions) and a lost test is named.
+#   <step> is the dagrun step tag (DAGRUN_TEST_COUNTS_PATH's basename without `.json`, for
+#   example `test.detcore_unit`). The census check in run_nextest derives its suite name from
+#   the same basename but also strips a leading `test.` (`detcore_unit`), so a reader that joins
+#   streams to census suites strips it too. <attempt> is DAGRUN_STEP_STARTED_MONOTONIC_NS, so a
+#   retried step keeps each attempt's stream instead of being refused for an existing file;
+# - else `-`, none. A counts path of `-` is not a counted step.
+# Beside a stream kept by that default go the attempt's start marker, <step>.<attempt>.started,
+# written before nextest runs, and its typed per-test results, <step>.<attempt>.results.json: a
+# copy of the result writer's DAGRUN_TEST_COUNTS_PATH file (nextest-test-results.rs, dagrun's
+# structured test results, with runtime skips and SKID-INFRA already typed), which dagrun does
+# not keep. ci/buck-build-compare.py compares runs by those results; the marker makes an attempt
+# that was killed before it published results visible as one without a result.
 function configured_events_path {
     if [[ ${HERMIT_NEXTEST_EVENTS_PATH+x} ]]; then
         if [[ -z $HERMIT_NEXTEST_EVENTS_PATH ]]; then
@@ -112,6 +127,17 @@ function configured_events_path {
             return 2
         fi
         printf '%s\n' "$HERMIT_NEXTEST_EVENTS_PATH"
+    elif [[ -n ${E2E_RESULT_ROOT:-} && -n ${DAGRUN_TEST_COUNTS_PATH:-} && $DAGRUN_TEST_COUNTS_PATH != - ]]; then
+        local step=${DAGRUN_TEST_COUNTS_PATH##*/} attempt=${DAGRUN_STEP_STARTED_MONOTONIC_NS:-}
+        step=${step##*:}
+        step=${step%.json}
+        [[ -n $step ]] || step=nextest
+        [[ $attempt =~ ^[0-9]+$ ]] || attempt=$(date +%s%N)-$$
+        if ! mkdir -p -- "$E2E_RESULT_ROOT/nextest-events"; then
+            printf 'run-nextest-counted: cannot create %s to keep the typed event stream\n' "$E2E_RESULT_ROOT/nextest-events" >&2
+            return 2
+        fi
+        printf '%s\n' "$E2E_RESULT_ROOT/nextest-events/$step.$attempt.jsonl"
     else
         printf '%s\n' -
     fi
@@ -126,6 +152,45 @@ function retain_events {
     [[ $destination == - ]] && return 0
     if ! (set -o noclobber; cat -- "$events" >"$destination"); then
         printf 'run-nextest-counted: cannot keep the typed event stream at %s\n' "$destination" >&2
+        return 2
+    fi
+}
+
+# The node's status once its records are kept: a failed keep (2) fails only a run that would
+# otherwise pass.
+function kept_status { # $1: the run's status; $2: the keeping's
+    if (($1 == 0 && $2 != 0)); then
+        printf '%s\n' "$2"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+# The start marker and the kept typed results that go beside a default-kept stream (above);
+# `-` for a caller-chosen stream path or none.
+function configured_results_prefix {
+    local events_destination=$1
+    if [[ $events_destination == - || ${HERMIT_NEXTEST_EVENTS_PATH+x} ]]; then
+        printf '%s\n' -
+    else
+        printf '%s\n' "${events_destination%.jsonl}"
+    fi
+}
+
+function mark_attempt_started { # $1: the results prefix, or -
+    [[ $1 == - ]] && return 0
+    if ! (set -o noclobber; : >"$1.started"); then
+        printf 'run-nextest-counted: cannot write the start marker %s.started\n' "$1" >&2
+        return 2
+    fi
+}
+
+function retain_results { # $1: the result writer's file; $2: the results prefix, or -. A writer
+    # that published nothing this attempt leaves nothing to keep: the marker says so.
+    local results=$1 prefix=$2
+    [[ $prefix == - || $results == - || ! -e $results ]] && return 0
+    if ! (set -o noclobber; cat -- "$results" >"$prefix.results.json"); then
+        printf 'run-nextest-counted: cannot keep the typed test results at %s.results.json\n' "$prefix" >&2
         return 2
     fi
 }
@@ -202,6 +267,110 @@ if in_flight:
 PYEOF
 }
 
+function check_selected_cases_listed { # $1: this selection's `nextest list` JSON.
+    # validate --tests names its cases in HERMIT_NEXTEST_SELECTED_CASES:
+    # whitespace-separated result IDs as run records print them,
+    # <package>$<test name> for a library unit test and
+    # <package>::<binary name>$<test name> for every other target. Every
+    # named case must be in this listing: one that is not cannot run, and
+    # since the run executes exactly what is listed, it would otherwise pass
+    # unrun (a nonexistent name lists nothing and passes with zero tests).
+    # Refuse before any test runs, naming each unlisted case. Returns 0 when
+    # every named case is listed (or none is named), 1 when one is not, and
+    # 2 when the listing cannot be read. The split covers every whitespace
+    # character, newlines included, so no later line goes unchecked.
+    local inventory=$1 output
+    local -a selected=() unlisted=()
+    read -r -d '' -a selected <<<"${HERMIT_NEXTEST_SELECTED_CASES:-}" || true
+    ((${#selected[@]})) || return 0
+    if ! output=$(run_rust_script "$RESULT_WRITER" --unlisted-cases "$inventory" "${selected[@]}"); then
+        printf 'run-nextest-counted: cannot check the selected cases against the nextest inventory\n' >&2
+        return 2
+    fi
+    [[ -n $output ]] || return 0
+    mapfile -t unlisted <<<"$output"
+    printf 'run-nextest-counted: case-unmatched: validate --tests named %s of %s case(s) that this node does not list, so they cannot run; refusing before any test runs. Unlisted:\n' \
+        "${#unlisted[@]}" "${#selected[@]}" >&2
+    printf '  %s\n' "${unlisted[@]}" >&2
+    printf 'run-nextest-counted: a case ID is a run record test_cases entry: <package>$<test name> for a library unit test, <package>::<binary name>$<test name> for every other target; it is unlisted when that test does not exist, when the node does not build its binary, or when the node'"'"'s own selection (its filters, --skip, #[ignore]) leaves it out. A package or binary name nextest does not know never gets here: nextest'"'"'s filter parser refuses it first (exit 2), naming it\n' >&2
+    return 1
+}
+
+function merge_case_filter { # $1: output array name; $2: the case filter; the rest: nextest run arguments.
+    # nextest ORs separate filtersets, so the case filter passed as one
+    # more -E would widen a node that passes its own: the node's whole
+    # population would run, plus any named case its filter excludes. So
+    # every filterset before the first `--` comes out and one goes in, also
+    # before `--`: ((<node filterset>) | ...) & (<case filter>), or the case
+    # filter alone when the node has none. A named case outside the node's
+    # population is then unlisted, and check_selected_cases_listed refuses
+    # it by name. The grammar is nextest 0.9.100's: -E and --filterset (with
+    # its alias --filter-expr) take a separate or `=` value, and -E also an
+    # attached one; the values of its other value-taking options are
+    # skipped, so a value is never read as a filterset. A short cluster
+    # holding E after other flags (-rE) is refused rather than guessed at.
+    local -n merged=$1
+    local case_filter=$2 arg
+    local -a node_filters=() rest=()
+    shift 2
+    merged=()
+    while (($#)); do
+        arg=$1
+        if [[ $arg == -- ]]; then
+            rest=("$@")
+            break
+        fi
+        # -v, -h and -r are nextest's only short flags without a value, so
+        # only they can come before an E in one cluster.
+        if [[ $arg =~ ^-[vhr]+E ]]; then
+            printf 'run-nextest-counted: cannot merge the case filter with %s: pass -E on its own\n' "$arg" >&2
+            return 2
+        fi
+        case $arg in
+            -E|--filterset|--filter-expr)
+                if (($# < 2)); then
+                    printf 'run-nextest-counted: %s requires a value\n' "$arg" >&2
+                    return 2
+                fi
+                node_filters+=("$2")
+                shift 2
+                continue
+                ;;
+            --filterset=*|--filter-expr=*) node_filters+=("${arg#*=}") ;;
+            -E=*) node_filters+=("${arg#-E=}") ;;
+            -E?*) node_filters+=("${arg#-E}") ;;
+            -p|--package|--exclude|--bin|--example|--test|--bench|-F|--features|\
+                --build-jobs|--cargo-profile|--target|--target-dir|--manifest-path|\
+                --config|-Z|--run-ignored|--partition|--platform-filter|-j|\
+                --test-threads|--retries|--max-fail|--no-tests|--failure-output|\
+                --success-output|--status-level|--final-status-level|\
+                --message-format|--message-format-version|--archive-file|\
+                --archive-format|--extract-to|--cargo-metadata|--workspace-remap|\
+                --binaries-metadata|--target-dir-remap|--config-file|\
+                --tool-config-file|-P|--profile|--color)
+                if (($# < 2)); then
+                    printf 'run-nextest-counted: %s requires a value\n' "$arg" >&2
+                    return 2
+                fi
+                merged+=("$1" "$2")
+                shift 2
+                continue
+                ;;
+            *) merged+=("$arg") ;;
+        esac
+        shift
+    done
+    if ((${#node_filters[@]})); then
+        local joined filter
+        joined=
+        for filter in "${node_filters[@]}"; do
+            joined+="${joined:+ | }($filter)"
+        done
+        case_filter="($joined) & ($case_filter)"
+    fi
+    merged+=(--filter-expr "$case_filter" "${rest[@]}")
+}
+
 function emit_libtest_count {
     local events=$1 status=${2:-0} path=${DAGRUN_TEST_COUNTS_PATH:--}
     local attempts=${3-} binary_map=${4-} cpu_report=${5-} inventory=${6-}
@@ -270,22 +439,12 @@ function run_nextest {
     local -a launch_arguments=()
     shift 7
     # Case selection (validate --tests): HERMIT_NEXTEST_FILTER_EXPR holds a
-    # nextest filter expression selecting exactly the recorded cases. It is
-    # a nextest option, so it goes before the first `--`; the inventory and
+    # nextest filter expression selecting exactly the recorded cases, ANDed
+    # with the node's own filtersets (merge_case_filter). The inventory and
     # run invocations below share "$@" and stay consistent.
     if [[ -n ${HERMIT_NEXTEST_FILTER_EXPR:-} ]]; then
         local -a filtered_args=()
-        local inserted=0 arg
-        for arg in "$@"; do
-            if (( ! inserted )) && [[ $arg == -- ]]; then
-                filtered_args+=(--filter-expr "$HERMIT_NEXTEST_FILTER_EXPR")
-                inserted=1
-            fi
-            filtered_args+=("$arg")
-        done
-        if (( ! inserted )); then
-            filtered_args+=(--filter-expr "$HERMIT_NEXTEST_FILTER_EXPR")
-        fi
+        merge_case_filter filtered_args "$HERMIT_NEXTEST_FILTER_EXPR" "$@" || return $?
         set -- "${filtered_args[@]}"
     fi
 
@@ -333,6 +492,15 @@ function run_nextest {
         cleanup_nextest_config
         return 2
     fi
+    # validate --tests: every named case must be in this listing, checked
+    # here, before any test runs. Executed == listed (below) then makes every
+    # named case run.
+    local selection_status=0
+    check_selected_cases_listed "$inventory" || selection_status=$?
+    if ((selection_status != 0)); then
+        cleanup_nextest_config
+        return "$selection_status"
+    fi
     # Retain the census identities beside the counts report: the landing
     # census gate diffs these against the base run's, so a test that stops
     # being listed is named instead of hidden inside a drifting count.
@@ -344,9 +512,13 @@ function run_nextest {
             cleanup_nextest_config
             return 2
         fi
-        # Census gate (phase 3, enforced): diff this run's listed population
-        # against the base (last landed main) population the queue adapter
-        # cached. HERMIT_CENSUS_BASE_LISTED_IDS names that base .listed-ids
+        # Census gate: every run refuses a node that lists zero tests; a run
+        # given a base also diffs its listed population against the base (last
+        # landed main) population the queue adapter cached, so a vanished test
+        # fails. Only candidate-versus-main comparisons need that base, and
+        # ci-hub supplies it to the validates it runs; a plain run has none,
+        # needs none, and its ledger row says census_checked=false.
+        # HERMIT_CENSUS_BASE_LISTED_IDS names that base .listed-ids
         # file (single-suite selections); HERMIT_CENSUS_BASE_DIR names the
         # adapter's per-suite supply directory (one stamped
         # <suite>.listed-ids per suite) for multi-suite/full-profile nodes,
@@ -361,15 +533,9 @@ function run_nextest {
         # adapter declares one, else this checkout's merge-base with
         # origin/<landing branch> (HERMIT_LANDING_BRANCH,
         # ci/landing-branches.env); a base stamped with another commit, a short/
-        # truncated base, or an unstamped base is refused by name. Since
-        # the count pins were deleted the census is the only disappearance
-        # guard, so a counted node REQUIRES its base: with none supplied
-        # this node exits 75 (could-not-run: the adapter has not published
-        # a base, so no population verdict exists; validate requeues
-        # instead of failing), unless HERMIT_CENSUS_ALLOW_NO_BASE=1 marks
-        # an explicit local/standalone run with no adapter. A supplied
-        # but stale/truncated/unstamped base and a vanished ID stay
-        # product failures.
+        # truncated base, or an unstamped base is refused by name. A
+        # supplied but stale/truncated/unstamped base, a vanished ID and a
+        # zero-test population are product failures.
         # HERMIT_CENSUS_REPORT_ONLY is retired in counted nodes (phase-2
         # rollout lever): it is ignored here so a stale adapter setting
         # cannot silently downgrade enforcement; --report-only remains a
@@ -382,15 +548,14 @@ function run_nextest {
         counts_name=${counts_name%.json}
         census_suite=${counts_name#test.}
         [[ -n $census_suite && $census_suite != "$counts_name" ]] || census_suite=${counts_name:-nextest}
-        local -a census_args=(--candidate-listed "${DAGRUN_TEST_COUNTS_PATH}.listed-ids" --require-base --suite "$census_suite")
+        local -a census_args=(--candidate-listed "${DAGRUN_TEST_COUNTS_PATH}.listed-ids" --suite "$census_suite")
         [[ -n ${HERMIT_CENSUS_BASE_LISTED_IDS:-} ]] && census_args+=(--base-listed "$HERMIT_CENSUS_BASE_LISTED_IDS")
         [[ -n ${HERMIT_CENSUS_BASE_DIR:-} ]] && census_args+=(--base-dir "$HERMIT_CENSUS_BASE_DIR")
         # Case-selected runs list a subset, never the suite population:
         # census-check names that treatment instead of comparing the
-        # full base (or refusing for want of one).
+        # full base, and still refuses a selection that lists nothing.
         [[ -n ${HERMIT_NEXTEST_FILTER_EXPR:-} ]] && census_args+=(--case-selected)
         [[ -n ${HERMIT_CENSUS_DROPPED_FILE:-} ]] && census_args+=(--dropped "$HERMIT_CENSUS_DROPPED_FILE")
-        [[ ${HERMIT_CENSUS_ALLOW_NO_BASE:-} == 1 ]] && census_args+=(--allow-no-base)
         local expected_base_commit=${HERMIT_CENSUS_EXPECTED_BASE_COMMIT:-${HERMIT_CENSUS_BASE_COMMIT:-}}
         if [[ -z $expected_base_commit ]]; then
             local landing_branch_name
@@ -412,15 +577,8 @@ function run_nextest {
         if (( census_status != 0 )); then
             printf 'run-nextest-counted: census gate refused this listed population (see census FAIL lines above)\n' >&2
             cleanup_nextest_config
-            # Exit 75 is the missing-base could-not-run refusal only
-            # (census-check.sh under --require-base with no base supplied):
-            # propagate it so validate classifies this node no-result
-            # (COULD_NOT_RUN/requeue) instead of a product failure. Every
-            # other census refusal (stale/truncated/provenance base,
-            # vanished ID) stays a product failure (return 1).
-            if (( census_status == 75 )); then
-                return 75
-            fi
+            # Every census refusal (zero tests, a stale/truncated/unstamped
+            # base, a vanished ID) is a product failure.
             return 1
         fi
     fi
@@ -547,9 +705,41 @@ function run_nextest {
     return "$count_status"
 }
 
+function self_test_failed { # $1: the line ($LINENO) of the assertion that failed.
+    # A failed assertion names itself: the line and its text, joined across
+    # backslash continuations, so a red lint-checks run says what broke.
+    printf 'run-nextest-counted: self-test FAIL at line %s: %s\n' "$1" "$(awk -v last="$1" '
+        { line[NR] = $0 }
+        END {
+            first = last
+            while (first > 1 && line[first - 1] ~ /\\$/) first--
+            for (i = first; i <= last; i++) {
+                text = line[i]; sub(/^[[:space:]]+/, "", text); sub(/[[:space:]]*\\$/, "", text)
+                out = out (i == first ? "" : " ") text
+            }
+            print out
+        }' "${BASH_SOURCE[0]}")" >&2
+    return 1
+}
+
 function self_test {
     local scratch got expected status=0 wall_multiplier cpu_wrapper fixture_binary attempts
-    local binary_map inventory launch_failure=0 inventory_wrong_name=0 ordinary_attempts ordinary_inventory
+    local binary_map inventory launch_failure=0 empty_listing=0 inventory_wrong_name=0
+    local ordinary_attempts ordinary_inventory inherited
+    # The verdict depends on this tree alone. Each case sets every input it
+    # exercises, so an inherited one can only change what a case tests: a
+    # validation's census base (HERMIT_CENSUS_BASE_DIR) arms the census gate
+    # against the fixture's own suite and refuses it. So clear, on entry, every
+    # inherited variable in the namespaces this wrapper and its helpers read
+    # (HERMIT_, NEXTEST_, DAGRUN_, E2E_), except the three that choose how a
+    # rust-script helper is started, never what it decides: a validation runs
+    # this self-test with prebuilt helpers.
+    while IFS= read -r inherited; do
+        case $inherited in
+            HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED|HERMIT_RUST_SCRIPT_ARTIFACT_ROOT|HERMIT_REAL_RUST_SCRIPT) ;;
+            HERMIT_*|NEXTEST_*|DAGRUN_*|E2E_*) unset "$inherited" ;;
+        esac
+    done < <(compgen -e)
     scratch=$(mktemp -d)
     trap 'rm -rf "$scratch"' RETURN
 
@@ -567,8 +757,8 @@ function self_test {
     got=$(DAGRUN_TEST_COUNTS_PATH="$scratch/counts.json" \
         emit_libtest_count "$scratch/events.jsonl" 0)
     expected=$'running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 7 filtered out'
-    [[ $got == "$expected" ]] || return 1
-    python3 - "$scratch/counts.json" <<'PYEOF' || return 1
+    [[ $got == "$expected" ]] || { self_test_failed "$LINENO"; return 1; }
+    python3 - "$scratch/counts.json" <<'PYEOF' || { self_test_failed "$LINENO"; return 1; }
 import json
 import sys
 
@@ -594,9 +784,9 @@ PYEOF
         '{"type":"test","event":"started","name":"suite::suite$cut' \
         >"$scratch/cut-events.jsonl"
     got=$(report_in_flight "$scratch/cut-events.jsonl" 2>&1 >/dev/null)
-    [[ $got == 'run-nextest-counted: 1 test(s) still in flight when the run ended: suite::suite$cut' ]] || return 1
+    [[ $got == 'run-nextest-counted: 1 test(s) still in flight when the run ended: suite::suite$cut' ]] || { self_test_failed "$LINENO"; return 1; }
     got=$(report_in_flight "$scratch/events.jsonl" 2>&1 >/dev/null)
-    [[ -z $got ]] || return 1
+    [[ -z $got ]] || { self_test_failed "$LINENO"; return 1; }
 
     printf 'HERMIT-TEST-SKIP: passes\tno /dev/kvm on this host\n' \
         >"$scratch/skips.txt"
@@ -604,8 +794,8 @@ PYEOF
         DAGRUN_TEST_COUNTS_PATH="$scratch/skip-counts.json" \
         emit_libtest_count "$scratch/events.jsonl" 0)
     expected=$'running 2 tests\ntest result: ok. 1 passed; 0 failed; 1 skipped; 0 ignored; 7 filtered out'
-    [[ $got == "$expected" ]] || return 1
-    python3 - "$scratch/skip-counts.json" <<'PYEOF' || return 1
+    [[ $got == "$expected" ]] || { self_test_failed "$LINENO"; return 1; }
+    python3 - "$scratch/skip-counts.json" <<'PYEOF' || { self_test_failed "$LINENO"; return 1; }
 import json
 import sys
 
@@ -624,9 +814,9 @@ PYEOF
         DAGRUN_TEST_COUNTS_PATH="$scratch/no-optin-counts.json" \
         emit_libtest_count "$scratch/events.jsonl" 0 \
         >/dev/null 2>"$scratch/no-optin.stderr" || status=$?
-    [[ $status == 2 ]] || return 1
-    grep -q 'not opted into schema 5' "$scratch/no-optin.stderr" || return 1
-    [[ ! -e $scratch/no-optin-counts.json ]] || return 1
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -q 'not opted into schema 5' "$scratch/no-optin.stderr" || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $scratch/no-optin-counts.json ]] || { self_test_failed "$LINENO"; return 1; }
 
     # A zero-skips node fails on the same skip population, naming the
     # skipped test, while the typed report still publishes.
@@ -636,18 +826,18 @@ PYEOF
         DAGRUN_TEST_COUNTS_PATH="$scratch/forbid-skip-counts.json" \
         emit_libtest_count "$scratch/events.jsonl" 0 \
         >/dev/null 2>"$scratch/forbid-skip.stderr" || status=$?
-    [[ $status == 1 ]] || return 1
+    [[ $status == 1 ]] || { self_test_failed "$LINENO"; return 1; }
     grep -q 'FORBID-SKIPS: suite\$passes: no /dev/kvm on this host' \
-        "$scratch/forbid-skip.stderr" || return 1
-    [[ -e $scratch/forbid-skip-counts.json ]] || return 1
+        "$scratch/forbid-skip.stderr" || { self_test_failed "$LINENO"; return 1; }
+    [[ -e $scratch/forbid-skip-counts.json ]] || { self_test_failed "$LINENO"; return 1; }
 
     sed 's/"filtered_out":7/"filtered_out":11/' \
         "$scratch/events.jsonl" >"$scratch/mutated-events.jsonl"
     got=$(DAGRUN_TEST_COUNTS_PATH="$scratch/mutated-counts.json" \
         emit_libtest_count "$scratch/mutated-events.jsonl" 0)
     expected=$'running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 11 filtered out'
-    [[ $got == "$expected" ]] || return 1
-    python3 - "$scratch/mutated-counts.json" <<'PYEOF' || return 1
+    [[ $got == "$expected" ]] || { self_test_failed "$LINENO"; return 1; }
+    python3 - "$scratch/mutated-counts.json" <<'PYEOF' || { self_test_failed "$LINENO"; return 1; }
 import json
 import sys
 
@@ -660,27 +850,27 @@ PYEOF
     got=$(DAGRUN_TEST_COUNTS_PATH="$scratch/expected-counts.json" \
         NEXTEST_EXPECTED_EXECUTED=2 emit_libtest_count "$scratch/events.jsonl" 0)
     expected=$'running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 7 filtered out'
-    [[ $got == "$expected" ]] || return 1
-    cmp -s "$scratch/expected-counts.json" "$scratch/counts.json" || return 1
+    [[ $got == "$expected" ]] || { self_test_failed "$LINENO"; return 1; }
+    cmp -s "$scratch/expected-counts.json" "$scratch/counts.json" || { self_test_failed "$LINENO"; return 1; }
 
     status=0
     DAGRUN_TEST_COUNTS_PATH="$scratch/wrong-counts.json" \
         NEXTEST_EXPECTED_EXECUTED=3 emit_libtest_count "$scratch/events.jsonl" 0 \
         >"$scratch/wrong-count.stdout" 2>"$scratch/wrong-count.stderr" || status=$?
-    [[ $status == 2 ]] || return 1
-    grep -q 'expected 3 tests to execute, saw 2' "$scratch/wrong-count.stderr" || return 1
-    [[ ! -e $scratch/wrong-counts.json ]] || return 1
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -q 'expected 3 tests to execute, saw 2' "$scratch/wrong-count.stderr" || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $scratch/wrong-counts.json ]] || { self_test_failed "$LINENO"; return 1; }
 
     status=0
     NEXTEST_EXPECTED_EXECUTED=unknown emit_libtest_count "$scratch/events.jsonl" 0 \
         >/dev/null 2>"$scratch/invalid-count.stderr" || status=$?
-    [[ $status == 2 ]] || return 1
-    grep -q 'NEXTEST_EXPECTED_EXECUTED' "$scratch/invalid-count.stderr" || return 1
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -q 'NEXTEST_EXPECTED_EXECUTED' "$scratch/invalid-count.stderr" || { self_test_failed "$LINENO"; return 1; }
 
-    [[ $(configured_wall_timeout_multiplier) == 1 ]] || return 1
+    [[ $(configured_wall_timeout_multiplier) == 1 ]] || { self_test_failed "$LINENO"; return 1; }
     wall_multiplier=$(HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER=1.5 \
         configured_wall_timeout_multiplier)
-    [[ $wall_multiplier == 1.5 ]] || return 1
+    [[ $wall_multiplier == 1.5 ]] || { self_test_failed "$LINENO"; return 1; }
 
     printf '%s\n' \
         '{"type":"suite","event":"started","test_count":1,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}' \
@@ -689,8 +879,8 @@ PYEOF
         '{"type":"suite","event":"failed","passed":0,"failed":1,"ignored":0,"measured":0,"filtered_out":3,"exec_time":0.2,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}' \
         >"$scratch/failed-events.jsonl"
     DAGRUN_TEST_COUNTS_PATH="$scratch/failed-counts.json" \
-        emit_libtest_count "$scratch/failed-events.jsonl" 100 >/dev/null || return 1
-    python3 - "$scratch/failed-counts.json" <<'PYEOF' || return 1
+        emit_libtest_count "$scratch/failed-events.jsonl" 100 >/dev/null || { self_test_failed "$LINENO"; return 1; }
+    python3 - "$scratch/failed-counts.json" <<'PYEOF' || { self_test_failed "$LINENO"; return 1; }
 import json
 import sys
 
@@ -710,8 +900,8 @@ PYEOF
         DAGRUN_TEST_COUNTS_PATH="$scratch/skid-infra-counts.json" \
         emit_libtest_count "$scratch/failed-events.jsonl" 100)
     expected=$'running 1 tests\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 3 filtered out'
-    [[ $got == "$expected" ]] || return 1
-    python3 - "$scratch/skid-infra-counts.json" <<'PYEOF' || return 1
+    [[ $got == "$expected" ]] || { self_test_failed "$LINENO"; return 1; }
+    python3 - "$scratch/skid-infra-counts.json" <<'PYEOF' || { self_test_failed "$LINENO"; return 1; }
 import json
 import sys
 
@@ -730,10 +920,10 @@ PYEOF
         DAGRUN_TEST_COUNTS_PATH="$scratch/skid-infra-no-optin.json" \
         emit_libtest_count "$scratch/failed-events.jsonl" 100 \
         >/dev/null 2>"$scratch/skid-infra-no-optin.stderr" || status=$?
-    [[ $status == 2 ]] || return 1
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
     grep -q 'skid-infra markers were recorded' \
-        "$scratch/skid-infra-no-optin.stderr" || return 1
-    [[ ! -e $scratch/skid-infra-no-optin.json ]] || return 1
+        "$scratch/skid-infra-no-optin.stderr" || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $scratch/skid-infra-no-optin.json ]] || { self_test_failed "$LINENO"; return 1; }
 
     # The listed count is derived from the inventory: filter-matched
     # testcases only (executed == listed for a successful run).
@@ -754,9 +944,9 @@ PYEOF
             }
         }
     }' >"$scratch/listed-inventory.json"
-    [[ $(run_rust_script "$RESULT_WRITER" --listed-count "$scratch/listed-inventory.json") == 3 ]] || return 1
-    run_rust_script "$RESULT_WRITER" --listed-ids "$scratch/listed-inventory.json" "$scratch/listed-ids.txt" || return 1
-    [[ $(cat "$scratch/listed-ids.txt") == $'suite/suite/also_runs\nsuite/suite/ignored_one\nsuite/suite/runs' ]] || return 1
+    [[ $(run_rust_script "$RESULT_WRITER" --listed-count "$scratch/listed-inventory.json") == 3 ]] || { self_test_failed "$LINENO"; return 1; }
+    run_rust_script "$RESULT_WRITER" --listed-ids "$scratch/listed-inventory.json" "$scratch/listed-ids.txt" || { self_test_failed "$LINENO"; return 1; }
+    [[ $(cat "$scratch/listed-ids.txt") == $'suite/suite/also_runs\nsuite/suite/ignored_one\nsuite/suite/runs' ]] || { self_test_failed "$LINENO"; return 1; }
 
     # Exercise the generated config, the real per-execution wrapper, and the
     # typed reconciliation path. A valid failed run must still return nextest's
@@ -772,7 +962,7 @@ PYEOF
         shift 4
         if [[ $operation == list ]]; then
             printf '%s\n' "$@" >"$scratch/list-arguments"
-            jq -nc --arg executable "$fixture_binary" --argjson launch_failure "$launch_failure" \
+            jq -nc --arg executable "$fixture_binary" --argjson empty_listing "$empty_listing" \
                 --argjson inventory_wrong_name "$inventory_wrong_name" '{
                 "rust-suites": {
                     "suite": {
@@ -781,7 +971,7 @@ PYEOF
                         "binary-name": "suite",
                         "kind": "lib",
                         "binary-path": $executable,
-                        "testcases": (if $launch_failure == 1 then {} else {
+                        "testcases": (if $empty_listing == 1 then {} else {
                             (if $inventory_wrong_name == 1 then "substituted" else "failure" end):
                                 {"ignored":false,"filter-match":{"status":"matches"}}
                         } end)
@@ -793,7 +983,7 @@ PYEOF
         [[ $operation == run ]] || return 99
         if ((launch_failure)); then
             printf '%s\n' \
-                '{"type":"suite","event":"started","test_count":0,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}' \
+                '{"type":"suite","event":"started","test_count":1,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}' \
                 '{"type":"suite","event":"failed","passed":0,"failed":0,"ignored":0,"measured":0,"filtered_out":0,"exec_time":0.0,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}'
             printf 'Summary [   0.010s] 12 tests run: 0 passed, 12 exec failed, 0 skipped\n' >&2
             return 100
@@ -817,29 +1007,108 @@ PYEOF
     set +e
     inventory="$scratch/wrapper-inventory.json"
     binary_map="$scratch/wrapper-binary-map.json"
-    got=$(TMPDIR="$scratch" HERMIT_CENSUS_ALLOW_NO_BASE=1 DAGRUN_TEST_COUNTS_PATH="$scratch/wrapper-counts.json" \
+    got=$(TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/wrapper-counts.json" \
         run_nextest "$scratch/wrapper-events" "$wall_multiplier" "$cpu_wrapper" \
         "$attempts" "$binary_map" "$inventory" "$scratch/wrapper-cpu.json" \
         --profile ci -p suite -j 1 --retries 2 -- --skip skipme)
     status=$?
     set -e
-    [[ $status == 100 ]] || return 1
+    [[ $status == 100 ]] || { self_test_failed "$LINENO"; return 1; }
     ordinary_inventory="$scratch/ordinary-inventory.json"
-    cp -- "$inventory" "$ordinary_inventory" || return 1
-    [[ $got == *$'running 1 tests\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 filtered out' ]] || return 1
-    [[ $got != *'test result: ok.'* ]] || return 1
+    cp -- "$inventory" "$ordinary_inventory" || { self_test_failed "$LINENO"; return 1; }
+    [[ $got == *$'running 1 tests\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 filtered out' ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ $got != *'test result: ok.'* ]] || { self_test_failed "$LINENO"; return 1; }
     printf '%s\n' --locked --color never --message-format json --profile ci -p suite \
         -- --skip skipme >"$scratch/expected-list-arguments"
-    cmp -s "$scratch/expected-list-arguments" "$scratch/list-arguments" || return 1
+    cmp -s "$scratch/expected-list-arguments" "$scratch/list-arguments" || { self_test_failed "$LINENO"; return 1; }
     [[ $(<"$scratch/wrapper-counts.json") == \
-        '{"executed_tests":1,"filtered_tests":0,"results":[{"attempts":1,"id":"suite$failure","result":"fail"}],"schema":2}' ]] || return 1
+        '{"executed_tests":1,"filtered_tests":0,"results":[{"attempts":1,"id":"suite$failure","result":"fail"}],"schema":2}' ]] || { self_test_failed "$LINENO"; return 1; }
     jq -e '
         .schema == 3 and .run_id == "self-test-nextest" and
         (.attempts | length) == 1 and
         .attempts[0].identity == {package:"suite", binary:"suite", test:"failure", attempt:1} and
         .attempts[0].completion == {kind:"exit", code:23} and
         .attempts[0].cpu_source == "wait4-subtree"
-    ' "$scratch/wrapper-cpu.json" >/dev/null || return 1
+    ' "$scratch/wrapper-cpu.json" >/dev/null || { self_test_failed "$LINENO"; return 1; }
+    # validate --tests (dh-71wz9z): a named case the listing lacks fails the
+    # node before any test runs, naming only that case; a listed one runs.
+    mkdir "$scratch/selected-attempts" "$scratch/listed-attempts"
+    status=0
+    HERMIT_NEXTEST_SELECTED_CASES='suite$failure suite$absent' TMPDIR="$scratch" \
+        DAGRUN_TEST_COUNTS_PATH="$scratch/selected-counts.json" \
+        run_nextest "$scratch/selected-events" "$wall_multiplier" "$cpu_wrapper" \
+        "$scratch/selected-attempts" "$scratch/selected-binary-map.json" \
+        "$scratch/selected-inventory.json" "$scratch/selected-cpu.json" \
+        --profile ci -p suite -j 1 --retries 2 >/dev/null 2>"$scratch/selected.stderr" || status=$?
+    local listed_status=0
+    HERMIT_NEXTEST_SELECTED_CASES='suite$failure' TMPDIR="$scratch" \
+        DAGRUN_TEST_COUNTS_PATH="$scratch/listed-counts.json" \
+        run_nextest "$scratch/listed-events" "$wall_multiplier" "$cpu_wrapper" \
+        "$scratch/listed-attempts" "$scratch/listed-binary-map.json" \
+        "$scratch/listed-inventory-run.json" "$scratch/listed-cpu.json" \
+        --profile ci -p suite -j 1 --retries 2 >/dev/null 2>"$scratch/listed.stderr" || listed_status=$?
+    [[ $status == 1 && ! -e $scratch/selected-events && ! -e $scratch/selected-counts.json ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -qx 'run-nextest-counted: case-unmatched: validate --tests named 1 of 2 case(s) that this node does not list, so they cannot run; refusing before any test runs. Unlisted:' \
+        "$scratch/selected.stderr" || { self_test_failed "$LINENO"; return 1; }
+    grep -qx '  suite\$absent' "$scratch/selected.stderr" || { self_test_failed "$LINENO"; return 1; }
+    ! grep -qx '  suite\$failure' "$scratch/selected.stderr" || { self_test_failed "$LINENO"; return 1; }
+    [[ $listed_status == 100 && -e $scratch/listed-events ]] || { self_test_failed "$LINENO"; return 1; }
+    ! grep -q 'case-unmatched' "$scratch/listed.stderr" || { self_test_failed "$LINENO"; return 1; }
+    # The named cases split on every whitespace character: a second line is
+    # checked too, and a leading newline does not skip the check.
+    local cases_value lines=0
+    for cases_value in $'suite$failure\nsuite$absent' $'\nsuite$absent'; do
+        lines=$((lines + 1))
+        mkdir "$scratch/lines$lines-attempts"
+        status=0
+        HERMIT_NEXTEST_SELECTED_CASES=$cases_value TMPDIR="$scratch" \
+            DAGRUN_TEST_COUNTS_PATH="$scratch/lines$lines-counts.json" \
+            run_nextest "$scratch/lines$lines-events" "$wall_multiplier" "$cpu_wrapper" \
+            "$scratch/lines$lines-attempts" "$scratch/lines$lines-binary-map.json" \
+            "$scratch/lines$lines-inventory.json" "$scratch/lines$lines-cpu.json" \
+            --profile ci -p suite -j 1 --retries 2 >/dev/null 2>"$scratch/lines.stderr" || status=$?
+        [[ $status == 1 && ! -e $scratch/lines$lines-events && ! -e $scratch/lines$lines-counts.json ]] || { self_test_failed "$LINENO"; return 1; }
+        grep -q "case-unmatched: validate --tests named 1 of $(wc -w <<<"$cases_value") case(s)" \
+            "$scratch/lines.stderr" || { self_test_failed "$LINENO"; return 1; }
+        grep -qx '  suite\$absent' "$scratch/lines.stderr" || { self_test_failed "$LINENO"; return 1; }
+        ! grep -qx '  suite\$failure' "$scratch/lines.stderr" || { self_test_failed "$LINENO"; return 1; }
+    done
+    # The case filter narrows the node's own filtersets, which nextest would
+    # OR with it: every spelling before `--` merges into one AND. Option
+    # values (a value is never read as a filterset) and everything after
+    # `--` stay as given; -rE is refused by name.
+    local -a merge_out=() merge_expected=()
+    merge_case_filter merge_out '(C)' --profile ci -E 'test(a)' -p -E \
+        '--filterset=kind(lib)' --filter-expr 'test(b)' '-E=test(c)' '-Etest(d)' -j 1 \
+        -- -E 'test(z)' --skip x || { self_test_failed "$LINENO"; return 1; }
+    merge_expected=(--profile ci -p -E -j 1 --filter-expr
+        '((test(a)) | (kind(lib)) | (test(b)) | (test(c)) | (test(d))) & ((C))'
+        -- -E 'test(z)' --skip x)
+    [[ $(printf '%s\n' "${merge_out[@]}") == "$(printf '%s\n' "${merge_expected[@]}")" ]] || { self_test_failed "$LINENO"; return 1; }
+    merge_case_filter merge_out '(C)' -p suite || { self_test_failed "$LINENO"; return 1; }
+    [[ $(printf '%s\n' "${merge_out[@]}") == $'-p\nsuite\n--filter-expr\n(C)' ]] || { self_test_failed "$LINENO"; return 1; }
+    status=0
+    merge_case_filter merge_out '(C)' -p suite -rE 'test(a)' 2>"$scratch/merge.stderr" || status=$?
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -qx 'run-nextest-counted: cannot merge the case filter with -rE: pass -E on its own' \
+        "$scratch/merge.stderr" || { self_test_failed "$LINENO"; return 1; }
+    status=0
+    merge_case_filter merge_out '(C)' -p suite -E 2>/dev/null || status=$?
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    # End to end, the listing receives the one merged filter.
+    mkdir "$scratch/merged-attempts"
+    status=0
+    HERMIT_NEXTEST_FILTER_EXPR='test(=failure)' HERMIT_NEXTEST_SELECTED_CASES='suite$failure' \
+        TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/merged-counts.json" \
+        run_nextest "$scratch/merged-events" "$wall_multiplier" "$cpu_wrapper" \
+        "$scratch/merged-attempts" "$scratch/merged-binary-map.json" \
+        "$scratch/merged-inventory.json" "$scratch/merged-cpu.json" \
+        --profile ci -p suite -E 'kind(lib)' -j 1 --retries 2 -- --skip skipme \
+        >/dev/null 2>"$scratch/merged.stderr" || status=$?
+    [[ $status == 100 ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ $(<"$scratch/list-arguments") == "$(printf '%s\n' --locked --color never \
+        --message-format json --profile ci -p suite --filter-expr \
+        '((kind(lib))) & (test(=failure))' -- --skip skipme)" ]] || { self_test_failed "$LINENO"; return 1; }
     # Budget re-resolution: the first prepared run refuses on a moved
     # context (before any test executes), the counted runner re-resolves
     # once and the run proceeds. The captured run stderr must sit beside
@@ -893,7 +1162,7 @@ PYEOF
     attempts="$scratch/reresolve-attempts"
     mkdir "$attempts"
     status=0
-    got=$(TMPDIR="$scratch" HERMIT_CENSUS_ALLOW_NO_BASE=1 DAGRUN_TEST_COUNTS_PATH="$scratch/reresolve-counts.json" \
+    got=$(TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/reresolve-counts.json" \
         HERMIT_PREPARED_NEXTEST_REQUIRED=1 \
         run_nextest "$scratch/reresolve-events" "$wall_multiplier" "$cpu_wrapper" \
         "$attempts" "$binary_map" "$inventory" "$scratch/reresolve-cpu.json" \
@@ -903,30 +1172,30 @@ PYEOF
         2>"$scratch/reresolve.stderr") || status=$?
     eval "run_rust_script() $(declare -f real_run_rust_script | sed -n '/^{/,$p')"
     unset -f real_run_rust_script
-    [[ $status == 100 ]] || return 1
-    grep -q 're-resolving once (attempt 2 of 2)' "$scratch/reresolve.stderr" || return 1
-    [[ -e $scratch/budget-run-stderr.txt && ! -e $attempts/budget-run-stderr.txt ]] || return 1
+    [[ $status == 100 ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -q 're-resolving once (attempt 2 of 2)' "$scratch/reresolve.stderr" || { self_test_failed "$LINENO"; return 1; }
+    [[ -e $scratch/budget-run-stderr.txt && ! -e $attempts/budget-run-stderr.txt ]] || { self_test_failed "$LINENO"; return 1; }
     # Only attempt records in the record directory, each one JSON the
     # typed-results reader would accept as a record.
     local reresolve_entry
     for reresolve_entry in "$attempts"/*; do
-        [[ -f $reresolve_entry ]] || return 1
+        [[ -f $reresolve_entry ]] || { self_test_failed "$LINENO"; return 1; }
         python3 -c 'import json,sys; record=json.load(open(sys.argv[1])); assert record["identity"] and record["completion"]' \
-            "$reresolve_entry" || return 1
+            "$reresolve_entry" || { self_test_failed "$LINENO"; return 1; }
     done
     [[ $(<"$scratch/reresolve-counts.json") == \
-        '{"executed_tests":1,"filtered_tests":0,"results":[{"attempts":1,"id":"suite$failure","result":"fail"}],"schema":2}' ]] || return 1
+        '{"executed_tests":1,"filtered_tests":0,"results":[{"attempts":1,"id":"suite$failure","result":"fail"}],"schema":2}' ]] || { self_test_failed "$LINENO"; return 1; }
     attempts="$scratch/wrapper-attempts"
-    grep -q 'period = "270s"' "$scratch/scaled-nextest.toml" || return 1
+    grep -q 'period = "270s"' "$scratch/scaled-nextest.toml" || { self_test_failed "$LINENO"; return 1; }
     [[ $(grep -c '^run-wrapper = "hermit-per-test-cpu"$' \
-        "$scratch/scaled-nextest.toml") == 1 ]] || return 1
+        "$scratch/scaled-nextest.toml") == 1 ]] || { self_test_failed "$LINENO"; return 1; }
     grep -q '^experimental = \["wrapper-scripts"\]$' \
-        "$scratch/scaled-nextest.toml" || return 1
+        "$scratch/scaled-nextest.toml" || { self_test_failed "$LINENO"; return 1; }
     grep -q '^target-runner = "within-wrapper"$' \
-        "$scratch/scaled-nextest.toml" || return 1
+        "$scratch/scaled-nextest.toml" || { self_test_failed "$LINENO"; return 1; }
     # This is the command Nextest receives, not the fixture's direct wrapper call.
     grep -Fq '"--cpu-timeout-usec", "22000000", "--termination-grace-ms", "2000", "--"' \
-        "$scratch/scaled-nextest.toml" || return 1
+        "$scratch/scaled-nextest.toml" || { self_test_failed "$LINENO"; return 1; }
     if compgen -G "$scratch/hermit-nextest-config.*.toml" >/dev/null; then
         printf 'run-nextest-counted: temporary nextest config leaked\n' >&2
         return 1
@@ -938,64 +1207,87 @@ PYEOF
     inventory_wrong_name=1
     mkdir "$scratch/attribution-attempts"
     status=0
-    TMPDIR="$scratch" HERMIT_CENSUS_ALLOW_NO_BASE=1 DAGRUN_TEST_COUNTS_PATH="$scratch/attribution-counts.json" \
+    TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/attribution-counts.json" \
         run_nextest "$scratch/attribution-events" "$wall_multiplier" "$cpu_wrapper" \
         "$scratch/attribution-attempts" "$binary_map" "$inventory" "$scratch/attribution-cpu.json" \
         --profile ci -p suite -j 1 --retries 2 -- --skip skipme \
         >"$scratch/attribution.stdout" 2>"$scratch/attribution.stderr" || status=$?
-    [[ $status == 100 ]] || return 1
-    [[ ! -e $scratch/attribution-counts.json && ! -e $scratch/attribution-cpu.json ]] || return 1
-    grep -q '0 eligible matches' "$scratch/attribution.stderr" || return 1
+    [[ $status == 100 ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $scratch/attribution-counts.json && ! -e $scratch/attribution-cpu.json ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -q '0 eligible matches' "$scratch/attribution.stderr" || { self_test_failed "$LINENO"; return 1; }
     inventory_wrong_name=0
 
     # Preserve the original zero-terminal launch failure separately from the
-    # executed exit23 control above. Stderr's twelve failures are not test rows.
-    # This caller passes its own --locked, which the list below must not repeat.
+    # executed exit23 control above, end to end through run_nextest's failure
+    # branch. Its listing names the one test, as a real launch failure's
+    # does; its stream ends with no terminal test event, and stderr's twelve
+    # exec failures are not test rows: the one listed test never ran, so it
+    # counts as not executed (filtered_tests 1), never as a row. This caller
+    # passes its own --locked, which the list below must not repeat.
     launch_failure=1
     ordinary_attempts=$attempts
     attempts="$scratch/launch-attempts"
     mkdir "$attempts"
     status=0
-    got=$(TMPDIR="$scratch" HERMIT_CENSUS_ALLOW_NO_BASE=1 DAGRUN_TEST_COUNTS_PATH="$scratch/launch-counts.json" \
+    got=$(TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/launch-counts.json" \
         run_nextest "$scratch/launch-events" "$wall_multiplier" "$cpu_wrapper" \
         "$attempts" "$binary_map" "$inventory" "$scratch/launch-cpu.json" \
         --profile ci --locked -p suite -j 1 --retries 2 -- --skip skipme) || status=$?
-    [[ $status == 100 ]] || return 1
-    [[ $got == *$'running 0 tests\ntest result: FAILED. 0 passed; 0 failed; 0 ignored; 0 filtered out' ]] || return 1
-    [[ $got != *'test result: ok.'* ]] || return 1
+    [[ $status == 100 ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ $got == *$'running 0 tests\ntest result: FAILED. 0 passed; 0 failed; 0 ignored; 1 filtered out' ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ $got != *'test result: ok.'* ]] || { self_test_failed "$LINENO"; return 1; }
     [[ $(<"$scratch/launch-counts.json") == \
-        '{"executed_tests":0,"filtered_tests":0,"results":[],"schema":2}' ]] || return 1
-    jq -e '. == {schema:3, run_id:null, attempts:[]}' "$scratch/launch-cpu.json" >/dev/null || return 1
-    cmp -s "$scratch/expected-list-arguments" "$scratch/list-arguments" || return 1
-    if compgen -G "$scratch/hermit-nextest-config.*.toml" >/dev/null; then return 1; fi
+        '{"executed_tests":0,"filtered_tests":1,"results":[],"schema":2}' ]] || { self_test_failed "$LINENO"; return 1; }
+    jq -e '. == {schema:3, run_id:null, attempts:[]}' "$scratch/launch-cpu.json" >/dev/null || { self_test_failed "$LINENO"; return 1; }
+    cmp -s "$scratch/expected-list-arguments" "$scratch/list-arguments" || { self_test_failed "$LINENO"; return 1; }
+    if compgen -G "$scratch/hermit-nextest-config.*.toml" >/dev/null; then self_test_failed "$LINENO"; return 1; fi
+    launch_failure=0
+
+    # A listing that names no test: the census gate refuses it as zero-tests
+    # before the run, so nothing runs and nothing publishes.
+    empty_listing=1
+    mkdir "$scratch/empty-attempts"
+    status=0
+    TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/empty-counts.json" \
+        run_nextest "$scratch/empty-events" "$wall_multiplier" "$cpu_wrapper" \
+        "$scratch/empty-attempts" "$scratch/empty-binary-map.json" \
+        "$scratch/empty-inventory.json" "$scratch/empty-cpu.json" \
+        --profile ci --locked -p suite -j 1 --retries 2 -- --skip skipme \
+        >/dev/null 2>"$scratch/empty.stderr" || status=$?
+    [[ $status == 1 ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -q 'census-check: zero-tests' "$scratch/empty.stderr" || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $scratch/empty-events && ! -e $scratch/empty-counts.json && ! -e $scratch/empty-cpu.json ]] || { self_test_failed "$LINENO"; return 1; }
+    cmp -s "$scratch/expected-list-arguments" "$scratch/list-arguments" || { self_test_failed "$LINENO"; return 1; }
+    if compgen -G "$scratch/hermit-nextest-config.*.toml" >/dev/null; then self_test_failed "$LINENO"; return 1; fi
+    empty_listing=0
 
     status=0
     DAGRUN_TEST_COUNTS_PATH="$scratch/launch-wrong-count.json" NEXTEST_EXPECTED_EXECUTED=1 \
         emit_libtest_count "$scratch/launch-events" 100 "$attempts" "$binary_map" \
         "$scratch/launch-wrong-cpu.json" "$inventory" >"$scratch/launch-wrong.stdout" 2>"$scratch/launch-wrong.stderr" || status=$?
-    [[ $status == 2 ]] || return 1
-    grep -q 'expected 1 tests to execute, saw 0' "$scratch/launch-wrong.stderr" || return 1
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -q 'expected 1 tests to execute, saw 0' "$scratch/launch-wrong.stderr" || { self_test_failed "$LINENO"; return 1; }
     # The refusal must carry the outcome it already knows. Withholding the typed
     # report is deliberate and asserted on the next line, so this message is the
     # only place the run can say whether the tests it DID run passed. Without it
     # an all-green population drift and a failing one read identically.
-    grep -q 'of which 0 passed and 0 failed' "$scratch/launch-wrong.stderr" || return 1
-    [[ ! -e $scratch/launch-wrong-count.json && ! -e $scratch/launch-wrong-cpu.json ]] || return 1
+    grep -q 'of which 0 passed and 0 failed' "$scratch/launch-wrong.stderr" || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $scratch/launch-wrong-count.json && ! -e $scratch/launch-wrong-cpu.json ]] || { self_test_failed "$LINENO"; return 1; }
     status=0
     DAGRUN_TEST_COUNTS_PATH="$scratch/failed-wrong-count.json" NEXTEST_EXPECTED_EXECUTED=2 \
         emit_libtest_count "$scratch/wrapper-events" 100 "$ordinary_attempts" "$binary_map" \
         "$scratch/failed-wrong-cpu.json" "$ordinary_inventory" >"$scratch/failed-wrong.stdout" 2>"$scratch/failed-wrong.stderr" || status=$?
-    [[ $status == 2 ]] || return 1
-    grep -q 'expected 2 tests to execute, saw 1' "$scratch/failed-wrong.stderr" || return 1
-    grep -q 'of which 0 passed and 1 failed' "$scratch/failed-wrong.stderr" || return 1
-    [[ ! -e $scratch/failed-wrong-count.json && ! -e $scratch/failed-wrong-cpu.json ]] || return 1
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -q 'expected 2 tests to execute, saw 1' "$scratch/failed-wrong.stderr" || { self_test_failed "$LINENO"; return 1; }
+    grep -q 'of which 0 passed and 1 failed' "$scratch/failed-wrong.stderr" || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $scratch/failed-wrong-count.json && ! -e $scratch/failed-wrong-cpu.json ]] || { self_test_failed "$LINENO"; return 1; }
     status=0
     DAGRUN_TEST_COUNTS_PATH="$scratch/launch-stray-count.json" \
         emit_libtest_count "$scratch/launch-events" 100 "$ordinary_attempts" "$binary_map" \
         "$scratch/launch-stray-cpu.json" "$inventory" >"$scratch/launch-stray.stdout" 2>"$scratch/launch-stray.stderr" || status=$?
-    [[ $status == 2 ]] || return 1
-    grep -q 'unexpected=' "$scratch/launch-stray.stderr" || return 1
-    [[ ! -e $scratch/launch-stray-count.json && ! -e $scratch/launch-stray-cpu.json ]] || return 1
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -q 'unexpected=' "$scratch/launch-stray.stderr" || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $scratch/launch-stray-count.json && ! -e $scratch/launch-stray-cpu.json ]] || { self_test_failed "$LINENO"; return 1; }
 
     unset -f cargo
 
@@ -1006,27 +1298,89 @@ PYEOF
     DAGRUN_TEST_COUNTS_PATH="$scratch/refused.json" \
         emit_libtest_count "$scratch/unknown-event.jsonl" 0 \
         >/dev/null 2>"$scratch/refusal" || status=$?
-    [[ $status == 2 ]] || return 1
-    grep -q 'unsupported test event "future"' "$scratch/refusal" || return 1
-    [[ ! -e $scratch/refused.json ]] || return 1
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -q 'unsupported test event "future"' "$scratch/refusal" || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $scratch/refused.json ]] || { self_test_failed "$LINENO"; return 1; }
 
-    retain_events "$scratch/events.jsonl" - || return 1
-    [[ ! -e $scratch/kept-events.jsonl ]] || return 1
-    retain_events "$scratch/events.jsonl" "$scratch/kept-events.jsonl" || return 1
-    cmp -s "$scratch/events.jsonl" "$scratch/kept-events.jsonl" || return 1
+    retain_events "$scratch/events.jsonl" - || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $scratch/kept-events.jsonl ]] || { self_test_failed "$LINENO"; return 1; }
+    retain_events "$scratch/events.jsonl" "$scratch/kept-events.jsonl" || { self_test_failed "$LINENO"; return 1; }
+    cmp -s "$scratch/events.jsonl" "$scratch/kept-events.jsonl" || { self_test_failed "$LINENO"; return 1; }
     status=0
     retain_events "$scratch/failed-events.jsonl" "$scratch/kept-events.jsonl" \
         2>"$scratch/retain-refusal" || status=$?
-    [[ $status == 2 ]] || return 1
-    grep -q 'cannot keep the typed event stream' "$scratch/retain-refusal" || return 1
-    cmp -s "$scratch/events.jsonl" "$scratch/kept-events.jsonl" || return 1
-    [[ $(HERMIT_NEXTEST_EVENTS_PATH="$scratch/asked" configured_events_path) == "$scratch/asked" ]] || return 1
-    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH; configured_events_path) == - ]] || return 1
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -q 'cannot keep the typed event stream' "$scratch/retain-refusal" || { self_test_failed "$LINENO"; return 1; }
+    cmp -s "$scratch/events.jsonl" "$scratch/kept-events.jsonl" || { self_test_failed "$LINENO"; return 1; }
+    [[ $(HERMIT_NEXTEST_EVENTS_PATH="$scratch/asked" configured_events_path) == "$scratch/asked" ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH E2E_RESULT_ROOT; configured_events_path) == - ]] || { self_test_failed "$LINENO"; return 1; }
     status=0
     HERMIT_NEXTEST_EVENTS_PATH='' configured_events_path >/dev/null 2>&1 || status=$?
-    [[ $status == 2 ]] || return 1
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    # A counted step of a validation keeps its stream under the durable result root, named by
+    # its dagrun step tag, one file per attempt; an explicit path still wins and makes no
+    # directory; without a result root or a counted step (a counts path of `-` included)
+    # nothing is kept.
+    local kept_root=$scratch/result-root counts=$scratch/counts/run-1:test.detcore_unit.json got
+    [[ $(E2E_RESULT_ROOT=$kept_root DAGRUN_TEST_COUNTS_PATH=$counts HERMIT_NEXTEST_EVENTS_PATH="$scratch/asked" \
+        configured_events_path) == "$scratch/asked" ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $kept_root ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH; E2E_RESULT_ROOT=$kept_root DAGRUN_TEST_COUNTS_PATH=- \
+        configured_events_path) == - ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $kept_root ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH; E2E_RESULT_ROOT=$kept_root DAGRUN_TEST_COUNTS_PATH=$counts \
+        DAGRUN_STEP_STARTED_MONOTONIC_NS=41 configured_events_path) == "$kept_root/nextest-events/test.detcore_unit.41.jsonl" ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ -d $kept_root/nextest-events ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH E2E_RESULT_ROOT; DAGRUN_TEST_COUNTS_PATH=$counts configured_events_path) == - ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH DAGRUN_TEST_COUNTS_PATH; E2E_RESULT_ROOT=$kept_root configured_events_path) == - ]] || { self_test_failed "$LINENO"; return 1; }
+    got=$(unset HERMIT_NEXTEST_EVENTS_PATH; E2E_RESULT_ROOT=$kept_root DAGRUN_TEST_COUNTS_PATH=$counts \
+        DAGRUN_STEP_STARTED_MONOTONIC_NS=not-a-number configured_events_path)
+    [[ $got == "$kept_root/nextest-events/"* && ${got#"$kept_root/nextest-events/"} =~ ^test\.detcore_unit\.[0-9]+-[0-9]+\.jsonl$ ]] || { self_test_failed "$LINENO"; return 1; }
+    # Two attempts of one step keep two streams; neither is refused as an existing file.
+    local attempt
+    for attempt in 41 42; do
+        retain_events "$scratch/events.jsonl" "$(unset HERMIT_NEXTEST_EVENTS_PATH; E2E_RESULT_ROOT=$kept_root \
+            DAGRUN_TEST_COUNTS_PATH=$counts DAGRUN_STEP_STARTED_MONOTONIC_NS=$attempt configured_events_path)" || { self_test_failed "$LINENO"; return 1; }
+    done
+    cmp -s "$scratch/events.jsonl" "$kept_root/nextest-events/test.detcore_unit.41.jsonl" || { self_test_failed "$LINENO"; return 1; }
+    cmp -s "$scratch/events.jsonl" "$kept_root/nextest-events/test.detcore_unit.42.jsonl" || { self_test_failed "$LINENO"; return 1; }
+    # A result root where the directory cannot be made refuses (exit 2), never keeps nothing.
+    : >"$scratch/not-a-directory"
+    status=0
+    (unset HERMIT_NEXTEST_EVENTS_PATH; E2E_RESULT_ROOT=$scratch/not-a-directory DAGRUN_TEST_COUNTS_PATH=$counts \
+        configured_events_path) >/dev/null 2>"$scratch/events-dir-refusal" || status=$?
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -q 'cannot create .* to keep the typed event stream' "$scratch/events-dir-refusal" || { self_test_failed "$LINENO"; return 1; }
+    # Beside a default-kept stream: the attempt's start marker (one per attempt, never replaced)
+    # and a copy of the typed results the writer published; nothing for a caller-chosen path.
+    local prefix=$kept_root/nextest-events/test.detcore_unit.43
+    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH; configured_results_prefix "$prefix.jsonl") == "$prefix" ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ $(unset HERMIT_NEXTEST_EVENTS_PATH; configured_results_prefix -) == - ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ $(HERMIT_NEXTEST_EVENTS_PATH="$scratch/asked" configured_results_prefix "$scratch/asked") == - ]] || { self_test_failed "$LINENO"; return 1; }
+    mark_attempt_started - || { self_test_failed "$LINENO"; return 1; }
+    mark_attempt_started "$prefix" || { self_test_failed "$LINENO"; return 1; }
+    [[ -f $prefix.started && ! -s $prefix.started ]] || { self_test_failed "$LINENO"; return 1; }
+    status=0
+    mark_attempt_started "$prefix" 2>"$scratch/marker-refusal" || status=$?
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -q 'cannot write the start marker' "$scratch/marker-refusal" || { self_test_failed "$LINENO"; return 1; }
+    retain_results "$scratch/no-such-results.json" "$prefix" || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $prefix.results.json ]] || { self_test_failed "$LINENO"; return 1; }
+    retain_results - "$prefix" || { self_test_failed "$LINENO"; return 1; }
+    printf '%s' '{"executed_tests":0,"filtered_tests":0,"results":[],"schema":5}' >"$scratch/results.json"
+    retain_results "$scratch/results.json" - || { self_test_failed "$LINENO"; return 1; }
+    [[ ! -e $prefix.results.json ]] || { self_test_failed "$LINENO"; return 1; }
+    retain_results "$scratch/results.json" "$prefix" || { self_test_failed "$LINENO"; return 1; }
+    cmp -s "$scratch/results.json" "$prefix.results.json" || { self_test_failed "$LINENO"; return 1; }
+    status=0
+    retain_results "$scratch/results.json" "$prefix" 2>"$scratch/results-refusal" || status=$?
+    [[ $status == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    grep -q 'cannot keep the typed test results' "$scratch/results-refusal" || { self_test_failed "$LINENO"; return 1; }
+    # A failed keep fails only a passing run: a census no-result (75) or a test failure stands.
+    [[ $(kept_status 0 0) == 0 && $(kept_status 0 2) == 2 ]] || { self_test_failed "$LINENO"; return 1; }
+    [[ $(kept_status 75 2) == 75 && $(kept_status 100 2) == 100 && $(kept_status 1 0) == 1 ]] || { self_test_failed "$LINENO"; return 1; }
 
-    printf 'run-nextest-counted: self-test PASS (typed counts, executed failure, zero-terminal launch failure, CPU reconciliation, refusal controls, event retention, skip classification, skid-infra classification)\n'
+    printf 'run-nextest-counted: self-test PASS (typed counts, executed failure, zero-terminal launch failure, zero-tests census refusal, case selection (named cases checked against the listing over all whitespace, the case filter ANDed with the node filtersets), CPU reconciliation, refusal controls, event retention, typed-result retention, skip classification, skid-infra classification)\n'
 }
 
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
@@ -1113,11 +1467,19 @@ HERMIT_SKID_INFRA_FILE="$cpu_measurement_dir/skid-infra.log"
 if [[ ${HERMIT_NEXTEST_RESULTS_SCHEMA:-} == 5 ]]; then
     export HERMIT_SKID_INFRA_FILE
 fi
+results_prefix=$(configured_results_prefix "$events_destination")
+keep_status=0
+mark_attempt_started "$results_prefix" || keep_status=2
 nextest_status=0
 run_nextest "$events_log" "$(configured_wall_timeout_multiplier)" "$cpu_wrapper" \
     "$cpu_attempt_records" "$cpu_binary_map" "$cpu_inventory" "$cpu_report" "$@" \
     || nextest_status=$?
-retain_events "$events_log" "$events_destination" || nextest_status=2
+# A record that cannot be kept fails a run that would otherwise pass (2). It never replaces a
+# status that already says something else: a census no-result (75), which validate requeues,
+# or a test failure must stay what it is.
+retain_events "$events_log" "$events_destination" || keep_status=2
+retain_results "${DAGRUN_TEST_COUNTS_PATH:--}" "$results_prefix" || keep_status=2
+nextest_status=$(kept_status "$nextest_status" "$keep_status")
 skid_retries=$(wc -l <"$skid_retry_record") || exit $?
 printf 'run-nextest-counted: skid-overshoot retries: %d\n' "$skid_retries" >&2
 retry_records=$(wc -l <"$HERMIT_RETRY_RECORD_FILE") || exit $?

@@ -47,12 +47,8 @@ runs locally, and each parity candidate shares its ptrace reference's route.
 CpuidOnReRouteTest evaluates the same plan with that switch on.
 
 Every test that execs defs.bzl (those classes, and one CellTest case) reads it
-through defs_source(). ShipIt strips defs.bzl from the GitHub export,
-facebookexperimental/hermit, with every other .bzl file until dh-2y5z03 V4. There
-those tests are skipped and the run prints one line beginning SKIPPED. Only an
-absent defs.bzl with GITHUB_REPOSITORY naming the export skips (DefsSkipTest): any
-other checkout missing the file still fails, and an export that has it runs every
-test. V4 deletes the skip.
+through defs_source(). The GitHub export, facebookexperimental/hermit, carries
+defs.bzl, so these tests run everywhere, and a checkout missing it fails.
 """
 
 from __future__ import annotations
@@ -69,7 +65,6 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest import mock
 
 import test_buck_e2e_ingest as ingest_test
 
@@ -77,9 +72,6 @@ import test_buck_e2e_ingest as ingest_test
 CI = Path(__file__).resolve().parent
 CELL_SH = CI / "buck-e2e" / "cell.sh"
 DEFS = CI / "buck-e2e" / "defs.bzl"
-DEFS_NAME = "ci/buck-e2e/defs.bzl"
-# The GitHub export ShipIt publishes, which has no .bzl file until dh-2y5z03 V4.
-EXPORT_REPOSITORY = "facebookexperimental/hermit"
 PLAN = CI / "expected-e2e-plan.json"
 RE_EXCLUSIONS = CI / "buck-e2e" / "re_exclusions.json"
 TEST, MODE, BACKEND = "c-programs/cpuid-probe", "verify", "dbt"
@@ -113,7 +105,7 @@ keys = ("HERMIT_E2E_EMPTY_WORKDIR", "E2E_RESULT_ROOT", "E2E_BUILD_ROOT", "VALIDA
         "E2E_RUN_ID", "HERMIT_BIN", "HERMIT_INSTALL_DIR", "E2E_KEEP_VERIFY_LOGS", "E2E_PARITY_POST_PASS",
         "HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN", "HERMIT_EPOCH", "HERMIT_E2E_BUNDLE_RECORD",
         "HERMIT_E2E_DIGEST_CACHE_DIR", "HERMIT_E2E_SESSION_CENSUS", "HERMIT_E2E_SNAPSHOT_GIT",
-        "HERMIT_E2E_V2_OCI_DIR")
+        "HERMIT_E2E_V2_OCI_DIR", "HERMIT_E2E_BUCKET_IMAGE_SYSTEM_UTILS")
 # The client directory the DBT backend would load from: name -> link target, or None.
 rsrcs = os.path.join(host(os.environ.get("HERMIT_INSTALL_DIR", "/nonexistent")), "rsrcs")
 links = {n: os.readlink(os.path.join(rsrcs, n)) if os.path.islink(os.path.join(rsrcs, n)) else None
@@ -469,6 +461,8 @@ class CellTest(unittest.TestCase):
         # As ci/buck-e2e/BUCK :empty-v2-rootfs builds it for a bundle that ships no v2 rootfs.
         (self.bundle / "v2-rootfs").mkdir()
         (self.bundle / "v2-rootfs" / "NO-V2-ROOTFS").write_text("This bundle ships no v2 rootfs.\n")
+        (self.bundle / "mini-crypto").mkdir()
+        (self.bundle / "mini-crypto" / "NO-MINI-CRYPTO").write_text("This bundle ships no mini-crypto image.\n")
         self.before = sorted(str(p.relative_to(self.bundle)) for p in self.bundle.rglob("*"))
         self.calls = self.tmp / "calls.jsonl"
         self.calls.touch()
@@ -908,6 +902,78 @@ class CellTest(unittest.TestCase):
         self.assertEqual(done["status"], "passed", done)
         [harness] = self.calls_by("harness")
         self.assertEqual(harness["env"]["HERMIT_E2E_V2_OCI_DIR"], "/src/bundle/v2-rootfs")
+
+    # The mini-crypto seam is OFF unless the bundle ships the image: a
+    # NO-MINI-CRYPTO bundle sets no bucket-image override (and drops a
+    # caller's), so the harness argv is exactly today's.
+    def ship_mini_crypto(self) -> None:
+        (self.bundle / "mini-crypto" / "NO-MINI-CRYPTO").unlink()
+        (self.bundle / "mini-crypto" / "oci-layout").write_text('{"imageLayoutVersion": "1.0.0"}\n')
+
+    def test_a_bundle_that_declares_no_mini_crypto_names_no_bucket_image(self) -> None:
+        done, _ = self.run_cell(
+            backend="ptrace", cell_test="system-utils/openssl-rand",
+            HERMIT_E2E_BUCKET_IMAGE_SYSTEM_UTILS="oci-dir:" + str(self.tmp / "elsewhere"))
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertIsNone(harness["env"]["HERMIT_E2E_BUCKET_IMAGE_SYSTEM_UTILS"])
+
+    def test_a_system_utils_ptrace_cell_gets_the_bundle_mini_crypto_image(self) -> None:
+        self.ship_mini_crypto()
+        done, _ = self.run_cell(
+            backend="ptrace", cell_test="system-utils/openssl-rand",
+            HERMIT_E2E_GUEST_IMAGE="mini-crypto",
+            HERMIT_E2E_BUCKET_IMAGE_SYSTEM_UTILS="oci-dir:" + str(self.tmp / "elsewhere"))
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertEqual(harness["env"]["HERMIT_E2E_BUCKET_IMAGE_SYSTEM_UTILS"],
+                         "oci-dir:" + str(self.bundle / "mini-crypto"))
+
+    def test_a_mini_crypto_image_does_not_reach_kvm_or_other_categories(self) -> None:
+        self.ship_mini_crypto()
+        for backend, cell_test in (("kvm", "system-utils/openssl-rand"), ("ptrace", TEST)):
+            with self.subTest(backend=backend, cell_test=cell_test):
+                self.calls.write_text("")
+                done, _ = self.run_cell(backend=backend, cell_test=cell_test)
+                self.assertEqual(done["status"], "passed", done)
+                [harness] = self.calls_by("harness")
+                self.assertIsNone(harness["env"]["HERMIT_E2E_BUCKET_IMAGE_SYSTEM_UTILS"])
+
+    def test_a_mini_crypto_without_an_oci_layout_or_the_declaration_fails_the_cell(self) -> None:
+        (self.bundle / "mini-crypto" / "NO-MINI-CRYPTO").unlink()
+        done, result = self.run_cell()
+        self.assertEqual(done["status"], "failed", done)
+        self.assertIn("holds no oci-layout and no NO-MINI-CRYPTO", details_json(done)["reason"])
+        self.assertIsNone(result)
+        self.assertEqual(self.calls_by("harness"), [])
+
+    def test_a_cell_that_needs_the_mini_crypto_image_fails_when_the_bundle_ships_none(self) -> None:
+        done, result = self.run_cell(
+            backend="ptrace", cell_test="system-utils/openssl-rand",
+            HERMIT_E2E_GUEST_IMAGE="mini-crypto")
+        self.assertEqual(done["status"], "failed", done)
+        self.assertIn("needs the mini-crypto guest image", details_json(done)["reason"])
+        self.assertIsNone(result)
+        self.assertEqual(self.calls_by("harness"), [])
+
+    def test_a_mini_crypto_with_both_an_image_and_the_declaration_fails_the_cell(self) -> None:
+        self.ship_mini_crypto()
+        (self.bundle / "mini-crypto" / "NO-MINI-CRYPTO").write_text("This bundle ships no mini-crypto image.\n")
+        done, result = self.run_cell(backend="ptrace", cell_test="system-utils/openssl-rand")
+        self.assertEqual(done["status"], "failed", done)
+        self.assertIn("holds both an oci-layout and NO-MINI-CRYPTO", details_json(done)["reason"])
+        self.assertIsNone(result)
+        self.assertEqual(self.calls_by("harness"), [])
+
+    def test_a_system_utils_ptrace_cell_in_the_pinned_root_gets_the_inner_image_path(self) -> None:
+        self.ship_mini_crypto()
+        done, _ = self.run_cell(
+            backend="ptrace", cell_test="system-utils/openssl-rand",
+            HERMIT_E2E_CONTAINER="pinned-root", HERMIT_E2E_GUEST_IMAGE="mini-crypto")
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertEqual(harness["env"]["HERMIT_E2E_BUCKET_IMAGE_SYSTEM_UTILS"],
+                         "oci-dir:/src/bundle/mini-crypto")
 
     def test_a_bundle_without_a_record_names_none(self) -> None:
         done, _ = self.run_cell(HERMIT_E2E_BUNDLE_RECORD=str(self.tmp / "elsewhere.json"))
@@ -2000,70 +2066,9 @@ def _defs_load(module: str, *symbols: str, **aliases: str) -> None:
         raise AssertionError(f"unexpected load in defs.bzl: {module!r} {sorted(requested)}")
 
 
-def defs_skip_reason(defs: Path, repository: str | None) -> str | None:
-    """The SKIPPED line for the GitHub export, or None to run the tests that exec defs.bzl.
-
-    It skips only when repository is EXPORT_REPOSITORY and nothing at all is at defs:
-    any other checkout missing the file still fails, and an export that has it runs
-    every test. dh-2y5z03 V4 deletes this skip.
-    """
-    if repository != EXPORT_REPOSITORY:
-        return None
-    try:
-        defs.lstat()
-    except FileNotFoundError:
-        return (f"SKIPPED on {EXPORT_REPOSITORY}: {DEFS_NAME} is absent, because ShipIt "
-                "strips every .bzl file from this export; the tests that exec it are "
-                "skipped until dh-2y5z03 V4 exports the Buck graph and deletes this skip")
-    return None
-
-
-DEFS_SKIP = defs_skip_reason(DEFS, os.environ.get("GITHUB_REPOSITORY"))
-
-
 def defs_source() -> str:
-    """defs.bzl's text. On the GitHub export without it, skips the calling test instead."""
-    if DEFS_SKIP:
-        raise unittest.SkipTest(DEFS_SKIP)
+    """defs.bzl's text."""
     return DEFS.read_text()
-
-
-class DefsSkipTest(unittest.TestCase):
-    """The tests that exec defs.bzl skip only on the export, and only without the file."""
-
-    def setUp(self) -> None:
-        self.dir = Path(tempfile.mkdtemp(prefix="test-buck-e2e-cell-defs-"))
-        self.addCleanup(shutil.rmtree, self.dir)
-        self.defs = self.dir / "defs.bzl"
-
-    def test_only_the_export_without_the_file_skips(self) -> None:
-        reason = defs_skip_reason(self.defs, EXPORT_REPOSITORY)
-        self.assertIsNotNone(reason)
-        self.assertTrue(reason.startswith("SKIPPED on facebookexperimental/hermit: "), reason)
-        self.assertIn(DEFS_NAME, reason)
-        self.assertIn("dh-2y5z03 V4", reason)
-        for other in (None, "rrnewton/hermit", "", "FacebookExperimental/hermit",
-                      "facebookexperimental/hermit-fork", "facebookexperimental/hermit "):
-            self.assertIsNone(defs_skip_reason(self.defs, other), other)
-
-    def test_the_export_with_the_file_runs_every_test(self) -> None:
-        self.defs.write_text("")
-        self.assertIsNone(defs_skip_reason(self.defs, EXPORT_REPOSITORY))
-        # Something at the path that is not a readable file is not absent either:
-        # the tests run and fail on it rather than skip.
-        self.defs.unlink()
-        self.defs.symlink_to(self.dir / "nowhere")
-        self.assertIsNone(defs_skip_reason(self.defs, EXPORT_REPOSITORY))
-        self.defs.unlink()
-        self.defs.mkdir()
-        self.assertIsNone(defs_skip_reason(self.defs, EXPORT_REPOSITORY))
-
-    def test_a_test_that_reads_defs_is_skipped_with_the_reason(self) -> None:
-        reason = defs_skip_reason(self.defs, EXPORT_REPOSITORY)
-        with mock.patch.object(sys.modules[__name__], "DEFS_SKIP", reason):
-            with self.assertRaises(unittest.SkipTest) as skipped:
-                defs_source()
-        self.assertEqual(str(skipped.exception), reason)
 
 
 def evaluate_cells(routing: str, pmu_on_re: str | None = "true", cpuid_on_re: str | None = None,
@@ -2248,6 +2253,42 @@ class ContainerChoiceTest(unittest.TestCase):
         self.assertTrue(privileged)
         self.assertLessEqual(privileged, chosen)
         self.assertFalse([c for c in self.plan if c["backend"] == "dbt"])
+
+
+class GuestImageCategoriesTest(unittest.TestCase):
+    """guest_image_categories is inert unless a consumer opts a category in.
+    Opting system-utils in un-containers its non-privileged ptrace cells
+    and sets HERMIT_E2E_GUEST_IMAGE so cell.sh points them at the bundle's
+    guest image (and refuses by failed record when none ships). Base-vs-head
+    off-mode identity is ci/check_buck_e2e_seam_identity.py's job."""
+
+    plan = json.loads(PLAN.read_text())["cells"]
+
+    def project(self, targets: dict[str, dict]) -> dict[str, tuple]:
+        return {
+            name: (tuple(target.get("args") or ()), dict(target.get("env") or {}),
+                   tuple(target.get("labels") or ()), target.get("route"))
+            for name, target in targets.items()
+        }
+
+    def test_only_the_listed_categorys_ptrace_cells_change(self) -> None:
+        off = self.project(evaluate_cells("local"))
+        on = self.project(evaluate_cells(
+            "local", guest_image_categories=["system-utils"]))
+        self.assertEqual(set(off), set(on))
+        changed = {name for name in off if off[name] != on[name]}
+        expected = {
+            cell_slug(cell) for cell in self.plan
+            if cell.get("category") == "system-utils" and cell["backend"] == "ptrace"
+            and cell.get("lane") != "privileged"}
+        self.assertTrue(expected, "the plan has system-utils ptrace cells")
+        self.assertEqual(changed, expected)
+        for name in expected:
+            env = on[name][1]
+            self.assertEqual(env["HERMIT_E2E_CONTAINER"], "", name)
+            self.assertEqual(env["HERMIT_E2E_GUEST_IMAGE"], "mini-crypto", name)
+            self.assertIn("guest image", env["HERMIT_E2E_CONTAINER_REASON"], name)
+            self.assertNotIn("hermit_e2e_container_pinned_root", on[name][2], name)
 
 
 class ParityRouteTest(unittest.TestCase):
@@ -2624,6 +2665,4 @@ class PmuOnReDefaultTest(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    if DEFS_SKIP:
-        print(f"test_buck_e2e_cell.py: {DEFS_SKIP}", flush=True)
     unittest.main()

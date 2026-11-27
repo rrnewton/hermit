@@ -89,6 +89,7 @@ use crate::types::*;
 pub(crate) mod descriptor_directory;
 #[cfg(test)]
 mod determinize_stat_tests;
+pub(crate) mod entry_mtime;
 pub(crate) mod flock_model;
 pub(crate) mod other_process_procfs;
 #[cfg(test)]
@@ -827,6 +828,20 @@ fn pipe_capacity_failure(
     };
     Some(PipeCapacityFailure { created_fds, error })
 }
+
+/// How many times Detcore injects a new pipe's capacity pin that Reverie
+/// reports did not run (`ERESTARTSYS`) before the run is refused
+/// (`Detcore::pin_pipe_capacity`).
+///
+/// Two, so one retry. The retry of a pin that a signal stopped is exact:
+/// reverie-ptrace holds that signal and delivers it at the guest's resume. On
+/// the retry it shields only realtime signals, and it holds one signal per
+/// thread, so a second report from a signal means that a standard signal
+/// stopped the retry and replaced the held one, which is lost. The pin refuses
+/// there, rather than let the run go on without that signal. The bound also
+/// ends the pin where a seccomp filter the guest inherited returns a restart
+/// every time without running the call.
+const PIPE_PIN_ATTEMPTS: usize = 2;
 
 fn random_device_lseek_result(status_flags: i32, whence: Whence) -> Result<i64, Errno> {
     if status_flags & OFlag::O_PATH.bits() != 0 {
@@ -2065,6 +2080,18 @@ pub(crate) fn removes_a_name(sysno: Sysno) -> bool {
     }
 }
 
+/// What [`Detcore::last_names_removed_by`] found before a call ran.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct NameRemovals {
+    /// The host inodes whose last name the call removes, for
+    /// [`Detcore::retire_removed_inodes`] once it succeeds.
+    pub(crate) retired: Vec<RawInode>,
+    /// For a rename other than an exchange, what the lookups saw of its
+    /// target (see [`entry_mtime::RenameTarget`]); `None` for every other
+    /// call and where they cannot tell.
+    pub(crate) rename_target: Option<entry_mtime::RenameTarget>,
+}
+
 /// Whether a call numbered `sysno` can be acted on by any of the file and
 /// descriptor checks `Detcore::handle_syscall_event` makes before it
 /// dispatches the call: the names it removes ([`removes_a_name`]), the
@@ -2181,6 +2208,217 @@ pub(crate) fn may_write_process_memory(flags: OFlag, descriptor: Option<(&Path, 
         && descriptor.is_none_or(|(link, on_procfs)| {
             on_procfs && link.file_name() == Some(std::ffi::OsStr::new("mem"))
         })
+}
+
+/// Whether a kernel fdinfo bound at its open to `table`, the task whose
+/// descriptor table it shows (`procfs::FdinfoTable`), is of one of the
+/// reader's own descriptors, the reader being thread `tid` of process `pid`
+/// in Detcore's numbers (`Detcore::procfs_caller_ids`, `None` in a nested PID
+/// namespace): a bound thread must be the reader itself; a bound process must
+/// be the reader's, whose table (the leader's, which procfs shows for the
+/// process) the reader must hold (`holds_process_table`: the leader, or a
+/// thread that shares its table; a thread made without `CLONE_FILES` holds a
+/// copy). A file another task opened (a parent's, inherited through a fork
+/// or through a `/proc/self` directory descriptor; one received over
+/// `SCM_RIGHTS`), another process's fdinfo, a sibling thread's, the
+/// process's fdinfo read by a thread with a table of its own, and a file
+/// bound to nothing are not: there the descriptor shown is another table's,
+/// or one Detcore cannot establish, which the reader's descriptor of the same
+/// number says nothing about. Such a fdinfo gets no lock-line account, and is
+/// read as before the lock ledger, through the reader's descriptor of the same
+/// number: where the kernel's bytes reach the sanitizer, its lock lines are
+/// refused by name (`sanitize_fdinfo_checked`); where that descriptor is a
+/// file Detcore renders or a placeholder, its rendering answers instead, lock
+/// lines included; where the reader has none, the read fails with EBADF
+/// (https://github.com/facebookexperimental/hermit/issues/544).
+fn fdinfo_names_callers_table(
+    table: Option<crate::procfs::FdinfoTable>,
+    reader: Option<(i32, i32)>,
+    holds_process_table: bool,
+) -> bool {
+    match (table, reader) {
+        (Some(table), Some((pid, tid))) => {
+            table.process == pid
+                && match table.thread {
+                    Some(thread) => thread == tid,
+                    None => holds_process_table,
+                }
+        }
+        _ => false,
+    }
+}
+
+/// Where the task an open's spelling names came from, as
+/// [`Detcore::procfs_selector_opener`] decides it ([`procfs_selector_source`]).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum SelectorSource {
+    /// The spelling names its task by number, or names none.
+    None,
+    /// A `self` or `thread-self` the call's own path spells, which Linux
+    /// resolves at this call, to the caller.
+    ThisCall,
+    /// A `self` or `thread-self` in the spelling of the directory descriptor
+    /// the relative path starts from, which Linux resolved at that
+    /// directory's open, to the task recorded on it
+    /// (`DetFd::procfs_selector_opener`).
+    Directory,
+    /// The spelling passes through a name the walk does not follow: a link
+    /// other than a selector (a task's `cwd`, `root` or `fd/N`, or an
+    /// ordinary symbolic link that happens to be called `self`), or any other
+    /// name outside the directories that reach a task's `fdinfo`. A `..` or a
+    /// selector's name after it says nothing of where Linux's lookup is, so
+    /// the spelling names no task Detcore can establish.
+    Unfollowed,
+}
+
+/// One directory, or the file below `fdinfo`, that [`procfs_selector_source`]'s
+/// walk can be at, with how a task directory's task was named.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ProcfsWalkStep {
+    Root,
+    Proc,
+    /// A process directory: `<pid>`, or the one `self` or `thread-self`
+    /// reaches.
+    Process(ProcfsTaskName),
+    /// A process's `task` directory.
+    Tasks,
+    /// A thread directory: `task/<tid>`, or the one `thread-self` reaches.
+    Thread,
+    Fdinfo,
+    /// A name below `fdinfo`.
+    Entry,
+    /// Another directory of a task's, which is a directory and no link
+    /// (`fd`, `map_files`, `ns`, `net`, `attr`): a `..` from it is the task
+    /// again, and every name below it is a link or a file the walk does not
+    /// follow.
+    TaskDirectory,
+}
+
+/// The directories of a task's own, besides `task` and `fdinfo`, that are
+/// directories and no links (`tgid_base_stuff` and `tid_base_stuff`'s `DIR`
+/// entries, fs/proc/base.c).
+const PROCFS_TASK_DIRECTORIES: [&str; 5] = ["fd", "map_files", "ns", "net", "attr"];
+
+/// How the walk named a process directory: by number, or by a selector,
+/// spelled by the call's own path (`own`) or by the directory it starts from.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ProcfsTaskName {
+    Number,
+    Selector { own: bool },
+}
+
+/// Whether `name` is a task number procfs looks up (`name_to_int`): decimal
+/// digits with no leading zero and no sign, at most `i32::MAX`. No task is 0.
+fn is_procfs_task_number(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        !name.is_empty()
+            && !name.starts_with('0')
+            && name.bytes().all(|byte| byte.is_ascii_digit())
+            && name.parse::<i32>().is_ok()
+    })
+}
+
+/// The steps one name below `step` takes the walk through, as Linux's lookup
+/// takes it, where the walk follows that name: `thread-self` is the link
+/// `<pid>/task/<tid>`, so a `..` after it is that process's `task`
+/// directory. `None` for a name the walk does not follow.
+fn procfs_walk_steps(
+    step: ProcfsWalkStep,
+    name: &std::ffi::OsStr,
+    own: bool,
+) -> Option<Vec<ProcfsWalkStep>> {
+    use ProcfsWalkStep::*;
+    let selector = ProcfsTaskName::Selector { own };
+    Some(match step {
+        Root if name == "proc" => vec![Proc],
+        Proc if name == "self" => vec![Process(selector)],
+        Proc if name == "thread-self" => vec![Process(selector), Tasks, Thread],
+        Proc if is_procfs_task_number(name) => vec![Process(ProcfsTaskName::Number)],
+        Process(_) if name == "task" => vec![Tasks],
+        Process(_) | Thread if name == "fdinfo" => vec![Fdinfo],
+        Process(_) | Thread if PROCFS_TASK_DIRECTORIES.iter().any(|known| name == *known) => {
+            vec![TaskDirectory]
+        }
+        Tasks if is_procfs_task_number(name) => vec![Thread],
+        Fdinfo => vec![Entry],
+        _ => return None,
+    })
+}
+
+/// [`SelectorSource`] for an open at `dirfd` of `path`, which reached
+/// `spelling`: the directory's recorded spelling (or the working
+/// directory's) joined with `path`, or `path` itself where it is absolute.
+///
+/// The spelling is walked one component at a time from `/`, as Linux's
+/// lookup walks it, and only through the names that reach a task's `fdinfo`:
+/// `/proc`, a task number or a selector directly below it, `task` and a
+/// thread's number, `fdinfo` and one name below it, and a task's other
+/// directories (`fd`, `map_files`, `ns`, `net`, `attr`), which only a `..`
+/// leaves, with `.` and `..` between them. A `..` climbs one of those directories, as it does on
+/// Linux, because none of them is reached through a link the walk does not
+/// model. Any other name stops the walk ([`SelectorSource::Unfollowed`]):
+/// past a `cwd`, a `root`, an `fd/N` or an ordinary symbolic link called
+/// `self`, a `..` climbs where the link led, which a lexical reading cannot
+/// know. So `../self/fdinfo/7` relative to a parent's `/proc/self` names
+/// the caller, and `cwd/self/../../fdinfo/7` relative to it names no task
+/// Detcore can establish, whatever `cwd/self` is.
+///
+/// The task a walk that ends below a process directory names is that
+/// directory's: by number ([`SelectorSource::None`]), or by a selector of the
+/// call's own path ([`SelectorSource::ThisCall`]) or of the directory
+/// descriptor's spelling ([`SelectorSource::Directory`]). A selector in the
+/// working directory's spelling resolves to the caller, as before: a
+/// residual for a working directory inherited through a fork. A spelling
+/// whose last components are not `path`'s (one a descriptor directory's
+/// link respelled) is not walked.
+fn procfs_selector_source(dirfd: i32, path: &Path, spelling: &Path) -> SelectorSource {
+    use std::path::Component;
+    let not_current = |component: &Component<'_>| !matches!(component, Component::CurDir);
+    let parts = spelling
+        .components()
+        .filter(not_current)
+        .collect::<Vec<_>>();
+    if parts.first() != Some(&Component::RootDir) {
+        return SelectorSource::None;
+    }
+    let own_parts = path.components().filter(not_current).collect::<Vec<_>>();
+    let Some(own_from) = parts.len().checked_sub(own_parts.len()) else {
+        return SelectorSource::Unfollowed;
+    };
+    if parts[own_from..] != own_parts[..] {
+        return SelectorSource::Unfollowed;
+    }
+    let mut walk = vec![ProcfsWalkStep::Root];
+    for (index, part) in parts.iter().enumerate().skip(1) {
+        match part {
+            Component::ParentDir => {
+                if walk.len() > 1 {
+                    walk.pop();
+                }
+            }
+            Component::Normal(name) => {
+                let step = *walk.last().expect("the walk keeps its root");
+                match procfs_walk_steps(step, name, index >= own_from) {
+                    Some(steps) => walk.extend(steps),
+                    None => return SelectorSource::Unfollowed,
+                }
+            }
+            Component::CurDir => {}
+            Component::RootDir | Component::Prefix(_) => return SelectorSource::Unfollowed,
+        }
+    }
+    let process = walk.iter().find_map(|step| match step {
+        ProcfsWalkStep::Process(name) => Some(*name),
+        _ => None,
+    });
+    match process {
+        None | Some(ProcfsTaskName::Number) => SelectorSource::None,
+        Some(ProcfsTaskName::Selector { own: true }) => SelectorSource::ThisCall,
+        Some(ProcfsTaskName::Selector { own: false }) if dirfd == libc::AT_FDCWD => {
+            SelectorSource::ThisCall
+        }
+        Some(ProcfsTaskName::Selector { own: false }) => SelectorSource::Directory,
+    }
 }
 
 /// [`Detcore::ledger_takes_fact`]'s rule: the backend's fact stands in for an
@@ -2736,6 +2974,245 @@ mod fdinfo_refusal_tests {
         // ptrace, DBT, SaBRe, LiteInst, in-guest, rendering or not.
         assert!(!ledger_takes_fact_where(true, true));
         assert!(!ledger_takes_fact_where(true, false));
+    }
+
+    /// Only a fdinfo bound at its open to the reader's own table has its
+    /// lock lines accounted for: one the reader's process opened through
+    /// `self` or its own number, or its own thread through `thread-self` or
+    /// below the process; the process's own fdinfo only for a reader that
+    /// holds the process's table. A fdinfo a parent opened through `self` and
+    /// a child reads after a fork (bound to the parent), another process's, a
+    /// sibling thread's, the process's read by a thread with a table of its
+    /// own (made without `CLONE_FILES`), one bound to nothing, and any read
+    /// from a nested PID namespace are not: their lines are refused.
+    #[test]
+    fn only_a_fdinfo_bound_to_the_readers_table_has_its_lock_lines_accounted_for() {
+        use crate::procfs::FdinfoTable;
+        let process = |process| FdinfoTable {
+            process,
+            thread: None,
+        };
+        let thread = |process, thread| FdinfoTable {
+            process,
+            thread: Some(thread),
+        };
+        // The reader is thread 5 of process 3, holding the process's table.
+        let own = |table| fdinfo_names_callers_table(Some(table), Some((3, 5)), true);
+        assert!(own(process(3)));
+        assert!(own(thread(3, 5)));
+        // The same thread with a table of its own: the process's fdinfo
+        // shows the leader's table, so only its own thread's is its.
+        assert!(!fdinfo_names_callers_table(
+            Some(process(3)),
+            Some((3, 5)),
+            false
+        ));
+        assert!(fdinfo_names_callers_table(
+            Some(thread(3, 5)),
+            Some((3, 5)),
+            false
+        ));
+        // A parent's `self` fdinfo read by its child 4 after a fork.
+        assert!(!fdinfo_names_callers_table(
+            Some(process(3)),
+            Some((4, 4)),
+            true
+        ));
+        // Another process, Hermit's init, a sibling thread.
+        assert!(!own(process(4)));
+        assert!(!own(process(1)));
+        assert!(!own(thread(3, 6)));
+        assert!(!own(thread(4, 5)));
+        assert!(!fdinfo_names_callers_table(None, Some((3, 5)), true));
+        assert!(!fdinfo_names_callers_table(Some(process(3)), None, true));
+    }
+
+    /// A `/proc` selector in an open's spelling is resolved at this call
+    /// where the guest's own path spells it: absolute, relative to the
+    /// working directory, or relative to a descriptor of `/proc` itself
+    /// (`self/fdinfo/7`). Where the selector came from the directory
+    /// descriptor's own spelling (`fdinfo/7` relative to a `/proc/self`
+    /// descriptor, `7` relative to `/proc/self/fdinfo`), it names the task
+    /// that directory was opened on. No selector, no source.
+    #[test]
+    fn a_procfs_selector_names_the_task_of_the_open_that_spelled_it() {
+        use SelectorSource::*;
+        let source = |dirfd, path: &str, spelling: &str| {
+            procfs_selector_source(dirfd, Path::new(path), Path::new(spelling))
+        };
+        let directory = 9;
+        assert_eq!(
+            source(libc::AT_FDCWD, "/proc/self/fdinfo/7", "/proc/self/fdinfo/7"),
+            ThisCall
+        );
+        assert_eq!(
+            source(
+                directory,
+                "/proc/thread-self/fdinfo/7",
+                "/proc/thread-self/fdinfo/7"
+            ),
+            ThisCall
+        );
+        assert_eq!(
+            source(directory, "self/fdinfo/7", "/proc/self/fdinfo/7"),
+            ThisCall
+        );
+        assert_eq!(
+            source(libc::AT_FDCWD, "fdinfo/7", "/proc/self/fdinfo/7"),
+            ThisCall
+        );
+        assert_eq!(
+            source(directory, "fdinfo/7", "/proc/self/fdinfo/7"),
+            Directory
+        );
+        assert_eq!(source(directory, "7", "/proc/self/fdinfo/7"), Directory);
+        // A `..` that climbs back to `/proc` and spells a selector of its own
+        // names the caller, whoever opened the directory.
+        assert_eq!(
+            source(directory, "../self/fdinfo/7", "/proc/self/../self/fdinfo/7"),
+            ThisCall
+        );
+        assert_eq!(
+            source(
+                directory,
+                "../../thread-self/fdinfo/7",
+                "/proc/self/fdinfo/../../thread-self/fdinfo/7"
+            ),
+            ThisCall
+        );
+        // One that stays below the directory's task keeps the directory's.
+        assert_eq!(
+            source(directory, "../fdinfo/7", "/proc/self/fdinfo/../fdinfo/7"),
+            Directory
+        );
+        assert_eq!(
+            source(directory, "fdinfo/7", "/proc/thread-self/fdinfo/7"),
+            Directory
+        );
+        assert_eq!(source(directory, "fdinfo/7", "/proc/42/fdinfo/7"), None);
+        assert_eq!(
+            source(directory, "task/43/fdinfo/7", "/proc/42/task/43/fdinfo/7"),
+            None
+        );
+        // A `.` is no step, wherever it is.
+        assert_eq!(
+            source(directory, "./self/fdinfo/7", "/proc/./self/fdinfo/7"),
+            ThisCall
+        );
+        assert_eq!(
+            source(directory, "./fdinfo/./7", "/proc/self/./fdinfo/./7"),
+            Directory
+        );
+        // A name the walk does not follow stops it: past a link other than a
+        // selector, a `..` climbs where the link led. An ordinary symbolic
+        // link called `self` below a task's `cwd` is no selector, and neither
+        // a selector's name nor a number after it names a task.
+        assert_eq!(
+            source(
+                directory,
+                "cwd/self/../../fdinfo/7",
+                "/proc/self/cwd/self/../../fdinfo/7"
+            ),
+            Unfollowed
+        );
+        assert_eq!(
+            source(
+                directory,
+                "cwd/q/../../fdinfo/7",
+                "/proc/self/cwd/q/../../fdinfo/7"
+            ),
+            Unfollowed
+        );
+        assert_eq!(
+            source(
+                libc::AT_FDCWD,
+                "/proc/self/root/proc/self/fdinfo/7",
+                "/proc/self/root/proc/self/fdinfo/7"
+            ),
+            Unfollowed
+        );
+        assert_eq!(
+            source(libc::AT_FDCWD, "/proc/self/fd/5/7", "/proc/self/fd/5/7"),
+            Unfollowed
+        );
+        // A task's other directories are directories, not links: a `..`
+        // from one is the task again.
+        assert_eq!(
+            source(
+                libc::AT_FDCWD,
+                "/proc/self/fd/../fdinfo/7",
+                "/proc/self/fd/../fdinfo/7"
+            ),
+            ThisCall
+        );
+        assert_eq!(
+            source(
+                libc::AT_FDCWD,
+                "/proc/self/task/12/ns/../fdinfo/7",
+                "/proc/self/task/12/ns/../fdinfo/7"
+            ),
+            ThisCall
+        );
+        assert_eq!(
+            source(directory, "fd/../fdinfo/7", "/proc/self/fd/../fdinfo/7"),
+            Directory
+        );
+        // Below a directory the walk did not follow to `/proc`.
+        assert_eq!(source(directory, "self", "/tmp/self"), Unfollowed);
+        assert_eq!(
+            source(
+                directory,
+                "../proc/self/fdinfo/7",
+                "/tmp/../proc/self/fdinfo/7"
+            ),
+            Unfollowed
+        );
+        // `thread-self` is the link `<pid>/task/<tid>`: a `..` after it is
+        // the process's `task` directory, below which `self` is no name.
+        assert_eq!(
+            source(
+                directory,
+                "../self/fdinfo/7",
+                "/proc/thread-self/../self/fdinfo/7"
+            ),
+            Unfollowed
+        );
+        assert_eq!(
+            source(
+                directory,
+                "../../fdinfo/7",
+                "/proc/thread-self/../../fdinfo/7"
+            ),
+            Directory
+        );
+        // Names outside the directories that reach a task's `fdinfo`, and
+        // numbers procfs does not look up.
+        assert_eq!(
+            source(libc::AT_FDCWD, "/proc/locks", "/proc/locks"),
+            Unfollowed
+        );
+        assert_eq!(
+            source(libc::AT_FDCWD, "/proc/042/fdinfo/7", "/proc/042/fdinfo/7"),
+            Unfollowed
+        );
+        // A name that merely starts like a selector is not one.
+        assert_eq!(
+            source(
+                libc::AT_FDCWD,
+                "/proc/selfish/fdinfo/7",
+                "/proc/selfish/fdinfo/7"
+            ),
+            Unfollowed
+        );
+        // A spelling whose last components are not the call's own path (a
+        // descriptor directory's link respelled) is not walked.
+        assert_eq!(
+            source(directory, "fdinfo/7", "/proc/self/fdinfo/8"),
+            Unfollowed
+        );
+        // A relative spelling (a directory descriptor with no record) names
+        // no task.
+        assert_eq!(source(directory, "fdinfo/7", "fdinfo/7"), None);
     }
 
     /// The locks of a `descriptor_status` fact are spelled as the fdinfo
@@ -5288,6 +5765,38 @@ impl<T: RecordOrReplay> Detcore<T> {
         Self::observed_path(guest, dirfd, path)
     }
 
+    /// The pid and tid, as `/proc` spells them, of the task a `self` or
+    /// `thread-self` selector in an open's spelling (`spelling`, the path the
+    /// call at `dirfd` of `path` reached) names: the caller's, where the
+    /// guest's own path spells the selector (absolute, or relative to a
+    /// descriptor of `/proc` itself, or to the working directory), as Linux
+    /// resolves it at the call; the one recorded on the directory
+    /// descriptor the relative path starts from (`DetFd::procfs_selector_opener`),
+    /// where the selector came from that directory's own spelling, as Linux
+    /// pins the directory to its task at the directory's open. `None` with no
+    /// selector, in a nested PID namespace, for a directory descriptor with
+    /// no record (one received without one), and for a spelling that passes
+    /// through a name [`procfs_selector_source`] does not follow. A working directory
+    /// entered by such a spelling and inherited through a fork is resolved
+    /// to the caller, not to the task it was entered for: a residual.
+    pub(crate) fn procfs_selector_opener<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        dirfd: i32,
+        path: &Path,
+        spelling: &Path,
+    ) -> Option<(i32, i32)> {
+        match procfs_selector_source(dirfd, path, spelling) {
+            SelectorSource::None | SelectorSource::Unfollowed => None,
+            SelectorSource::ThisCall => self.procfs_caller_ids(guest),
+            SelectorSource::Directory => guest
+                .thread_state()
+                .with_detfd(dirfd, |detfd| detfd.procfs_selector_opener())
+                .ok()
+                .flatten(),
+        }
+    }
+
     /// The procfs directory descriptor `dirfd` is open on, where Detcore has
     /// no record of the descriptor, as the guest names it: the kernel's name
     /// for it (its `/proc/thread-self/fd/N` link, `Self::descriptor_kernel_link`),
@@ -5683,9 +6192,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// it is a directory or a file with one link (see [`retires_on_removal`]).
     /// Each name is stat'ed with an injected `fstatat(AT_SYMLINK_NOFOLLOW)`
     /// before the call runs; a name that does not resolve removes nothing.
-    /// Pass the result to [`Self::retire_removed_inodes`] if the call
-    /// succeeds. Only with virtualized metadata, the only mode that numbers
-    /// inodes.
+    /// Pass the `retired` inodes to [`Self::retire_removed_inodes`] if the
+    /// call succeeds. For a rename the same lookups also tell whether it can
+    /// change any name (`rename_target`, which the entry-mtime model reads
+    /// instead of looking the old name up again after the call). Only with
+    /// virtualized metadata, the only mode that numbers inodes.
     ///
     /// Nothing is retired without sequentialized threads. Only then do the
     /// lookups, the call and the retirement run in one turn; otherwise another
@@ -5697,36 +6208,58 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         call: &Syscall,
-    ) -> Vec<RawInode> {
+    ) -> NameRemovals {
         if !guest.config().virtualize_metadata || !guest.config().sequentialize_threads {
-            return Vec::new();
+            return NameRemovals::default();
         }
         // The name removed, and for a rename the source, which replaces
         // nothing when it is the target's own file (`rename(a, a)`, or two
         // links of one file).
         let Some((removed, source)) = removed_names(call, true) else {
-            return Vec::new();
+            return NameRemovals::default();
         };
         // Every path the call reads, which the lookups must leave unchanged.
         let inputs = [removed.1, source.and_then(|source| source.1)];
         let Some(path) = removed.1 else {
-            return Vec::new();
+            return NameRemovals::default();
         };
-        let Ok(stat) = Self::inject_lstatat(guest, removed.0, path, inputs).await else {
-            return Vec::new();
+        let stat = match Self::inject_lstatat(guest, removed.0, path, inputs).await {
+            Ok(stat) => stat,
+            Err(errno) => {
+                return NameRemovals {
+                    retired: Vec::new(),
+                    rename_target: source
+                        .and_then(|_| entry_mtime::RenameTarget::from_lookups(Err(errno), None)),
+                };
+            }
         };
         let inode = RawInode::new(stat.st_dev, stat.st_ino);
-        if let Some((dirfd, Some(path))) = source
-            && Self::inject_lstatat(guest, dirfd, path, inputs)
-                .await
-                .is_ok_and(|source| RawInode::new(source.st_dev, source.st_ino) == inode)
-        {
-            return Vec::new();
+        let mut rename_target = None;
+        if let Some((dirfd, source_path)) = source {
+            let looked_up = match source_path {
+                Some(path) => Some(
+                    Self::inject_lstatat(guest, dirfd, path, inputs)
+                        .await
+                        .map(|source| RawInode::new(source.st_dev, source.st_ino)),
+                ),
+                None => None,
+            };
+            rename_target = entry_mtime::RenameTarget::from_lookups(Ok(inode), looked_up);
+            if rename_target == Some(entry_mtime::RenameTarget::SameFile) {
+                return NameRemovals {
+                    retired: Vec::new(),
+                    rename_target,
+                };
+            }
         }
-        if retires_on_removal(&stat) {
+        let retired = if retires_on_removal(&stat) {
             vec![inode]
         } else {
             Vec::new()
+        };
+        NameRemovals {
+            retired,
+            rename_target,
         }
     }
 
@@ -6841,6 +7374,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut property_copy: Option<PathBuf> = None;
         // A name in the property area the snapshot does not hold.
         let mut property_unknown: Option<String> = None;
+        // Whether the open creates its file, decided in its own turn, after
+        // its grant and just before it runs, so that its directory's mtime and
+        // the new file's follow it (`entry_mtime`). Not boxed here: the model
+        // and the flags decide most opens at once, and it boxes the lookup an
+        // `O_CREAT` open without `O_EXCL` needs.
+        let creates = self.open_creates(guest, call).await;
         let res: Result<i64, Error> = match fifo {
             Some((fifo, fifo_path)) => {
                 self.open_fifo_once_a_guest_holds_its_peer(guest, call, fifo, &fifo_path)
@@ -7156,7 +7695,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let sysfs_object = self.opened_sysfs_object(guest, fd, identity.as_ref());
                 if let Some(object) = sysfs_object
                     .as_deref()
-                    .filter(|object| self.is_absent_sysfs_object(object))
+                    .filter(|object| self.is_absent_sysfs_object(guest, object))
                 {
                     guest.thread_state().remove_fd(fd);
                     let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
@@ -7297,6 +7836,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                     )
                     .await;
                 }
+                // The file this open created, and for a named one its
+                // directory, take the virtual now as their mtime, once any
+                // retired mapping of its inode is gone (`entry_mtime`).
+                if let (Some(creates), Some(stat)) = (creates, &host_stat) {
+                    Box::pin(self.touch_created_by_open(
+                        guest,
+                        call,
+                        creates,
+                        RawInode::new(stat.st_dev, stat.st_ino),
+                    ))
+                    .await;
+                }
                 // A descriptor that writes process memory can rewrite the
                 // untraced code (see `record_untraced_code_change`). Reported
                 // once the open returns, before the guest has the descriptor;
@@ -7375,6 +7926,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // (`/proc/self/../self/io`) classifies as the file it reaches,
                 // which may be outside the level.
                 let mut recordreplay_task_directory = false;
+                // The descriptor's link as the recording read it, under record
+                // and replay (`recorded_open_path`), for the fdinfo binding's
+                // confirmation below.
+                let mut recorded_open_link = None;
                 if procfs.is_none() || self.cfg.recordreplay_modes {
                     let resolved = if self.cfg.recordreplay_modes {
                         self.recorded_open_path(guest, fd).await?
@@ -7407,6 +7962,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     } else {
                         None
                     };
+                    if self.cfg.recordreplay_modes {
+                        recorded_open_link = resolved.clone();
+                    }
                     // Under record and replay, a `/proc` name outside the
                     // run's level that a spelling the lookup check does not
                     // resolve reached, named by the link the recording read
@@ -7621,6 +8179,110 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .as_mut()
                         .expect("a classified procfs file disappeared")
                         .bind_schedstat_thread(thread);
+                }
+                // The task a `self` or `thread-self` selector in this open's
+                // spelling names (`procfs_selector_opener`), kept with the
+                // open file below, so that a name later opened relative to it
+                // is that task's.
+                // A path through the caller's own descriptor links to a
+                // directory Detcore serves (`/proc/self/fd/N/...`) is walked
+                // as the decisions above respelled it
+                // (`descriptor_directory::decided_path`): through each link as
+                // Linux resolves it, below the directory's canonical spelling,
+                // which names its task by number. Every component of that
+                // absolute path is this call's, so it is walked as one.
+                let (walked_path, walked_spelling) = match &guest_spelled {
+                    Some(_) => (observed_path.as_path(), observed_path.as_path()),
+                    None => (path.as_path(), observed_path.as_path()),
+                };
+                let selector_opener =
+                    self.procfs_selector_opener(guest, call.dirfd(), walked_path, walked_spelling);
+                // Whether the walk followed the spelling to the task it names
+                // (`SelectorSource::Unfollowed`).
+                let spelling_followed =
+                    procfs_selector_source(call.dirfd(), walked_path, walked_spelling)
+                        != SelectorSource::Unfollowed;
+                // A descriptor's fdinfo shows the table of the task its path
+                // named at the open, `self` and `thread-self` resolved then
+                // (`seq_fdinfo_open` keeps that task's inode), not the table
+                // of whoever reads it later, after a fork or a descriptor's
+                // transfer. Bound only by a spelling, outside a nested PID
+                // namespace (`Detcore::procfs_caller_ids`), as above. Only a
+                // fdinfo bound to the reader's own table has its lock lines
+                // served, and only with sequentialized threads
+                // (`fdinfo_locks` at the read); any other is read as before
+                // the lock ledger (`fdinfo_names_callers_table` says how).
+                if procfs
+                    .as_ref()
+                    .is_some_and(|file| file.fdinfo_owner().is_some())
+                {
+                    // A selector names the task `procfs_selector_opener`
+                    // resolved it to: the opener, where the guest's own path
+                    // spells it (absolute, or relative to a descriptor of
+                    // `/proc` itself), or the task the directory descriptor
+                    // the path is relative to was opened on (a parent's
+                    // `/proc/self`, inherited through a fork), as Linux pins
+                    // that directory at its open. A number names its own task.
+                    // A spelling the walk did not follow binds no table, by
+                    // number or selector alike: its lexical reading may name a
+                    // task the kernel's lookup never reached.
+                    let names_selector = procfs.as_ref().is_some_and(|file| {
+                        matches!(
+                            file.fdinfo_owner(),
+                            Some(
+                                crate::procfs::FdinfoOwner::SelfProcess
+                                    | crate::procfs::FdinfoOwner::ThreadSelf
+                                    | crate::procfs::FdinfoOwner::Thread { process: None, .. }
+                            )
+                        )
+                    });
+                    let opener = if names_selector {
+                        selector_opener
+                    } else {
+                        self.procfs_caller_ids(guest)
+                    }
+                    .filter(|_| classified_by_spelling && spelling_followed);
+                    // Opened as the kernel opened it: where the kernel
+                    // refused the open (`proc_fdinfo_access_allowed`), its
+                    // EACCES has already reached the guest.
+                    procfs
+                        .as_mut()
+                        .expect("a classified procfs file disappeared")
+                        .bind_fdinfo_table(opener);
+                    // ⚠️ THE SPELLING WAS READ BEFORE THIS CALL'S SCHEDULER
+                    // TURN (`resource_request` above), which is a scheduling
+                    // point even with sequentialized threads (a chaos pick, or
+                    // an expired `--target-timeslice`). Another thread can
+                    // run there and change where the lookup starts (`dup2` of
+                    // another task's `/proc/<pid>` over the directory
+                    // descriptor, or a `chdir`): the spelling then names this
+                    // reader's table while the kernel opened another task's
+                    // fdinfo. So the binding stands only if the descriptor the
+                    // kernel returned names the same task and descriptor by
+                    // its own link (`ProcfsFile::confirm_fdinfo_table`; one
+                    // more injected `readlinkat`, which is no scheduling
+                    // point, so nothing runs between the kernel's open and
+                    // this check). A read trusts the binding only with
+                    // sequentialized threads (`fdinfo_locks` at the read).
+                    // Under record and replay the link is the one the
+                    // recording read for this open, above: replay's slot may
+                    // hold a stand-in eventfd, whose live link names no
+                    // fdinfo, so a live read would unbind there what the
+                    // recording served.
+                    if procfs
+                        .as_ref()
+                        .is_some_and(|file| file.fdinfo_table().is_some())
+                    {
+                        let opened = if self.cfg.recordreplay_modes {
+                            recorded_open_link.clone()
+                        } else {
+                            Self::descriptor_kernel_link(guest, fd).await
+                        };
+                        procfs
+                            .as_mut()
+                            .expect("a classified procfs file disappeared")
+                            .confirm_fdinfo_table(opened.as_deref());
+                    }
                 }
                 // The path the descriptor's link names, for a per-process
                 // file the backend keeps itself and does not name (the KVM
@@ -7900,6 +8562,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                     if let Some((reached, incarnation)) = reached.clone() {
                         detfd.set_procfs_reached(reached, incarnation);
+                    }
+                    if let Some(ids) = selector_opener {
+                        detfd.set_procfs_selector_opener(ids);
                     }
                     if link_itself {
                         detfd.set_procfs_link_itself();
@@ -9820,6 +10485,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         let target_fd = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_target_fd())?;
+        // Whose descriptor this fdinfo names. Its open bound it to a
+        // descriptor table (`procfs_fdinfo_table`): the reader's own
+        // (`fdinfo_names_callers_table`), another task's, or none (a nested
+        // PID namespace, a file classified by its kernel link, a directory
+        // descriptor with no record, or a spelling the walk did not follow).
+        // As for a descriptor link (`DescriptorLinkOpener`),
+        // the leader holds the table procfs shows for the process, and so
+        // does every thread that shares it (`process_files`).
+        let fdinfo_table = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_fdinfo_table())?;
+        let holds_process_table = {
+            let detpid = self.own_detpid(guest);
+            let state = guest.thread_state();
+            state.dettid == detpid || state.holds_process_files()
+        };
+        let names_callers_table = fdinfo_names_callers_table(
+            fdinfo_table,
+            self.procfs_caller_ids(guest),
+            holds_process_table,
+        );
         // The kernel's fdinfo for a procfs file Detcore renders describes the
         // memfd standing in for it. Linux's names the file: Detcore's cursor,
         // the guest's procfs mount and the file's inode. The cursor is the one
@@ -9856,6 +10542,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             _ => None,
         };
         let placeholder_inode = placeholder.as_ref().map(|(_, inode)| *inode);
+        // Whether these are the kernel's fdinfo bytes, whose `lock:` lines
+        // name host values (`fdinfo_locks` below).
+        let kernel_fdinfo = rendered_target.is_none() && placeholder.is_none();
         let contents = match (rendered_target, placeholder) {
             (Some((_, offset)), _) => rendered_procfs::rendered_target_fdinfo(
                 offset as u64,
@@ -9966,6 +10655,56 @@ impl<T: RecordOrReplay> Detcore<T> {
             ))
         } else {
             None
+        };
+        // What the `lock:` lines of a descriptor's fdinfo the kernel printed
+        // show the guest (`procfs::FdinfoLockLines`), decided here, where
+        // Detcore's global state and device pool can be asked. Not for a
+        // fdinfo Detcore renders, whose lines it makes itself
+        // (`Self::render_own_fdinfo`). Boxed, so that this call's future
+        // holds its answer alone. Only for a fdinfo of one of the reader's
+        // own descriptors, as its open bound it (`fdinfo_names_callers_table`
+        // above). Any other fdinfo gets no account and is read as before the
+        // lock ledger (`fdinfo_names_callers_table` says how).
+        //
+        // ⚠️ ONLY WITH SEQUENTIALIZED THREADS. The binding was read from the
+        // open's spelling, before the kernel's open, and confirmed from the
+        // opened descriptor's own link after it. Without sequentialized
+        // threads another thread can, between any two of these steps, `dup2`
+        // another task's `/proc/<pid>` over the directory descriptor the
+        // lookup starts from, another fdinfo over the descriptor the kernel
+        // returned before the binding is installed on it, or another fdinfo
+        // over this read's descriptor: the binding would then admit another
+        // task's lock lines under the reader's identity, which base refused.
+        // The link check narrows that window but does not close it, so there
+        // the account is withheld: the read is as before the lock ledger, the
+        // kernel's lock lines refused by name where they reach the sanitizer.
+        // With sequentialized threads only one guest thread runs at a time:
+        // the open's check runs under its turn, right after the kernel's open,
+        // and a `dup2` between the open and this read moves the other
+        // description's record, binding included, onto this descriptor
+        // (`dup_fd_after_replacement`).
+        let fdinfo_locks = match target_fd
+            .filter(|_| names_callers_table && guest.config().sequentialize_threads)
+        {
+            Some(target_fd)
+                if kernel_fdinfo
+                    && !guest
+                        .thread_state()
+                        .with_detfd(call.fd(), |detfd| detfd.procfs_is_rendered_fdinfo())? =>
+            {
+                let (open_file, lock_tracked) =
+                    guest.thread_state().with_detfd(target_fd, |detfd| {
+                        (detfd.open_file_id(), detfd.is_lock_tracked())
+                    })?;
+                Box::pin(Self::kernel_fdinfo_locks(
+                    guest,
+                    open_file,
+                    lock_tracked,
+                    &contents,
+                ))
+                .await
+            }
+            _ => None,
         };
         // The guest's CPUID instruction is answered from Detcore's table
         // exactly when CPUID is virtualized and the backend delivers the
@@ -10327,6 +11066,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     task_stat,
                     task_status: task_status.clone(),
                     fdinfo_rendering: fdinfo_rendering.clone(),
+                    fdinfo_locks: fdinfo_locks.clone(),
                 },
             );
         })?;
@@ -13694,6 +14434,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
         {
             stat.size = 4096;
+            stat.blksize = 4096;
             if stat.mask.contains(StatxMask::STATX_BLOCKS) {
                 stat.blocks = 8;
             }
@@ -13741,6 +14482,60 @@ impl<T: RecordOrReplay> Detcore<T> {
             && !procfs.is_procfs()
         {
             stat.nlink = 1;
+        }
+
+        // A file's block count is its host allocator's state, not the
+        // guest's: on ext4 a file in more than four extents carries one
+        // extra 4096-byte extent-tree block, and delayed allocation makes
+        // a just-written file's count depend on writeback timing, so the
+        // host's `st_blocks` can differ between the two executions of one
+        // `--verify` run
+        // (https://github.com/facebookexperimental/hermit/issues/462).
+        // Report only what the pinned inputs and the guest's actions
+        // determine -- the size, at a fixed 4096-byte unit, never the
+        // host's `st_blksize`, which varies with the host file system. A
+        // sparse file therefore reports as dense and a fallocate
+        // reservation beyond EOF is invisible in the count; the bytes a
+        // guest reads are unchanged. `st_blksize`, a preferred-I/O hint
+        // in Linux, is pinned to the same unit so the fields agree
+        // (`blocks == ceil(size / blksize) * blksize / 512`). Directories
+        // take both values from the size pin above, which this formula
+        // also gives (4096 bytes, 8 units); a proved procfs entry keeps
+        // the kernel's values, as there. Pseudo-filesystem files that
+        // are not proved procfs (sysfs attributes, whose size Linux
+        // reports as 4096 with 0 blocks) therefore report 8 units here;
+        // on KVM `/proc/self/maps` by path likewise goes from 1 to 8.
+        // Unlike the directory size pin, this block skips the
+        // unprovable-procfs exclusion: it never touches the size, so no
+        // SEEK_END-style consumer can be misled, and a deterministic
+        // count is preferable to a host one even for a file that might
+        // be procfs (on DBT, procfs files report blksize 4096).
+        if !procfs.is_procfs() {
+            let file_type = stat.mode & libc::S_IFMT;
+            if stat.mask.contains(StatxMask::STATX_BLOCKS) {
+                if file_type == libc::S_IFREG {
+                    let size = stat.size.max(0);
+                    stat.blocks = (size / 4096 + i64::from(size % 4096 != 0)) * 8;
+                } else if file_type == libc::S_IFLNK {
+                    // ext4's rule, whatever the host file system: a target
+                    // under 60 bytes lives in the inode itself and takes
+                    // no block; a longer one (at most 4095 bytes) takes
+                    // one 4096-byte block.
+                    stat.blocks = if stat.size < 60 { 0 } else { 8 };
+                } else if matches!(
+                    file_type,
+                    libc::S_IFIFO | libc::S_IFSOCK | libc::S_IFCHR | libc::S_IFBLK
+                ) {
+                    // Fifos, sockets and devices allocate no file data;
+                    // Linux reports 0. Pin it rather than keep a host
+                    // value (ext4 counts an external xattr block in
+                    // `i_blocks` for every file type).
+                    stat.blocks = 0;
+                }
+            }
+            if matches!(file_type, libc::S_IFREG | libc::S_IFLNK) {
+                stat.blksize = 4096;
+            }
         }
 
         let epoch_tp = Timespec {
@@ -14238,7 +15033,41 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.publish_pipe_status(guest, fd).await;
                 Ok(result)
             }
-            F_DUPFD(_) | F_DUPFD_CLOEXEC(_) => {
+            F_DUPFD(arg) | F_DUPFD_CLOEXEC(arg) => {
+                // An argument at or above RLIMIT_NOFILE is EINVAL
+                // (`f_dupfd`, fs/file.c, reached from `do_fcntl`), after
+                // the descriptor itself: `check_fcntl_cmd` (fs/fcntl.c)
+                // admits both commands on an O_PATH descriptor, so one
+                // the guest holds gets the argument's EINVAL, and one it
+                // does not hold is EBADF first, as `fdget` precedes the
+                // argument check. The guest's virtual limit decides, not
+                // the host's (`nofile_limit`). A descriptor the model
+                // lists decides the EINVAL from the model; one it does
+                // not list is settled by an F_GETFD recorded in the
+                // dup's place, on every backend: on a shared-table
+                // backend the model names only descriptors it has
+                // discovered, so an inherited or just-received one can
+                // be missing from it while the guest holds it, and
+                // missing alone never proves unheld (replay re-derives
+                // the same substitution, keying by sequential event).
+                // The backend runtime's own descriptors are not the
+                // guest's and read as absent without that probe.
+                if crate::syscalls::helpers::fd_at_or_above_nofile(
+                    arg,
+                    crate::syscalls::helpers::nofile_limit(guest),
+                ) {
+                    let (numbers, _, _) = guest.thread_state().descriptor_table();
+                    if numbers.contains(&fd) {
+                        return Err(Errno::EINVAL.into());
+                    }
+                    if guest.is_runtime_owned_fd(fd) {
+                        return Err(Errno::EBADF.into());
+                    }
+                    return match self.record_or_replay(guest, call.with_cmd(F_GETFD)).await {
+                        Ok(_) => Err(Errno::EINVAL.into()),
+                        Err(errno) => Err(errno.into()),
+                    };
+                }
                 let newfd = self.record_or_replay(guest, call).await? as RawFd;
                 let lock_tracked = self.lock_tracked_descriptions(guest, newfd..=newfd);
                 let replaced = guest.thread_state_mut().dup_fd(fd, newfd, o_cloexec)?;
@@ -14358,6 +15187,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 Ok(result)
             }
+            // Elsewhere the kernel holds the lease and prints it in the
+            // description's fdinfo. The ledger keeps the lease this call took
+            // or released, from its kind and its result alone (recorded, so a
+            // replay keeps the same), and vouches for a fdinfo's lease lines
+            // against it (`procfs::locks::LockLedger::note_lease`). No fdinfo
+            // is read, so the recording is unchanged. A failed call changes
+            // nothing.
+            F_SETLEASE(kind) => {
+                let result = self.record_or_replay(guest, call).await?;
+                let lease = match kind {
+                    libc::F_RDLCK => Some("READ"),
+                    libc::F_WRLCK => Some("WRITE"),
+                    _ => None,
+                };
+                self.note_description_lease(guest, fd, lease).await;
+                Ok(result)
+            }
             _ => {
                 trace!(
                     "[detcore-finishme]: fcntl unhandled cases: {:?}",
@@ -14366,6 +15212,34 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(self.record_or_replay(guest, call).await?)
             }
         }
+    }
+
+    /// The guest's own `F_SETLEASE` through `fd` succeeded, leaving its open
+    /// file description holding a lease of `lease`'s access, or none: the
+    /// ledger keeps it for this description
+    /// (`procfs::locks::LockLedger::note_lease`), which it follows from now
+    /// on (`DetFd::set_lock_tracked`). A descriptor Detcore keeps no model of
+    /// is left out; a fdinfo of it is then not vouched for.
+    async fn note_description_lease<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        lease: Option<&str>,
+    ) {
+        let Ok(open_file) = guest.thread_state().with_detfd(fd, |detfd| {
+            detfd.set_lock_tracked();
+            detfd.open_file_id()
+        }) else {
+            return;
+        };
+        let slots = guest.thread_state().slots_naming(open_file);
+        crate::tool_global::note_description_lease(
+            guest,
+            open_file,
+            lease.map(str::to_owned),
+            slots,
+        )
+        .await;
     }
 
     /// Record which OFD and flock locks the open file description `fd` names
@@ -14910,6 +15784,66 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.refuse_lock_bookkeeping(guest, reason).await
             }
         }
+    }
+
+    /// What the `lock:` lines of a fdinfo the kernel printed (`contents`) of
+    /// a descriptor of `open_file` show the guest (`procfs::FdinfoLockLines`):
+    /// each line's owner, from Detcore's lock ledger, flock model and process
+    /// table (`procfs::locks::LockLedger::fdinfo_owners`), and the file's
+    /// device as a lock line Detcore renders shows it
+    /// ([`Self::lock_line_device`]). `None` where the file has no lock line,
+    /// or one Detcore cannot parse, which the sanitizer refuses by name.
+    async fn kernel_fdinfo_locks<G: Guest<Self>>(
+        guest: &mut G,
+        open_file: OpenFileId,
+        lock_tracked: bool,
+        contents: &[u8],
+    ) -> Option<crate::procfs::FdinfoLockLines> {
+        let rows = crate::procfs::locks::fdinfo_lock_rows(contents)?;
+        if rows.is_empty() {
+            // No lock line: shown as it is, unless the guest's own lease on
+            // the description, or an OFD or flock lock the ledger last read
+            // it holding, is gone from it, a removal Detcore did not see, or
+            // the ledger's record of it may be stale for the file the
+            // fdinfo's `ino:` line names, or is unknown
+            // (`procfs::locks::LockLedger::fdinfo_owners`), which the
+            // sanitizer then refuses by name. Only a description whose locks
+            // the ledger follows can hold a lock or lease the guest took.
+            if !lock_tracked {
+                return None;
+            }
+            let owners = crate::tool_global::fdinfo_lock_owners(
+                guest,
+                open_file,
+                Vec::new(),
+                fdinfo_inode(contents),
+            )
+            .await;
+            return owners.is_err().then_some(crate::procfs::FdinfoLockLines {
+                rows,
+                owners,
+                device: (0, 0),
+            });
+        }
+        // Every line names the description's own file (`__show_fd_locks`
+        // lists only locks taken through it), so the first names its
+        // device; the sanitizer refuses a line that names another.
+        let mut object = rows.first()?.lock.object.split(':');
+        let major = u32::from_str_radix(object.next()?, 16).ok()?;
+        let minor = u32::from_str_radix(object.next()?, 16).ok()?;
+        let device = Self::lock_line_device(guest, libc::makedev(major, minor)).await;
+        let owners = crate::tool_global::fdinfo_lock_owners(
+            guest,
+            open_file,
+            rows.clone(),
+            fdinfo_inode(contents),
+        )
+        .await;
+        Some(crate::procfs::FdinfoLockLines {
+            rows,
+            owners,
+            device: (libc::major(device), libc::minor(device)),
+        })
     }
 
     /// Stop the run, by name, with the policy-refusal exit, because Detcore
@@ -16806,6 +17740,19 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let old_fd = call.oldfd();
         let new_fd = call.newfd();
+        // Linux refuses a new descriptor at or above RLIMIT_NOFILE
+        // before the table grows or anything closes (`ksys_dup3`,
+        // fs/file.c); the guest's virtual limit decides, not the host's
+        // (`nofile_limit`). The same descriptor twice takes the lookup-
+        // only path and is never refused this way.
+        if old_fd != new_fd
+            && crate::syscalls::helpers::fd_at_or_above_nofile(
+                new_fd,
+                crate::syscalls::helpers::nofile_limit(guest),
+            )
+        {
+            return Err(Errno::EBADF.into());
+        }
         if let Some(refusal) = self
             .refuse_dup_over_waited_listener(guest, Sysno::dup2, old_fd, new_fd)
             .await
@@ -16926,6 +17873,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         let old_fd = call.oldfd();
         let new_fd = call.newfd();
         let flags = call.flags();
+        // As in `handle_dup2`, at or above the guest's virtual
+        // RLIMIT_NOFILE, in `ksys_dup3`'s order (fs/file.c): flags other
+        // than O_CLOEXEC are EINVAL first (the raw argument, whose
+        // refused bits the typed flags truncate away), then old and new
+        // the same descriptor, then the limit's EBADF. Below the limit
+        // the call is forwarded exactly as written.
+        if crate::syscalls::helpers::fd_at_or_above_nofile(
+            new_fd,
+            crate::syscalls::helpers::nofile_limit(guest),
+        ) {
+            let raw_flags = call.into_parts().1.arg2 as libc::c_int;
+            if raw_flags & !libc::O_CLOEXEC != 0 || old_fd == new_fd {
+                return Err(Errno::EINVAL.into());
+            }
+            return Err(Errno::EBADF.into());
+        }
         if let Some(refusal) = self
             .refuse_dup_over_waited_listener(guest, Sysno::dup3, old_fd, new_fd)
             .await
@@ -16963,6 +17926,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.report_lock_references(guest, lock_tracked).await;
         self.note_channel_end_closed(guest, closed_end).await;
         Ok(res)
+    }
+
+    /// Pin the new pipe `fds` to the deterministic capacity by injecting
+    /// `fcntl(F_SETPIPE_SZ)` on its read end, and return the result.
+    ///
+    /// A signal that stops the backend's step of the injected call before its
+    /// `syscall` instruction means that the call did not run: reverie-ptrace
+    /// then reports `ERESTARTSYS` and holds the signal for the guest's resume.
+    /// The pin, which is idempotent on the new, empty pipe, is then injected
+    /// again, but only `PIPE_PIN_ATTEMPTS` times in all; after that the last
+    /// `ERESTARTSYS` is the result. Linux returns neither `ERESTARTSYS` nor
+    /// `EINTR` from `F_SETPIPE_SZ` (`pipe_fcntl` and `pipe_set_size` in
+    /// fs/pipe.c), so every other error, `EINTR` included, is the result at
+    /// once.
+    async fn pin_pipe_capacity<G: Guest<Self>>(
+        guest: &mut G,
+        fds: [RawFd; 2],
+    ) -> Result<i64, Errno> {
+        let pin = syscalls::Fcntl::new()
+            .with_fd(fds[0])
+            .with_cmd(F_SETPIPE_SZ(deterministic_pipe_capacity_bytes()));
+        let mut result = Err(Errno::ERESTARTSYS);
+        for attempt in 1..=PIPE_PIN_ATTEMPTS {
+            result = guest.inject(pin).await;
+            if result != Err(Errno::ERESTARTSYS) {
+                break;
+            }
+            warn!(
+                "[detcore] the capacity pin of new pipe (fds {fds:?}) did not run \
+                 (attempt {attempt} of {PIPE_PIN_ATTEMPTS}): {}",
+                Errno::ERESTARTSYS,
+            );
+        }
+        result
     }
 
     /// pipe2 system call.
@@ -17009,13 +18006,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // run, even one that happens to succeed (a pipe created under the quota
                 // already has two pages).
                 let capacity_result = if host_pipe_floor() {
-                    guest
-                        .inject(
-                            syscalls::Fcntl::new()
-                                .with_fd(fds[0])
-                                .with_cmd(F_SETPIPE_SZ(deterministic_pipe_capacity_bytes())),
-                        )
-                        .await
+                    Self::pin_pipe_capacity(guest, fds).await
                 } else {
                     error!(
                         "{}",
@@ -17043,7 +18034,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // Defensive, not expected: pinning on a freshly created EMPTY pipe is a
                     // shrink or a no-op. EBUSY needs buffered data and EPERM needs to exceed
                     // `pipe-max-size`; neither can hold here (below a two-page
-                    // `pipe-max-size` the pin is refused before it is tried).
+                    // `pipe-max-size` the pin is refused before it is tried). A pin that
+                    // did not run in `PIPE_PIN_ATTEMPTS` attempts does reach here, with
+                    // `ERESTARTSYS`, as does an `EINTR`, which Linux never returns from
+                    // this call (`Self::pin_pipe_capacity`).
                     for close in failure.close_syscalls() {
                         let _ = guest.inject(close).await;
                     }
@@ -18623,8 +19617,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         if scope == PidfdSignalScope::ProcessGroup {
             tracing::error!(
                 "[detcore, dtid {}] signal {} by pidfd_send_signal with PIDFD_SIGNAL_PROCESS_GROUP \
-                 is not supported: Detcore does not model process-group membership, and the \
-                 guest's process group is inherited from Hermit's \
+                 is not supported: Detcore models process-group membership but does not yet \
+                 deliver a process-group send to each member \
+                 (https://github.com/facebookexperimental/hermit/issues/429), and the guest's \
+                 process group is inherited from Hermit's \
                  (https://github.com/rrnewton/hermit/issues/4108)",
                 guest.thread_state().dettid,
                 signal,
@@ -20166,7 +21162,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         if let Some(directory) = directory {
             let level = self.cfg.proc_level;
-            let cpus = self.cfg.virtual_cpu_count();
+            let cpus = self.sysfs_cpus(guest);
             // A user bind over a sysfs path keeps its own names. Ask the
             // opened descriptor, not its path in the tool's mount namespace.
             let has_absent_cpu = entries
@@ -23495,6 +24491,14 @@ mod inject_fstat_scratch {
         /// descriptor received outside the model do where it is gone; any
         /// other answer is not scripted.
         fcntl_ebadf: bool,
+        /// Scripted errors of injected `fcntl(F_SETPIPE_SZ)` calls, in order,
+        /// before any real one; `ERESTARTSYS` is how reverie-ptrace reports
+        /// an injected call that a signal stopped before its `syscall`
+        /// instruction (the signal held for the guest's resume).
+        pipe_pin_errors: std::collections::VecDeque<Errno>,
+        /// The descriptor of every injected `fcntl(F_SETPIPE_SZ)`, a
+        /// scripted failure included.
+        pipe_pin_attempts: Vec<RawFd>,
         /// Whether an injected syscall that nothing here scripts runs in this
         /// process, on the test's own descriptors, as the probes of a
         /// received descriptor (`fcntl`, `fstatfs`, ...) do; otherwise it is
@@ -23578,6 +24582,8 @@ mod inject_fstat_scratch {
                 binder_read_consumed: None,
                 ppoll_ready: None,
                 fcntl_ebadf: false,
+                pipe_pin_errors: Default::default(),
+                pipe_pin_attempts: Vec::new(),
                 unscripted_real: false,
                 counts_memory_reads: false,
                 binder_read_fault: None,
@@ -23834,6 +24840,14 @@ mod inject_fstat_scratch {
                         args.arg5,
                     )
                 });
+            }
+            if let Syscall::Fcntl(call) = Syscall::from_raw(number, args)
+                && matches!(call.cmd(), F_SETPIPE_SZ(_))
+            {
+                self.pipe_pin_attempts.push(call.fd());
+                if let Some(errno) = self.pipe_pin_errors.pop_front() {
+                    return Err(errno);
+                }
             }
             // SAFETY: each arm runs the syscall Detcore asked for against this
             // process, on addresses Detcore obtained from this guest.
@@ -27083,6 +28097,104 @@ mod inject_fstat_scratch {
         // A null buffer is left alone.
         tool.canonicalize_statfs_buf(&mut guest, None).unwrap();
     }
+
+    /// A harness guest that sequentializes threads, so that `handle_pipe2`
+    /// pins the new pipe, with `errors` scripted for the pin; and its tool.
+    fn pipe_pin_guest(errors: &[Errno]) -> (Detcore, ScriptedGuest) {
+        assert!(
+            host_pipe_floor(),
+            "this host's pipe-max-size is below two pages, so no pipe is pinned"
+        );
+        let (_, mut guest) = ScriptedGuest::new(true, false);
+        guest.config.sequentialize_threads = true;
+        guest.unscripted_real = true;
+        guest.pipe_pin_errors = errors.iter().copied().collect();
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+        (tool, guest)
+    }
+
+    /// Runs `handle_pipe2` with `errors` scripted for the pin, and requires
+    /// that it refuses the run, having injected the pin until each scripted
+    /// error was reported. Under this harness the refusal is the
+    /// `UnrecoverableShutdown` RPC that `unrecoverable_shutdown` sends before
+    /// it exits in a build with debug assertions, which unit tests keep on in
+    /// every mode. Returns the descriptors `pipe2` created, and the guest.
+    async fn refused_pipe_pin(errors: &[Errno]) -> ([RawFd; 2], ScriptedGuest) {
+        use futures::FutureExt;
+        let (tool, mut guest) = pipe_pin_guest(errors);
+        let mut fds = [-1i32; 2];
+        let call = syscalls::Pipe2::new()
+            .with_pipefd(AddrMut::from_raw(fds.as_mut_ptr() as usize))
+            .with_flags(OFlag::O_CLOEXEC);
+        let outcome = std::panic::AssertUnwindSafe(tool.handle_pipe2(&mut guest, call))
+            .catch_unwind()
+            .await;
+        let panic = outcome.expect_err("the handler did not refuse the run");
+        let message = panic.downcast_ref::<String>().map_or("", String::as_str);
+        assert!(
+            message.contains("UnrecoverableShutdown"),
+            "the handler did not refuse the run: {message}"
+        );
+        assert!(
+            guest.pipe_pin_errors.is_empty(),
+            "the pin was not injected until each scripted error was reported"
+        );
+        (fds, guest)
+    }
+
+    /// A signal that stops the injected pin of a new pipe before its
+    /// `syscall` instruction runs makes reverie-ptrace report `ERESTARTSYS`
+    /// and hold the signal for the guest's resume ("Interrupted by a signal
+    /// before the `syscall` executed" in reverie-ptrace's `task.rs`). The pin
+    /// did not run, so it is retried, once: the pipe gets the deterministic
+    /// capacity and both ends are registered. Before, Detcore refused the
+    /// whole run ("cannot pin scheduler-managed pipe to 8192 bytes ...: -512
+    /// ERESTARTSYS"), which a Debian package build under Hermit hit 30 s in.
+    #[tokio::test]
+    async fn a_pipe_pin_a_signal_stopped_before_it_ran_is_retried() {
+        let (tool, mut guest) = pipe_pin_guest(&[Errno::ERESTARTSYS]);
+        let mut fds = [-1i32; 2];
+        let call = syscalls::Pipe2::new()
+            .with_pipefd(AddrMut::from_raw(fds.as_mut_ptr() as usize))
+            .with_flags(OFlag::O_CLOEXEC);
+        assert_eq!(tool.handle_pipe2(&mut guest, call).await.unwrap(), 0);
+        assert_eq!(
+            guest.pipe_pin_attempts, [fds[0]; 2],
+            "the interrupted pin was not retried exactly once"
+        );
+        // SAFETY: F_GETPIPE_SZ only reads the test's own pipe.
+        let capacity = unsafe { libc::fcntl(fds[0], libc::F_GETPIPE_SZ) };
+        assert_eq!(capacity, deterministic_pipe_capacity_bytes());
+        for fd in fds {
+            assert!(
+                guest.thread.with_detfd(fd, |_| ()).is_ok(),
+                "pipe end {fd} is not registered"
+            );
+            // SAFETY: the test's own descriptor, closed once.
+            assert_eq!(unsafe { libc::close(fd) }, 0);
+        }
+    }
+
+    /// A pin that a signal stops on every attempt is refused after two
+    /// attempts (`PIPE_PIN_ATTEMPTS`), and both descriptors `pipe2` created
+    /// are closed. A third attempt, which would run and succeed here, would
+    /// come after a held signal may have been lost.
+    #[tokio::test]
+    async fn a_pipe_pin_that_never_runs_is_refused_after_two_attempts() {
+        let (fds, guest) = refused_pipe_pin(&[Errno::ERESTARTSYS; 2]).await;
+        assert_eq!(guest.pipe_pin_attempts, [fds[0]; 2]);
+        assert_eq!(guest.close_attempts, fds);
+    }
+
+    /// Linux never returns `EINTR` from `F_SETPIPE_SZ`, so a pin that reports
+    /// it (a filter or a backend did) is refused without a retry, and both
+    /// descriptors `pipe2` created are closed.
+    #[tokio::test]
+    async fn a_pipe_pin_that_reports_eintr_is_refused_without_a_retry() {
+        let (fds, guest) = refused_pipe_pin(&[Errno::EINTR]).await;
+        assert_eq!(guest.pipe_pin_attempts, [fds[0]]);
+        assert_eq!(guest.close_attempts, fds);
+    }
 }
 
 #[cfg(test)]
@@ -27641,6 +28753,275 @@ mod serving_kernel_protection_key_tests {
                     (0xffff_8000_0000_0000, page, libc::PROT_NONE as usize, 0),
                     "{reply:?}"
                 );
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod nofile_tests {
+    use reverie::Guest;
+    use reverie::syscalls::Errno;
+
+    use crate::record_or_replay::NoopTool;
+    use crate::syscall_hot_path_tests::InjectGuest;
+
+    /// The guest's virtual `RLIMIT_NOFILE` current value in these tests:
+    /// small, so the boundary is a descriptor number a test can name, and
+    /// below every host limit, so only the virtual limit can refuse.
+    const LIMIT: u64 = 16;
+
+    fn limited(reply: Result<i64, Errno>) -> InjectGuest<NoopTool> {
+        let mut guest = InjectGuest::<NoopTool>::new(reply);
+        guest
+            .thread_state_mut()
+            .resource_limits
+            .lock()
+            .unwrap()
+            .set(
+                reverie::syscalls::linux_abi::RLIMIT_NOFILE,
+                crate::tool_local::ResourceLimit {
+                    current: LIMIT,
+                    maximum: 1_048_576,
+                },
+            );
+        guest
+    }
+
+    fn errno(result: &Result<i64, reverie::Error>) -> Result<i64, Errno> {
+        match result {
+            Ok(value) => Ok(*value),
+            Err(reverie::Error::Errno(errno)) => Err(*errno),
+            Err(other) => panic!("not an errno: {other:?}"),
+        }
+    }
+
+    /// `dup2` to a descriptor at the guest's virtual `RLIMIT_NOFILE` is
+    /// `EBADF` from the virtual limit alone (fs/file.c `ksys_dup3`: the
+    /// `newfd >= rlimit(RLIMIT_NOFILE)` refusal, before the table grows or
+    /// the old descriptor is looked up), so nothing is injected. One below
+    /// the limit still goes to the kernel: the scripted answer is the
+    /// guest's. The scripted host answer above the limit is the `EBADF` a
+    /// host whose real limit happens to bind gives, so at the tip the
+    /// errno matches and only the injected call gives the defect away.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn nofile_dup2_at_the_virtual_limit_is_ebadf_without_the_kernel() {
+        futures::executor::block_on(async {
+            let tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+            let mut guest = limited(Err(Errno::EBADF));
+            let call = reverie::syscalls::Dup2::new()
+                .with_oldfd(3)
+                .with_newfd(LIMIT as i32);
+            let result = tool.handle_dup2(&mut guest, call).await;
+            assert_eq!(errno(&result), Err(Errno::EBADF));
+            assert!(
+                guest.injected().is_empty(),
+                "the virtual limit refuses before the kernel: {:?}",
+                guest.injected()
+            );
+
+            let mut guest = limited(Err(Errno::EINVAL));
+            let call = reverie::syscalls::Dup2::new()
+                .with_oldfd(3)
+                .with_newfd(LIMIT as i32 - 1);
+            let result = tool.handle_dup2(&mut guest, call).await;
+            assert_eq!(errno(&result), Err(Errno::EINVAL), "the kernel's answer");
+            assert_eq!(guest.injected().len(), 1, "below the limit it is forwarded");
+
+            // The same descriptor twice at the limit takes the kernel's
+            // lookup-only path: forwarded, never the limit's EBADF.
+            let mut guest = limited(Ok(LIMIT as i64));
+            guest
+                .thread_state_mut()
+                .add_fd(
+                    LIMIT as i32,
+                    nix::fcntl::OFlag::O_RDONLY,
+                    crate::fd::FdType::Pipe,
+                    None,
+                )
+                .unwrap();
+            let call = reverie::syscalls::Dup2::new()
+                .with_oldfd(LIMIT as i32)
+                .with_newfd(LIMIT as i32);
+            let result = tool.handle_dup2(&mut guest, call).await;
+            assert_eq!(errno(&result), Ok(LIMIT as i64), "the same descriptor");
+            assert_eq!(guest.injected().len(), 1, "the lookup is forwarded");
+        })
+    }
+
+    /// `dup3` as `dup2`, with Linux's order in `ksys_dup3` preserved where
+    /// the virtual limit binds: flags other than `O_CLOEXEC` are `EINVAL`
+    /// first, then old and new the same descriptor, then the limit's
+    /// `EBADF`. Each is answered without the kernel.
+    #[test]
+    fn nofile_dup3_at_the_virtual_limit_keeps_linux_order() {
+        futures::executor::block_on(async {
+            let tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+            for (name, oldfd, flags, expected) in [
+                ("at the limit", 3, nix::fcntl::OFlag::empty(), Errno::EBADF),
+                (
+                    "the same descriptor at the limit",
+                    LIMIT as i32,
+                    nix::fcntl::OFlag::empty(),
+                    Errno::EINVAL,
+                ),
+                (
+                    "flags Linux refuses, at the limit",
+                    3,
+                    nix::fcntl::OFlag::O_RDWR,
+                    Errno::EINVAL,
+                ),
+            ] {
+                let mut guest = limited(Err(Errno::EBADF));
+                let call = reverie::syscalls::Dup3::new()
+                    .with_oldfd(oldfd)
+                    .with_newfd(LIMIT as i32)
+                    .with_flags(flags);
+                let result = tool.handle_dup3(&mut guest, call).await;
+                assert_eq!(errno(&result), Err(expected), "{name}");
+                assert!(
+                    guest.injected().is_empty(),
+                    "{name}: answered without the kernel: {:?}",
+                    guest.injected()
+                );
+            }
+
+            let mut guest = limited(Err(Errno::ENOMEM));
+            let call = reverie::syscalls::Dup3::new()
+                .with_oldfd(3)
+                .with_newfd(LIMIT as i32 - 1)
+                .with_flags(nix::fcntl::OFlag::O_CLOEXEC);
+            let result = tool.handle_dup3(&mut guest, call).await;
+            assert_eq!(errno(&result), Err(Errno::ENOMEM), "the kernel's answer");
+            assert_eq!(guest.injected().len(), 1, "below the limit it is forwarded");
+
+            // A flag bit the typed flags truncate away still counts: the
+            // raw register is read, so this is EINVAL, not the limit's
+            // EBADF, and nothing is forwarded.
+            let mut guest = limited(Err(Errno::EBADF));
+            let raw = reverie::syscalls::Syscall::from_raw(
+                reverie::syscalls::Sysno::dup3,
+                reverie::syscalls::SyscallArgs::new(3, LIMIT as usize, 0x8000_0000, 0, 0, 0),
+            );
+            let reverie::syscalls::Syscall::Dup3(call) = raw else {
+                panic!("dup3 raw call did not decode: {raw:?}");
+            };
+            let result = tool.handle_dup3(&mut guest, call).await;
+            assert_eq!(errno(&result), Err(Errno::EINVAL), "a truncated flag bit");
+            assert!(
+                guest.injected().is_empty(),
+                "a truncated flag bit: answered without the kernel: {:?}",
+                guest.injected()
+            );
+        })
+    }
+
+    /// `F_DUPFD` and `F_DUPFD_CLOEXEC` with their argument at the guest's
+    /// virtual `RLIMIT_NOFILE` are `EINVAL` (`f_dupfd`, fs/file.c:
+    /// `from >= rlimit(RLIMIT_NOFILE)`), after the descriptor itself:
+    /// `check_fcntl_cmd` admits both commands on an `O_PATH` descriptor,
+    /// so a held descriptor gets the argument's `EINVAL`; one the guest
+    /// does not hold is `EBADF` first, as `fdget` precedes the argument
+    /// check. A descriptor the model lists decides from the model; one
+    /// it does not list is settled by an `F_GETFD` recorded in the dup's
+    /// place, because on a shared-table backend an inherited or
+    /// just-received descriptor can be held while missing from the
+    /// model: its `EBADF` stays, its success becomes `EINVAL`. The
+    /// backend runtime's own descriptor reads as absent with no probe.
+    /// One below the limit still goes to the kernel as written.
+    #[test]
+    fn nofile_fcntl_dupfd_at_the_virtual_limit_is_einval_after_ebadf() {
+        futures::executor::block_on(async {
+            let tool = crate::syscall_hot_path_tests::detcore::<NoopTool>();
+            // (name, cmd, fd, runtime-owned, kernel answer, expected, the
+            // one forwarded command, if any)
+            for (name, cmd, fd, runtime, reply, expected, forwarded) in [
+                (
+                    "F_DUPFD at the limit",
+                    reverie::syscalls::FcntlCmd::F_DUPFD(LIMIT as i32),
+                    3,
+                    false,
+                    Err(Errno::EINVAL),
+                    Errno::EINVAL,
+                    None,
+                ),
+                (
+                    "F_DUPFD_CLOEXEC at the limit",
+                    reverie::syscalls::FcntlCmd::F_DUPFD_CLOEXEC(LIMIT as i32),
+                    3,
+                    false,
+                    Err(Errno::EINVAL),
+                    Errno::EINVAL,
+                    None,
+                ),
+                (
+                    "a descriptor missing from the model the kernel lacks",
+                    reverie::syscalls::FcntlCmd::F_DUPFD(LIMIT as i32),
+                    9,
+                    false,
+                    Err(Errno::EBADF),
+                    Errno::EBADF,
+                    Some(libc::F_GETFD as usize),
+                ),
+                (
+                    "a descriptor missing from the model the kernel holds",
+                    reverie::syscalls::FcntlCmd::F_DUPFD(LIMIT as i32),
+                    9,
+                    false,
+                    Ok(0),
+                    Errno::EINVAL,
+                    Some(libc::F_GETFD as usize),
+                ),
+                (
+                    "the runtime's own descriptor",
+                    reverie::syscalls::FcntlCmd::F_DUPFD(LIMIT as i32),
+                    9,
+                    true,
+                    Ok(0),
+                    Errno::EBADF,
+                    None,
+                ),
+                (
+                    "one below the limit",
+                    reverie::syscalls::FcntlCmd::F_DUPFD(LIMIT as i32 - 1),
+                    3,
+                    false,
+                    Err(Errno::ENOMEM),
+                    Errno::ENOMEM,
+                    Some(libc::F_DUPFD as usize),
+                ),
+            ] {
+                let mut guest = limited(reply);
+                if runtime {
+                    guest = guest.with_runtime_fd(9);
+                }
+                guest
+                    .thread_state_mut()
+                    .add_fd(
+                        3,
+                        nix::fcntl::OFlag::O_RDONLY,
+                        crate::fd::FdType::Pipe,
+                        None,
+                    )
+                    .unwrap();
+                let call = reverie::syscalls::Fcntl::new().with_fd(fd).with_cmd(cmd);
+                let result = tool.handle_fcntl(&mut guest, call).await;
+                assert_eq!(errno(&result), Err(expected), "{name}");
+                let injected = guest.injected();
+                match forwarded {
+                    None => assert!(
+                        injected.is_empty(),
+                        "{name}: answered without the kernel: {injected:?}"
+                    ),
+                    Some(command) => {
+                        assert_eq!(injected.len(), 1, "{name}: one forwarded call");
+                        let (sysno, args) = injected[0];
+                        assert_eq!(sysno, reverie::syscalls::Sysno::fcntl, "{name}");
+                        assert_eq!(args.arg0, fd as usize, "{name}: descriptor");
+                        assert_eq!(args.arg1, command, "{name}: forwarded command");
+                    }
+                }
             }
         })
     }

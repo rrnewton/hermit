@@ -81,6 +81,17 @@ LIBHERMIT_TEST_DEPS = [
     "//hermetic_infra/reverie:reverie-liteinst-exec-stop" if dep == "//hermetic_infra/reverie:reverie-liteinst" else dep for dep in LIBHERMIT_DEPS
 ]
 
+# libhermit's production dependencies: the shared list with
+# reverie-liteinst built against the one reverie-inguest of Cargo's
+# `exec-stop-launcher` build (reverie:reverie-liteinst-exec-stop-private),
+# plus that feature's direct loader and digest dependencies. The inguest
+# crate itself comes through named_deps, as in the test harnesses.
+LIBHERMIT_PROD_DEPS = [dep for dep in LIBHERMIT_DEPS if dep != "//hermetic_infra/reverie:reverie-liteinst"] + [
+    "fbsource//third-party/rust:sha2-010",
+    "//hermetic_infra/reverie:reverie-liteinst-exec-stop-private",  # @manual name:reverie_liteinst
+    "//hermetic_infra/reverie:reverie-loader",
+]
+
 LIBHERMIT_ENV = {
     # src/bin/hermit/version.rs reports it in `hermit --version`. Both trees
     # share this file, and each keeps its release values in its own
@@ -115,6 +126,7 @@ LIBHERMIT_TEST_SRCS = {
         "reverie_pin.rs",
         "src/in_guest_delivery_harness/guest.c",
         "tests/common/exclusive_rewrite_summary.rs",
+        "tests/common/host_fact_v3.rs",
         "tests/common/readonly_proc.rs",
         "tests/common/test_skip.rs",
         "tests/fixtures/chosen-before-reserved-input.json",
@@ -183,9 +195,9 @@ rust_library(
             },
             # The OSS package's backend features (Cargo.toml), declared but
             # empty, which keeps `cfg(feature = ...)` known to clippy's
-            # `-D warnings` in fb-only/ci.sh. Of those backends fbsource builds
-            # only LiteInst, whose dependencies the Buck targets list
-            # unconditionally.
+            # `-D warnings` in fb-only/ci.sh. Of those backends fbsource
+            # builds LiteInst and its exec-stop launcher, whose dependencies
+            # the Buck targets list unconditionally.
             "features": {
                 "dbt": [],
                 "default": [],
@@ -220,11 +232,21 @@ rust_library(
     },
     crate = "hermit",
     env = LIBHERMIT_ENV,
-    # The LiteInst backend, as upstream's Buck build of this library. Each
-    # target spells out its features: the open-source tree's
+    # The LiteInst backend and its exec-stop launcher, as upstream's Cargo
+    # build of this library with both features. Each target spells out its
+    # features: the open-source tree's
     # scripts/check-buck-reindeer-features.rs reads only literal lists.
-    features = ["liteinst"],
-    named_deps = {"reverie": "//hermetic_infra/reverie:reverie"},
+    features = [
+        "exec-stop-launcher",
+        "liteinst",
+    ],
+    named_deps = {
+        "reverie": "//hermetic_infra/reverie:reverie",
+        # Cargo's `exec-stop-launcher` dependency on reverie-inguest with
+        # `exec-stop` and `loader-private-runtime`, unified with
+        # reverie-liteinst's dependency as in LIBHERMIT_PROD_DEPS.
+        "reverie_inguest": "//hermetic_infra/reverie:reverie-inguest-exec-stop-private",
+    },
     # The LiteInst backing descriptor and the in-guest entry symbols are
     # per-image link contracts that only a final binary link can resolve, so
     # this library must not become a shared object.
@@ -233,7 +255,7 @@ rust_library(
     target_compatible_with = ["ovr_config//cpu:x86_64"],
     # :libhermit-unittest below, which needs the prefixed source layout.
     unittests = False,
-    deps = LIBHERMIT_DEPS,
+    deps = LIBHERMIT_PROD_DEPS,
 )
 
 # libhermit's unit tests, the application's (src/bin/hermit) included.
@@ -328,7 +350,7 @@ rust_binary(
 hermit_release_targets(
     srcs = LIBHERMIT_SRCS,
     unstamped_env = LIBHERMIT_ENV,
-    deps = LIBHERMIT_DEPS,
+    deps = LIBHERMIT_PROD_DEPS,
 )
 
 # The hermit-release aliases exist only in the open-source build; see
@@ -468,7 +490,7 @@ buck_genrule(
     + " && cp $(location :hermit) $OUT/hermit"
     + " && cp $(location //hermetic_infra/hermit:detcore-liteinst-staged)/rsrcs/libdetcore_liteinst.so $OUT/rsrcs/libdetcore_liteinst.so"
     + " && cp $(location //hermetic_infra/hermit:detcore-liteinst-staged)/rsrcs/libdetcore_liteinst.package.json $OUT/rsrcs/libdetcore_liteinst.package.json"
-    + " && cp $(location //hermetic_infra/reverie:reverie-liteinst-preload[cdylib]) $OUT/rsrcs/libreverie_liteinst.so"
+    + " && cp $(location //hermetic_infra/reverie:reverie-liteinst-preload-stripped) $OUT/rsrcs/libreverie_liteinst.so"
     + " && cp $(location //hermetic_infra/hermit:reverie-liteinst-revision) $OUT/rsrcs/libreverie_liteinst.so.revision",
     # GATED OFF until D1c qualifies the Buck-built runtime bytes against
     # the fixed liteinst-runtime build: ci.skip_target() excludes this
@@ -626,6 +648,7 @@ rust_binary(
         for src in [
             "hermit-cli/tests/cpu_profile_v2_rootfs.rs",
             "hermit-cli/tests/common/hermit_binary.rs",
+            "hermit-cli/tests/common/host_fact_v3.rs",
             "hermit-cli/tests/common/skid_overshoot.rs",
             "hermit-cli/tests/common/test_skip.rs",
             "hermit-cli/tests/fixtures/isa/cpuid_v2_probe.c",
@@ -644,6 +667,37 @@ rust_binary(
         "fbsource//third-party/rust:tar",
         "fbsource//third-party/rust:tempfile",
         "//hermetic_infra/hermit/detcore:detcore",
+        "//hermetic_infra/hermit/detcore-model:detcore-model",
+    ],
+)
+
+# The callable form of the x86-64-v3 host-fact refusal predicate for
+# run_probed.py (fb-only/gated_tests): the shell-test runner asks this
+# binary whether a failed command's exit status and stderr are a
+# decided host-fact refusal, so host_fact_v3.rs stays the one
+# classifier every runner shares. Buck-only, like
+# cpu-profile-v2-rootfs-test above: no Cargo target names the file.
+rust_binary(
+    name = "host-fact-v3-verdict",
+    autocargo = {"ignore_rule": True},
+    crate = "host_fact_v3_verdict",
+    crate_root = "hermit-cli/tests/common/host_fact_v3_verdict.rs",
+    mapped_srcs = {
+        src.removeprefix("hermit-cli/"): src
+        for src in [
+            "hermit-cli/tests/common/host_fact_v3_verdict.rs",
+            "hermit-cli/tests/common/host_fact_v3.rs",
+        ]
+    },
+    # hermit/detcore virtualizes the x86 cpuid instruction; x86-64 only.
+    target_compatible_with = ["ovr_config//cpu:x86_64"],
+    # host_fact_v3.rs's unit tests run in the harnesses that include
+    # hermit_binary.rs; this binary only exposes the predicate.
+    unittests = False,
+    # $(exe ...) for this binary is expanded by _host_admission in
+    # every package that calls hermit_host_test.
+    visibility = ["//hermetic_infra/hermit/..."],
+    deps = [
         "//hermetic_infra/hermit/detcore-model:detcore-model",
     ],
 )

@@ -106,6 +106,8 @@ use crate::timeouts::FLIP_2026_10_30_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
 use crate::timeouts::KVM_2026_11_08_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
+use crate::timeouts::KVM_2026_11_26_TIMEOUT_CALIBRATIONS;
+#[cfg(test)]
 use crate::timeouts::KVM_RATCHET_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
 use crate::timeouts::LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS;
@@ -2542,7 +2544,32 @@ impl ManifestInputs {
     }
 }
 
+/// The per-category environment override for a bucket image, for routes
+/// whose image cannot live in the shared manifest (the fbsource Buck
+/// route supplies mini-crypto only to its system-utils ptrace seam).
+/// Unset or empty means manifest behaviour, byte for byte.
+fn bucket_image_env_name(category: &str) -> String {
+    format!(
+        "HERMIT_E2E_BUCKET_IMAGE_{}",
+        category
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    )
+}
+
 fn bucket_image(set: &ManifestSet, category: &str) -> Option<String> {
+    if let Ok(override_image) = std::env::var(bucket_image_env_name(category)) {
+        if !override_image.trim().is_empty() {
+            return Some(override_image);
+        }
+    }
     set.documents
         .iter()
         .find(|document| document.bucket == category)
@@ -13058,6 +13085,18 @@ fn execute_observed_until(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bucket_image_env_name_uppercases_and_underscores() {
+        assert_eq!(
+            bucket_image_env_name("system-utils"),
+            "HERMIT_E2E_BUCKET_IMAGE_SYSTEM_UTILS"
+        );
+        assert_eq!(
+            bucket_image_env_name("bin-c"),
+            "HERMIT_E2E_BUCKET_IMAGE_BIN_C"
+        );
+    }
+
     /// The session is the field after the process group, whatever bytes the
     /// command name holds.
     #[test]
@@ -19786,6 +19825,7 @@ fi
             .chain(&DBT_FLIP_2026_10_27_TIMEOUT_CALIBRATIONS)
             .chain(&FLIP_2026_10_30_TIMEOUT_CALIBRATIONS)
             .chain(&KVM_2026_11_08_TIMEOUT_CALIBRATIONS)
+            .chain(&KVM_2026_11_26_TIMEOUT_CALIBRATIONS)
             .map(|calibration| {
                 (
                     (calibration.test, calibration.mode, calibration.backend),
@@ -28667,6 +28707,7 @@ backends_disabled:
             first_divergent_left_message: None,
             first_divergent_right_message: None,
             exact_branch_counter: None,
+            startup_unmonitored: None,
             store_exclusive_retries: None,
         }
     }

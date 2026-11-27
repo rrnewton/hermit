@@ -7,8 +7,9 @@
 # boundary without creating a second resource or cgroup layer. Each invocation
 # is one privileged podman container pinned BY DIGEST, with /dev/kvm passed
 # through, no runtime network, source at /src (read-only by default, explicitly
-# writable for validation nodes), and separate writable output and target
-# volumes.
+# writable for validation nodes), separate writable output and target
+# volumes, and the running kernel's generated uapi asm headers read-only at
+# their host path.
 #
 # WHY BY DIGEST AND NOT BY TAG. A tag is mutable; a digest is the artifact that
 # actually ran. The digest belongs in the receipt next to the flake.lock: the
@@ -50,7 +51,11 @@
 # executables and configuration are deliberately not mounted: the image owns
 # its toolchain and network policy. This is the local equivalent of the shard
 # jobs' `Swatinem/rust-cache` restore, not a workaround: in both cases the cache
-# is an input carried across the phase boundary.
+# is an input carried across the phase boundary. An explicit home is a
+# build-phase home and is bind-mounted WRITABLE, as before. Without
+# --cargo-home, the caller's $HOME/.cargo caches are seeded under a private
+# overlay instead, so the caller's live caches are never written; pass
+# --cargo-home none for no caches at all.
 #
 # DAGRUN_TEST_COUNTS_PATH is scheduler-owned on the host. When requested through
 # --env, its parent directory is mounted at /dagrun-test-counts and the child is
@@ -67,7 +72,7 @@ set -euo pipefail
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 DIGEST_FILE="$HERE/image.digest"
 
-src=""; out=""; digest=""; src_mode="ro=true"; cargo_home=""; bundle_lower=""
+src=""; out=""; digest=""; src_mode="ro=true"; cargo_home=""; cargo_home_given=false; bundle_lower=""; hermit_bundle=""; hermit_bundle_given=false
 project_src=""; project_out=""; project_descriptor=""; project_mode="ro=true"
 proc_locks_runtime=false
 check_image=false
@@ -76,10 +81,11 @@ pass_env=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h)
-            printf '%s\n' 'usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA] [--src-rw] [--cargo-home DIR] [--proc-locks-runtime] [--nextest-calibration] [--bundle-lower DIR] [--env NAME]... -- CMD...' \
+            printf '%s\n' 'usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA] [--src-rw] [--cargo-home DIR] [--proc-locks-runtime] [--nextest-calibration] [--bundle-lower DIR] [--hermit-bundle DIR] [--env NAME]... -- CMD...' \
                 '--bundle-lower DIR mounts DIR read-only at /bundle-lower, as the lower layer of an overlay the command mounts itself.' \
                 '       run-in-pinned-root.sh --check-image [--digest NAME@SHA]' \
                 '--project-src/--project-out/--project-descriptor admit one distinct /project workspace and target; the original core stays at /src. --project-src-rw is separate from --src-rw.' \
+                '--cargo-home DIR bind-mounts DIR'\''s registry and git caches writable (a build-phase cargo home, extracted into by cargo); none: no caches. Default: seed from $HOME/.cargo under a private overlay when it has caches, so the host caches are never written (printed).' \
                 '--nextest-calibration captures the actual host envelope for the regular Nextest consumer using an existing prepared helper. Missing capture capability stays unqualified; bootstrap calls do not capture or compile.' \
                 'HERMIT_PINNED_IMAGE_PROBE_BOUND_S=SECONDS replaces the 120 s WALL bound on each of the two exact-image probe attempts (a positive integer; unset: 120). Production leaves it unset.'
             exit 0 ;;
@@ -92,10 +98,11 @@ while [[ $# -gt 0 ]]; do
         --digest) digest=$2; shift 2 ;;
         --check-image) check_image=true; shift ;;
         --src-rw) src_mode="ro=false"; shift ;;
-        --cargo-home) cargo_home=$2; shift 2 ;;
+        --cargo-home) cargo_home=$2; cargo_home_given=true; shift 2 ;;
         --proc-locks-runtime) proc_locks_runtime=true; shift ;;
         --nextest-calibration) nextest_calibration=true; shift ;;
         --bundle-lower) bundle_lower=$2; shift 2 ;;
+        --hermit-bundle) [[ "$hermit_bundle_given" == false ]] || { echo "duplicate --hermit-bundle" >&2; exit 2; }; hermit_bundle=$2; hermit_bundle_given=true; shift 2 ;;
         --env) pass_env+=("$2"); shift 2 ;;
         --) shift; break ;;
         *) echo "run-in-pinned-root: unexpected argument '$1'" >&2; exit 2 ;;
@@ -135,6 +142,16 @@ check_pinned_image() {
     # attempts in seconds. The default applies only when it is unset: an empty
     # value is refused, not read as 120.
     local bound=${HERMIT_PINNED_IMAGE_PROBE_BOUND_S-120} status attempt
+    # A missing podman is a missing prerequisite, not an image verdict:
+    # name it (and the fix) instead of letting it surface as timeout's raw
+    # "failed to run command" line under a generic inspection failure.
+    # The status stays 127, the tool-failure status timeout itself
+    # reports for a command it cannot run.
+    if ! command -v podman >/dev/null 2>&1; then
+        echo "run-in-pinned-root: podman is required to run the pinned validation image, but no podman was found on PATH." >&2
+        echo "  Install it (Debian/Ubuntu: sudo apt-get install -y podman; Fedora: sudo dnf install -y podman), make sure 'podman --version' works, then rerun. Validation does not fall back to the host toolchain." >&2
+        return 127
+    fi
     if [[ ! "$bound" =~ ^[1-9][0-9]*$ ]]; then
         echo "run-in-pinned-root: HERMIT_PINNED_IMAGE_PROBE_BOUND_S must be a positive integer number of seconds, got '$bound'." >&2
         echo "  Unset it for the default 120 s probe bound, or set a whole number of seconds such as 30." >&2
@@ -172,7 +189,7 @@ check_pinned_image() {
 }
 
 if "$check_image"; then
-    [[ -z "$project_src" && -z "$project_out" && -z "$project_descriptor" && "$project_mode" == ro=true && -z "$src" && -z "$out" && -z "$cargo_home" && "$src_mode" == ro=true && "$proc_locks_runtime" == false && "$nextest_calibration" == false && ${#pass_env[@]} == 0 && $# == 0 ]] || {
+    [[ -z "$project_src" && -z "$project_out" && -z "$project_descriptor" && "$project_mode" == ro=true && -z "$src" && -z "$out" && -z "$cargo_home" && "$cargo_home_given" == false && "$hermit_bundle_given" == false && "$src_mode" == ro=true && "$proc_locks_runtime" == false && "$nextest_calibration" == false && ${#pass_env[@]} == 0 && $# == 0 ]] || {
         echo "run-in-pinned-root: --check-image accepts only optional --digest." >&2
         exit 2
     }
@@ -191,6 +208,41 @@ fi
 # DAG in validate.
 src=$(realpath -m -- "$src")
 out=$(realpath -m -- "$out")
+if [[ "$cargo_home_given" == true && -z "$cargo_home" ]]; then
+    echo "run-in-pinned-root: --cargo-home was given an empty value; pass a directory, none, or omit it to seed from \$HOME/.cargo" >&2
+    exit 2
+fi
+cargo_home_none=false
+if [[ "$cargo_home" == none ]]; then
+    cargo_home_none=true
+    cargo_home=""
+fi
+# Resolve the seeded default once, here, so the mount loop below is the only
+# place either form becomes a podman argument. Seeding applies only when the
+# caller named no cargo home at all; --cargo-home none opts out, and an
+# explicit directory keeps the exact pre-seeding semantics.
+cargo_seeded=false
+if [[ -z "$cargo_home" && "$cargo_home_none" == false ]]; then
+    # Seeded by default (owner direction): without --cargo-home, an offline
+    # cargo build fails inside with a download error and nothing pointing at
+    # the missing caches. Seed from the caller's own Cargo home when it has
+    # dependency caches; the mount loop seeds them under a private overlay,
+    # never a writable bind, so the host caches are never written.
+    if [[ -z "${HOME:-}" ]]; then
+        echo "run-in-pinned-root: HOME is unset, so no cargo caches are seeded; pass --cargo-home DIR for host caches, or --cargo-home none to make that explicit" >&2
+    elif [[ -d "$HOME/.cargo/registry" || -d "$HOME/.cargo/git" ]]; then
+        cargo_home=$(realpath -m -- "$HOME/.cargo")
+        cargo_seeded=true
+        echo "run-in-pinned-root: seeding cargo dependency caches from $cargo_home under a private overlay (host caches are never written); pass --cargo-home none to opt out" >&2
+    else
+        for arg in "$@"; do
+            if [[ ${arg##*/} == cargo ]]; then
+                echo "run-in-pinned-root: offline cargo builds need populated caches: run a networked cargo fetch so \$HOME/.cargo has registry/git caches to seed, or pass --cargo-home DIR with a populated build-phase home, or expect \"failed to download\" errors" >&2
+                break
+            fi
+        done
+    fi
+fi
 if [[ -n "$cargo_home" ]]; then
     cargo_home=$(realpath -m -- "$cargo_home")
 fi
@@ -207,6 +259,64 @@ if [[ -n "$bundle_lower" ]]; then
         exit 2
     }
     bundle_mount=(--mount "type=bind,source=$bundle_lower,destination=/bundle-lower,ro=true")
+fi
+
+if [[ "$hermit_bundle_given" == true && -z "$hermit_bundle" ]]; then
+    echo "run-in-pinned-root: --hermit-bundle was given an empty value; pass a bundle directory or omit it" >&2
+    exit 2
+fi
+hermit_bundle_mount=()
+hermit_bundle_env=()
+if [[ -n "$hermit_bundle" ]]; then
+    # A host-built Hermit bundle (owner 7502): the same published-artifact
+    # format the in-root build produces, verified by the one existing
+    # verifier, then mounted read-only so a run inside the image needs no
+    # Rust toolchain of its own. The ldd and --version preflight is a HOST
+    # check only: it refuses, by name, libraries this host cannot resolve
+    # and a binary that cannot execute here. The container resolves against
+    # the pinned image's own libraries, so a host pass does not by itself
+    # prove the in-image ABI; the printed DT_NEEDED/GLIBC line is the
+    # audit record for that comparison.
+    hermit_bundle=$(realpath -m -- "$hermit_bundle")
+    [[ -d "$hermit_bundle" ]] || {
+        echo "run-in-pinned-root: --hermit-bundle $hermit_bundle is not a directory" >&2
+        exit 2
+    }
+    [[ "$hermit_bundle" != *,* ]] || {
+        echo "run-in-pinned-root: --hermit-bundle path cannot contain a comma: $hermit_bundle" >&2
+        exit 2
+    }
+    wrapper_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+    verified_bundle=$("$wrapper_dir/../verify-hermit-e2e-artifact.sh" "$hermit_bundle") || {
+        echo "run-in-pinned-root: --hermit-bundle $hermit_bundle failed artifact verification" >&2
+        exit 2
+    }
+    hermit_binary=$verified_bundle/hermit
+    magic=$(od -An -t x1 -N4 "$hermit_binary" | tr -d ' \n')
+    if [[ $magic == 7f454c46 ]]; then
+        needed=$(readelf -d "$hermit_binary" | sed -n 's/.*(NEEDED).*Shared library: \[\(.*\)\].*/\1/p' | paste -sd, -)
+        glibc_versions=$(readelf -V --wide "$hermit_binary" | sed -n 's/.*Name: \(GLIBC_[^ ]*\) *Flags:.*/\1/p' | sort -u | paste -sd, -)
+        echo "run-in-pinned-root: hermit bundle binary DT_NEEDED: $needed; GLIBC symbol versions: $glibc_versions" >&2
+        ldd_out=$(timeout -k 2 30 ldd "$hermit_binary" 2>&1) || {
+            echo "run-in-pinned-root: hermit bundle preflight failed: ldd cannot run $hermit_binary: $ldd_out" >&2
+            exit 2
+        }
+        if grep -q "not found" <<<"$ldd_out"; then
+            echo "run-in-pinned-root: hermit bundle preflight failed: $hermit_binary has unresolved libraries on this host:" >&2
+            grep "not found" <<<"$ldd_out" >&2
+            exit 2
+        fi
+    fi
+    version_out=$(timeout -k 2 30 "$hermit_binary" --version 2>&1) || {
+        echo "run-in-pinned-root: hermit bundle preflight failed: $hermit_binary --version exited nonzero: $version_out" >&2
+        exit 2
+    }
+    echo "run-in-pinned-root: hermit bundle verified: $verified_bundle ($version_out)" >&2
+    hermit_bundle_mount=(--mount "type=bind,source=$verified_bundle,destination=/hermit-bundle,ro=true")
+    hermit_bundle_env=(-e HERMIT_BIN=/hermit-bundle/hermit)
+    if [[ -d $verified_bundle/install ]]; then
+        hermit_bundle_env+=(-e HERMIT_INSTALL_DIR=/hermit-bundle/install)
+    fi
 fi
 
 # A second workspace is one paired source/output, never an arbitrary mount.
@@ -478,11 +588,27 @@ if [[ -n "$cargo_home" ]]; then
     # disabled network, even though the image carries its own pinned clippy.
     # Import only dependency caches into a separate Cargo home so `/bin` remains
     # the sole source of Cargo subcommands in the pinned root.
+    #
+    # The two forms differ in who may write. An explicit --cargo-home is a
+    # build-phase home (validate's split home) that cargo is expected to
+    # extract into, so it keeps the writable bind it has always had. The
+    # seeded default is the caller's live ~/.cargo, which a container must
+    # never write: it goes in as a podman overlay volume (:O), so cargo
+    # extracts into a container-private upper layer that dies with the
+    # container, and the host caches stay byte-unchanged.
     mkdir -p "$pinned_home/.cargo"
     for cache in registry git; do
         if [[ -d "$cargo_home/$cache" ]]; then
             mkdir -p "$pinned_home/.cargo/$cache"
-            cargo_mount+=(--mount "type=bind,source=$cargo_home/$cache,destination=/build/.cargo/$cache")
+            if [[ "$cargo_seeded" == true ]]; then
+                [[ "$cargo_home" != *:* ]] || {
+                    echo "run-in-pinned-root: cannot seed cargo caches from '$cargo_home': an overlay volume cannot name a source path containing ':'; pass --cargo-home DIR or --cargo-home none" >&2
+                    exit 2
+                }
+                cargo_mount+=(--volume "$cargo_home/$cache:/build/.cargo/$cache:O")
+            else
+                cargo_mount+=(--mount "type=bind,source=$cargo_home/$cache,destination=/build/.cargo/$cache")
+            fi
         fi
     done
 fi
@@ -567,11 +693,56 @@ elif [[ -d $host_pinned_cpu_dir ]] &&
         "type=bind,source=$host_pinned_cpu_dir,destination=$guest_pinned_cpu_dir"
     )
 fi
+
+# The running kernel's syscall numbers, read-only, at the path where the host
+# keeps them. Detcore's every_host_kernel_syscall_number_is_accounted_for
+# checks that its tables name every syscall number the kernel under test
+# wires, and only that kernel's own headers say which numbers those are. The
+# image has no kernel headers (no /lib/modules, no /usr/include/asm), and a
+# copy kept in the image or the tree would stop matching the kernel the tests
+# run on. A container runs on the host's kernel, so `uname -r` inside it
+# reports this same release and the test reads this directory's unistd_64.h
+# first. Where the host has no such directory (or Podman's comma-framed
+# --mount cannot name it exactly), nothing is bound and that test fails by
+# name, listing the paths it tried.
+#
+# HERMIT_RUNNING_KERNEL_UAPI_ASM names this directory in every container,
+# bound or not, and is wrapper-owned (a forwarded --env of it is refused
+# below). Where it is set the test reads only this directory's header, so a
+# header the image might carry can never stand in for the running kernel's.
+kernel_release=$(uname -r)
+guest_uapi_asm=/lib/modules/$kernel_release/build/arch/x86/include/generated/uapi/asm
+env_args+=(-e "HERMIT_RUNNING_KERNEL_UAPI_ASM=$guest_uapi_asm")
+host_uapi_asm=
+if [[ -d $guest_uapi_asm ]]; then
+    host_uapi_asm=$(realpath -e -- "$guest_uapi_asm")
+fi
+if [[ $host_uapi_asm$guest_uapi_asm == *[,$'\t\r\n']* ]]; then
+    echo "run-in-pinned-root: not binding the running kernel's uapi headers: Podman's comma-framed --mount cannot name $guest_uapi_asm (host path ${host_uapi_asm:-absent}) exactly; the host syscall-table test will fail by name" >&2
+elif [[ -z $host_uapi_asm ]]; then
+    echo "run-in-pinned-root: the running kernel's uapi headers are absent at $guest_uapi_asm; the host syscall-table test will fail by name" >&2
+else
+    # One line on every bound run, in the node's own log: a node that passes
+    # shows which header the syscall-table test compared against.
+    echo "run-in-pinned-root: bound host syscall header: $guest_uapi_asm/unistd_64.h (ro, from $host_uapi_asm)" >&2
+    extra_mounts+=(
+        --mount
+        "type=bind,source=$host_uapi_asm,destination=$guest_uapi_asm,ro=true"
+    )
+fi
 for name in "${pass_env[@]}"; do
     [[ $name =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || {
         echo "run-in-pinned-root: invalid environment name '$name'." >&2
         exit 2
     }
+    if [[ $name == HERMIT_RUNNING_KERNEL_UAPI_ASM ]]; then
+        echo "run-in-pinned-root: HERMIT_RUNNING_KERNEL_UAPI_ASM is wrapper-owned; do not forward it" >&2
+        exit 2
+    fi
+    if [[ $name == HERMIT_INSTALL_DIR && -n "$hermit_bundle" ]]; then
+        echo "run-in-pinned-root: HERMIT_INSTALL_DIR is bundle-owned when --hermit-bundle is set; do not forward it" >&2
+        exit 2
+    fi
     [[ -v $name ]] || continue
     case "$name" in
         E2E_RESULT_ROOT)
@@ -745,6 +916,39 @@ env_args+=(-e CARGO_UNSTABLE_CHECKSUM_FRESHNESS=true)
 # guarantee is void. CARGO_NET_OFFLINE in the image makes that fail loudly.
 # --pull=never: the exact digest must already be in the local store; the run
 # never fetches it, so a missing image fails here rather than being pulled.
+#
+# --init: the payload must not be the init of the container's PID namespace.
+# Without it, taskset, the node's `exec bash -c` guard and the wrappers it runs
+# exec down to the payload itself (test-harness, for every E2E bucket), so the
+# payload is PID 1. The kernel re-parents every orphan in the namespace to that
+# init (kernel/exit.c, find_new_reaper), and an orphan that exits stays a
+# zombie until its init waits for it. test-harness waits only for the
+# children it started, and must: its runner waits for each leader by PID and
+# reads that leader's rusage, which a blanket wait(-1) would steal. Hermit's
+# KVM VM teardown helper (hermit-vm-reap) is deliberately detached so the VM
+# destroy stays off the CLI's exit path, so every KVM run leaves one orphan,
+# which stays a zombie under test-harness until the node ends. --init runs
+# Podman's own init (catatonit, from the host's containers.conf init_path; not
+# from the image, so --pull=never and the pinned digest are unchanged) as
+# PID 1 and the payload as its child: it reaps every orphan, forwards the
+# signals Podman proxies to the payload, and exits with the payload's status
+# (128 + the signal number when a signal killed it).
+#
+# /bin/env --default-signal: the payload must start with no signal blocked and
+# every signal at its default action, as it did as PID 1 before --init.
+# catatonit leaves SIGTSTP, SIGTTIN and SIGTTOU blocked in the child it starts
+# (pinned image, /proc/self/status: SigBlk 0x380000 with --init, 0 without;
+# SigIgn the same either way). The blocked mask survives fork and execve, so
+# every process the payload started inherited it, and the cli tests that
+# compare a zombie's /proc/<pid>/stat signal fields with Linux's answer
+# failed. With no signal named, the image's GNU env unblocks every signal and
+# resets its action to the default, then execs, adding no process. Resetting
+# the actions as well keeps the start state fixed whatever an init or caller
+# ignores (execve resets only caught handlers: fs/exec.c begin_new_exec ->
+# kernel/signal.c flush_signal_handlers). glibc reserves signals 32 and 33 for
+# its threads library and sigaction refuses to change them, so a caller that
+# ignores them still passes that to the payload, as before --init; glibc's
+# sigprocmask never leaves them blocked.
 
 # A container runtime can widen the task affinity even with cgroups disabled.
 # Restore the actual caller's set inside the container before executing the
@@ -794,6 +998,7 @@ done <<< "$proc_status"
 
 exec podman run --rm \
     --pull=never \
+    --init \
     --cgroups=disabled \
     --privileged \
     --hostname=hermetic-container.local \
@@ -812,12 +1017,15 @@ exec podman run --rm \
     "${git_mounts[@]}" \
     "${extra_mounts[@]}" \
     "${bundle_mount[@]}" \
+    "${hermit_bundle_mount[@]}" \
     "${calibration_mount[@]}" \
     "${env_args[@]}" \
+    "${hermit_bundle_env[@]}" \
     -e HOME=/build \
     -e CARGO_HOME="$cargo_home_in" \
     -e "CARGO_TARGET_DIR=$effective_target_in" \
     -w "$workdir_in" \
     "$digest" \
+    /bin/env --default-signal \
     /bin/taskset --cpu-list "$caller_affinity" \
     "$@"

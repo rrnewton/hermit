@@ -34,8 +34,9 @@ supplemental evidence; local validation (below) is what a reviewer looks for.
 
 ## Local Validation Protocol
 
-Every change must be **locally validated before it is pushed**. The single
-entry point is:
+Every change must be **locally validated before it is pushed**. Local
+validation needs Podman for its pinned-root steps and refuses by name
+without it (there is no host fallback). The single entry point is:
 
 ```bash
 ./scripts/validate.rs
@@ -49,6 +50,26 @@ full label. It fails safe to the full label when no trustworthy baseline
 exists. Scoped kvm, ptrace, liteinst, sabre and e9patch routes are residual
 future work, not v1 routes. Run `./scripts/validate.rs --all` for the
 complete suite.
+
+`make validate` goes through `scripts/validate-front-door.sh` first. Inside
+the maintainers' `dev-hermit` harness it decides in milliseconds, before
+anything compiles, whether an agent or a human is calling:
+- An agent (an agent harness among the caller's ancestors, an agent
+  environment marker, or a herdr agent pane) is refused in three lines that
+  name the exact `ci-hub validate-run` command.
+- A human is warned that the run is off the record and is not validation
+  evidence, and how many paths are dirty if any. Then the full validate runs in
+  place (`--human-off-the-record`).
+
+This is routing, not a security boundary. An agent that clears its
+environment and leaves its process tree looks human: through a
+`systemd-run --user` service, over ssh, or in a tmux server started elsewhere.
+That is acceptable because such a run publishes nothing. Outside the harness,
+and inside a ci-hub validate-run unit, `make validate` runs the driver without
+classifying the caller. Every route outside a ci-hub unit, the human route
+included, starts the driver under `with-proxy` when it exists, as ci-hub's unit
+does, because the fetch node downloads from crates.io and GitHub. See
+`scripts/validate-front-door.sh --help`.
 
 `scripts/validate.rs portable-only` is the local mirror of the manual
 `.github/workflows/ci-portable.yml` workflow: it runs the same build, lint,

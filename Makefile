@@ -42,7 +42,7 @@ HERMIT_DEBUG_BIN ?= target/debug/hermit
 
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules verify-submodules check-skill-discovery validate validate-plan \
-	validate-self-test validate-timeout-layers-test lint lint-parent-checks lint-script-tests fmt \
+	validate-self-test validate-timeout-layers-test lint lint-parent-checks lint-musl-detcore lint-script-tests fmt \
 	validate-kvm validate-dbt validate-sabre validate-e9patch
 
 build: prune-stale-release install-deps ## Build the development Hermit binary with first-party backends
@@ -58,12 +58,12 @@ build: prune-stale-release install-deps ## Build the development Hermit binary w
 			exit 1; \
 		fi
 
-# `install-deps` is the "install everything this repo needs to build" entrypoint,
-# so it opts into best-effort auto-installation of the native build toolchain via
-# INSTALL_BUILD_TOOLS. Target-specific variables propagate to prerequisites, so
-# the transitive `check-build-tools` prereq sees this and installs before it
-# asserts. `validate`/`release-core` do NOT set it and therefore only assert.
-install-deps: INSTALL_BUILD_TOOLS := 1
+# `install-deps` is the "install everything this repo needs to build" entrypoint.
+# It never installs system packages on its own: its transitive `check-build-tools`
+# prerequisite fails, naming what is missing, unless the caller passes
+# INSTALL_BUILD_TOOLS=1, the only switch that runs `install-build-tools` (which
+# installs through sudo). Nothing in this Makefile sets that variable, so `make`,
+# `make build` and `make install-deps` never escalate unless asked to.
 install-deps: install-hooks check-submodules ## Build and stage the first-party LiteInst runtimes
 	@echo 'make: building the first-party LiteInst runtimes (release profile)'
 	@echo "make: cargo jobs=$(THIRD_PARTY_BUILD_JOBS) (host has $$(nproc) logical cores)"
@@ -121,9 +121,15 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 	echo "make: removed stale $$bin ($$reason); run 'make release-core' to rebuild it" >&2
 
 # Keep `validate` as an explicit .PHONY convenience target for the sole Rust
-# validation entrypoint.
-validate: verify-submodules ## Run the full validation suite (Rust driver; pass flags via ARGS)
-	./scripts/validate.rs --all $(ARGS)
+# validation entrypoint. The front door routes before anything compiles: inside
+# a dev-hermit parent it refuses an agent toward `ci-hub validate-run` and runs
+# a human's validate in place, off the record; it then starts scripts/validate.rs,
+# whose first DAG node (pre.submodules) verifies the submodule pins (see --help).
+# --all-unless-level makes the driver run the full suite unless ARGS names a
+# level, so `make validate ARGS=--quick` runs quick; the driver's own parser
+# decides what ARGS names.
+validate: ## Run the full validation suite, or the level ARGS names (agents are routed to ci-hub; pass flags via ARGS)
+	@./scripts/validate-front-door.sh -- --all-unless-level $(ARGS)
 
 validate-plan: ## Print the boxed DAG plan (nodes, wall/CPU/memory caps, deps) without running it
 	./scripts/validate.rs --show-plan $(ARGS)
@@ -160,7 +166,7 @@ check-skill-discovery: ## Verify Claude and stock Codex discover the same produc
 # a checker added to lint-checks is exercised by local validation automatically, whereas the previous
 # arrangement required someone to also hand-write a DAG node and six of the ten
 # checkers in this target had no such node (measured 2026-08-25 at a5fef7ff7623).
-lint: lint-checks lint-script-tests lint-cargo lint-parent-checks ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, rust-script unit tests, Reverie pin policy, nested lockfiles, record-version floor)
+lint: lint-checks lint-script-tests lint-cargo lint-parent-checks lint-musl-detcore ## Run the full lint suite matching CI (rustfmt, shellcheck, whitespace, clippy, rust-script unit tests, Reverie pin policy, nested lockfiles, record-version floor, musl Detcore compile)
 
 # The one checker that needs the dev-hermit PARENT repository: the accept arm of the
 # canonical ledger adapter contract drives the parent's real ci-hub/ledger/validate_rows.py.
@@ -173,6 +179,15 @@ lint: lint-checks lint-script-tests lint-cargo lint-parent-checks ## Run the ful
 # not evaluated, which is neither a pass nor a lint failure.
 lint-parent-checks: ## The lint checker that needs the dev-hermit parent (CI node check.canonical_adapter_accept, full lane only)
 	python3 ./scripts/test_validate_stop_paths.py --canonical-adapter-accept-arm-only
+
+# The musl compile check (cargo check -p hermit-detcore for x86_64-unknown-linux-musl)
+# is a Cargo build, not a lint checker, so it is its own DAG node, check.musl_detcore,
+# sized from its own measurement, and not part of lint-checks. `lint` still runs it,
+# so a local `make lint` covers what CI runs. Without the musl std component the
+# script exits 75 (NO RESULT) and make reports that as `Error 75`: the check was not
+# evaluated, which is neither a pass nor a lint failure.
+lint-musl-detcore: ## The musl hermit-detcore compile check (CI node check.musl_detcore)
+	./ci/check-musl-detcore.sh
 
 # The full stop-path checker is safe to run inside validation: it clears the outer
 # HERMIT_VALIDATE_ACTIVE marker before launching fixtures, and every full-validate
@@ -224,13 +239,16 @@ LINT_CHECK_TARGETS := \
     lint-check-bisect-probe \
     lint-check-lint-checks-node \
     lint-check-assert-build-dependencies \
+    lint-check-assert-test-dependencies \
     lint-check-image-provenance \
     lint-check-retry-fetch \
     lint-check-apt-install-cached \
+    lint-check-build-tools-opt-in \
     lint-check-pinned-root-cache \
     lint-check-checker-scheduling \
     lint-check-early-artifact-gate \
     lint-check-validate-refusal-predicate \
+    lint-check-validate-front-door \
     lint-check-audit-test-binary-registration \
     lint-check-shellcheck \
     lint-check-whitespace \
@@ -238,8 +256,8 @@ LINT_CHECK_TARGETS := \
     lint-check-reverie-pin \
     lint-check-private-static-owned \
     lint-check-private-static-pipeline \
-    lint-check-musl-detcore \
     lint-check-nested-lockfiles \
+    lint-check-cargo-proxy \
     lint-check-cargo-lock-freshness \
     lint-check-cargo-lock-cochange \
     lint-check-record-version-floor \
@@ -251,6 +269,9 @@ LINT_CHECK_TARGETS := \
     lint-check-buck-e2e-ingest \
     lint-check-buck-e2e-stock \
     lint-check-buck-e2e-verdict \
+    lint-check-buck-e2e-buckconfig-sources \
+    lint-check-buck-measure \
+    lint-check-buck-build-compare \
     lint-check-buck-e2e-cell \
     lint-check-buck-e2e-stage \
     lint-check-buck-e2e-stages \
@@ -260,8 +281,11 @@ LINT_CHECK_TARGETS := \
     lint-check-conformance-test-counts \
     lint-check-recount-pins \
     lint-check-census-diff \
+    lint-check-run-nextest-counted \
     lint-check-runner-guard \
-    lint-check-no-sve
+    lint-check-no-sve \
+    lint-check-detcore-backend-abstraction-test \
+    lint-check-stage-detcore-liteinst
 .PHONY: lint-checks $(LINT_CHECK_TARGETS)
 lint-checks: $(LINT_CHECK_TARGETS) ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
 
@@ -343,6 +367,9 @@ lint-check-lint-checks-node:
 lint-check-assert-build-dependencies:
 	./ci/hermetic/assert-build-dependencies.sh --self-test
 
+lint-check-assert-test-dependencies:
+	./ci/hermetic/assert-test-dependencies.sh --self-test
+
 lint-check-image-provenance:
 	./ci/hermetic/check-image-provenance.rs
 
@@ -351,6 +378,9 @@ lint-check-retry-fetch:
 
 lint-check-apt-install-cached:
 	./ci/apt-install-cached-test.sh
+
+lint-check-build-tools-opt-in:
+	./scripts/test-build-tools-opt-in.sh
 
 lint-check-pinned-root-cache:
 	python3 ./ci/hermetic/run-in-pinned-root-cache-test.py
@@ -365,6 +395,9 @@ lint-check-early-artifact-gate:
 lint-check-validate-refusal-predicate:
 	python3 ./scripts/check-validate-refusal-predicate.py --self-test
 	python3 ./scripts/check-validate-refusal-predicate.py
+
+lint-check-validate-front-door:
+	./scripts/test-validate-front-door.sh
 
 lint-check-audit-test-binary-registration:
 	python3 ./ci/audit-test-binary-registration.py
@@ -399,11 +432,11 @@ lint-check-private-static-owned:
 lint-check-private-static-pipeline:
 	PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s hermit-install/private-static -p 'test_*.py'
 
-lint-check-musl-detcore:
-	./ci/check-musl-detcore.sh
-
 lint-check-nested-lockfiles:
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
+
+lint-check-cargo-proxy:
+	./ci/hermetic/tests/test-cargo-proxy.sh
 
 # Tier 1 of the two-tier Cargo.lock gate: full `cargo metadata --locked`
 # (never --no-deps) on every OSS Cargo root. Also runs fail-fast as the
@@ -450,6 +483,15 @@ lint-check-buck-e2e-stock:
 lint-check-buck-e2e-verdict:
 	python3 ./ci/test_buck_e2e_verdict.py
 
+lint-check-buck-e2e-buckconfig-sources:
+	./ci/buck-e2e/test-buckconfig-sources.sh
+
+lint-check-buck-measure:
+	python3 ./ci/test_buck_measure.py
+
+lint-check-buck-build-compare:
+	python3 ./ci/test_buck_build_compare.py
+
 lint-check-buck-e2e-cell:
 	python3 ./ci/test_buck_e2e_cell.py
 
@@ -479,12 +521,23 @@ lint-check-recount-pins:
 lint-check-census-diff:
 	python3 ./ci/test_census_diff.py
 
+# The counted Nextest runner's own self-test (fake nextest, the real CPU
+# wrapper): typed counts, case selection, the census gate and refusals.
+lint-check-run-nextest-counted:
+	./ci/run-nextest-counted.sh --self-test
+
 lint-check-runner-guard:
 	python3 ./ci/test_runner_guard.py
 
 lint-check-no-sve:
 	rust-script --test ./scripts/check-no-sve.rs
 	./scripts/check-no-sve.rs /bin/true
+
+lint-check-detcore-backend-abstraction-test:
+	./scripts/check-detcore-backend-abstraction-test.sh
+
+lint-check-stage-detcore-liteinst:
+	./ci/stage-detcore-liteinst-test.sh
 
 # The unit tests carried by rust-script entrypoints are their own CI node,
 # check.script_unit_tests, so they run beside lint-checks instead of inside its
@@ -521,10 +574,11 @@ help: ## Show this help (the list of make targets)
 # fails to SPAWN cmake and panics with the cryptic "failed to configure
 # DynamoRIO: No such file or directory (os error 2)" — an ENOENT on the cmake
 # executable, not a missing source tree (a missing source instead makes cmake
-# exit non-zero). `make install-deps` sets INSTALL_BUILD_TOOLS=1 to best-effort
-# install the toolchain first; every other entrypoint asserts only and fails
-# fast with an actionable message. On a warm box the tools are present and this
-# is a no-op.
+# exit non-zero). Only a caller's explicit INSTALL_BUILD_TOOLS=1 runs
+# `install-build-tools` (through sudo) first; otherwise every entrypoint,
+# `make build` included, asserts only and fails fast naming the missing
+# packages and that opt-in. On a warm box the tools are present and this is a
+# no-op.
 check-build-tools: ## Verify the native build toolchain (cmake + C/C++ compiler) is present
 	@detect() { \
 		miss=; \
@@ -543,24 +597,40 @@ check-build-tools: ## Verify the native build toolchain (cmake + C/C++ compiler)
 		missing="$$(detect)"; \
 	fi; \
 	if [ -n "$$missing" ]; then \
+		apt=; dnf=; \
+		case "$$missing" in *cmake*) apt=cmake; dnf=cmake;; esac; \
+		case "$$missing" in *C-compiler*|*C++-compiler*) apt="$${apt:+$$apt }build-essential";; esac; \
+		case "$$missing" in *C-compiler*) dnf="$${dnf:+$$dnf }gcc";; esac; \
+		case "$$missing" in *C++-compiler*) dnf="$${dnf:+$$dnf }gcc-c++";; esac; \
 		echo "error: required native build tool(s) not found on PATH:$$missing" >&2; \
 		echo "  The DBT backend builds DynamoRIO from source with CMake; without" >&2; \
 		echo "  these the build fails ~30s in with a cryptic \"failed to configure" >&2; \
-		echo "  DynamoRIO: No such file or directory\". Install them, for example:" >&2; \
-		echo "    Debian/Ubuntu: sudo apt-get install -y cmake build-essential" >&2; \
-		echo "    Fedora/RHEL:   sudo dnf install -y cmake gcc gcc-c++ make" >&2; \
-		echo "  or run 'make install-deps', which installs them automatically." >&2; \
+		echo "  DynamoRIO: No such file or directory\". Install the missing package(s):" >&2; \
+		echo "    Debian/Ubuntu: $$apt" >&2; \
+		echo "    Fedora/RHEL:   $$dnf" >&2; \
+		if [ "$(INSTALL_BUILD_TOOLS)" = 1 ]; then \
+			echo "  INSTALL_BUILD_TOOLS=1 ran the installer, and they are still missing (see its warnings above)." >&2; \
+		else \
+			echo "  or rerun with INSTALL_BUILD_TOOLS=1 (for example 'make INSTALL_BUILD_TOOLS=1 build')," >&2; \
+			echo "  which runs the installer with sudo. Nothing sets it for you." >&2; \
+		fi; \
 		exit 1; \
 	fi; \
 	echo "make: build tools OK -- cmake, a C compiler and a C++ compiler are all on PATH"
 
 # Best-effort install of the native build toolchain via the platform package
-# manager. Invoked only from the `install-deps` path (INSTALL_BUILD_TOOLS=1).
-# Uses non-interactive sudo so it never hangs on a password prompt in an
-# automated context; if privileges or a package manager are unavailable it warns
-# and returns success, leaving check-build-tools to emit the actionable error.
-install-build-tools: ## Best-effort install of cmake + a C/C++ toolchain via the platform package manager
-	@echo "install-deps: ensuring native build toolchain (cmake + C/C++ compiler) is installed..."; \
+# manager, through sudo. It runs only when the caller passes
+# INSTALL_BUILD_TOOLS=1: check-build-tools calls it then, and a direct
+# `make install-build-tools` without that opt-in refuses. Uses non-interactive
+# sudo so it never hangs on a password prompt in an automated context; if
+# privileges or a package manager are unavailable it warns and returns success,
+# leaving check-build-tools to emit the actionable error.
+install-build-tools: ## With INSTALL_BUILD_TOOLS=1 only: install cmake + a C/C++ toolchain through sudo and the package manager
+	@if [ "$(INSTALL_BUILD_TOOLS)" != 1 ]; then \
+		echo "install-build-tools: refused -- it installs system packages through sudo, so it runs only when the caller passes INSTALL_BUILD_TOOLS=1" >&2; \
+		exit 1; \
+	fi; \
+	echo "install-build-tools: INSTALL_BUILD_TOOLS=1 -- installing the native build toolchain (cmake + C/C++ compiler)..."; \
 		SUDO=; \
 		if [ "$$(id -u)" != 0 ]; then \
 			if command -v sudo >/dev/null 2>&1; then SUDO="sudo -n"; \

@@ -785,6 +785,45 @@ pub fn copy_cargo_workloads(
         .collect()
 }
 
+/// The Cargo command `standalone` runs in `repository`, pinned to the
+/// toolchain of `cargo` itself: `RUSTC` names the rustc in `cargo`'s own
+/// directory. Cargo takes its rustc from `RUSTC`, else `build.rustc`, else
+/// PATH, and under rustup PATH holds a proxy that picks a toolchain from
+/// `RUSTUP_TOOLCHAIN` or, without it, by directory. With `RUSTUP_TOOLCHAIN`
+/// unset (the test binary run directly, not under a rustup `cargo`), a
+/// registry dependency that ships its own `rust-toolchain` (never-say-never
+/// 6.6.666 pins "1.14.0") was compiled with a toolchain nobody installed
+/// ("toolchain '1.14.0-x86_64-unknown-linux-gnu' is not installed").
+///
+/// The rule is cargo's own toolchain. The pin is real when `cargo` is a
+/// toolchain's own binary, which `env!("CARGO")` is under rustup (Cargo
+/// records its own executable). Where `cargo` is the rustup proxy, the rustc
+/// beside it is the proxy too and pins nothing; that case works because the
+/// proxy `cargo` exports `RUSTUP_TOOLCHAIN`. The pin overrides a `RUSTC`
+/// the caller set. Refused by name: a `cargo` that is not an absolute path
+/// (Buck passes the bare `cargo`), which names no toolchain directory, and
+/// a layout with no rustc beside `cargo` (a separately installed cargo),
+/// which before used whatever rustc PATH held. Validation never reaches
+/// this: it sets `HERMIT_PREPARED_NEXTEST_REQUIRED`, which
+/// `require_standalone` refuses.
+fn standalone_cargo(cargo: &str, repository: &Path) -> Result<Command, String> {
+    if !Path::new(cargo).is_absolute() {
+        return Err(format!(
+            "cannot pin the record workload build to the toolchain of {cargo}: not an absolute path, so it names no toolchain directory"
+        ));
+    }
+    let rustc = Path::new(cargo).with_file_name("rustc");
+    if !rustc.is_file() {
+        return Err(format!(
+            "cannot pin the record workload build to the toolchain of {cargo}: no rustc beside it at {}",
+            rustc.display()
+        ));
+    }
+    let mut command = Command::new(cargo);
+    command.current_dir(repository).env("RUSTC", rustc);
+    Ok(command)
+}
+
 /// Prepares the workloads outside the official producer, in a population
 /// under `build_root` that every test process of this target directory
 /// shares (<https://github.com/rrnewton/hermit/issues/3946>).
@@ -803,6 +842,16 @@ pub fn standalone(
     cargo: &str,
 ) -> Result<Vec<Workload>, BuildError> {
     require_standalone()?;
+    standalone_ungated(repository, build_root, cargo)
+}
+
+/// `standalone` past its `require_standalone` gate, so that a test can drive
+/// its Cargo commands with a stand-in `cargo`.
+fn standalone_ungated(
+    repository: &Path,
+    build_root: &Path,
+    cargo: &str,
+) -> Result<Vec<Workload>, BuildError> {
     fs::create_dir_all(build_root).map_err(|e| e.to_string())?;
     // Not the process id alone: tests that re-run themselves in a new PID
     // namespace are all pid 2 there, so two of them running at once named the
@@ -815,15 +864,13 @@ pub fn standalone(
     let logs = build_root.join(format!("{CARGO_LOGS_PREFIX}{}-{nanos}", std::process::id()));
     fs::create_dir_all(&logs).map_err(|e| e.to_string())?;
     let logs = Staging(logs);
-    let mut metadata = Command::new(cargo);
-    metadata
-        .current_dir(repository)
-        .args(["metadata", "--format-version=1", "--locked"]);
+    let mut metadata = standalone_cargo(cargo, repository)?;
+    metadata.args(["metadata", "--format-version=1", "--locked"]);
     let metadata: Value =
         serde_json::from_slice(&output(metadata, &logs.0.join("cargo-metadata"))?)
             .map_err(|e| e.to_string())?;
-    let mut build = Command::new(cargo);
-    build.current_dir(repository).args([
+    let mut build = standalone_cargo(cargo, repository)?;
+    build.args([
         "build",
         "--locked",
         "-p",
@@ -1066,6 +1113,64 @@ mod tests {
             let path = self.0.join(name);
             fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        }
+        /// A stand-in C compiler, for tests of how a population is shared,
+        /// rebuilt and pruned rather than of compiling, as `executable`
+        /// stands in for the Cargo-built guests. It answers exactly
+        /// `--version`, which the population key reads, with a fixed line,
+        /// and for exactly `C_FLAGS... SOURCE -o OUTPUT` it installs SOURCE as
+        /// an executable OUTPUT, so each workload costs one small process
+        /// instead of a compiler pipeline. Any other invocation fails and
+        /// names all of its arguments.
+        ///
+        /// The test executes this file, so this process never holds it open
+        /// for writing: a sibling test's spawn would inherit that descriptor
+        /// and the exec would fail with ETXTBSY (see
+        /// ci/manifest-plan/src/exec_safe_fs.rs, which the other test target
+        /// that includes this module does not have). The script is written
+        /// under a staging name, and an `install` child creates the
+        /// executable.
+        fn compiler(&self) -> PathBuf {
+            let flags = C_FLAGS
+                .iter()
+                .enumerate()
+                .map(|(index, flag)| format!("[ \"${{{}}}\" = '{flag}' ]", index + 1))
+                .collect::<Vec<_>>()
+                .join(" && ");
+            let script = format!(
+                "#!/bin/sh\n\
+                 if [ $# -eq 1 ] && [ \"$1\" = --version ]; then echo 'stand-in cc 1'; exit 0; fi\n\
+                 if [ $# -eq {total} ] && {flags} && [ \"${{{minus_o}}}\" = -o ]; then\n\
+                 exec install -m 755 -- \"${{{source}}}\" \"${{{output}}}\"\n\
+                 fi\n\
+                 echo \"stand-in cc: expected --version or {expected} SOURCE -o OUTPUT, got: $*\" >&2\n\
+                 exit 2\n",
+                total = C_FLAGS.len() + 3,
+                source = C_FLAGS.len() + 1,
+                minus_o = C_FLAGS.len() + 2,
+                output = C_FLAGS.len() + 3,
+                expected = C_FLAGS.join(" "),
+            );
+            self.installed("stand-in-cc", &script)
+        }
+        /// An executable `script` at `relative`, created by an `install`
+        /// child process rather than written by this process, so no thread
+        /// of this multi-threaded test process can hold it open for writing
+        /// when it is executed (ETXTBSY).
+        fn installed(&self, relative: &str, script: &str) -> PathBuf {
+            let path = self.0.join(relative);
+            let staging = self.0.join(format!("{relative}.staging"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&staging, script).unwrap();
+            let status = Command::new("install")
+                .args(["-m", "755", "-T", "--"])
+                .arg(&staging)
+                .arg(&path)
+                .status()
+                .unwrap();
+            assert!(status.success(), "install of {relative}: {status}");
+            fs::remove_file(&staging).unwrap();
             path
         }
         fn paths(&self) -> BTreeMap<String, PathBuf> {
@@ -1567,6 +1672,27 @@ mod tests {
         names
     }
 
+    /// How many threads of this process wait in flock(2) for the lock file
+    /// `path`: the "->" lines of /proc/locks with this process's pid and the
+    /// file's inode. The device field is not compared: on btrfs /proc/locks
+    /// names the filesystem's device while stat(2) names the subvolume's, as
+    /// `flock_waiter_on` in ci/manifest-plan/src/nextest_binaries.rs records.
+    fn flock_waiters_on(path: &Path) -> usize {
+        let inode = format!(":{}", fs::metadata(path).unwrap().ino());
+        let pid = std::process::id().to_string();
+        fs::read_to_string("/proc/locks")
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                fields.get(1) == Some(&"->")
+                    && fields.get(2) == Some(&"FLOCK")
+                    && fields.get(5) == Some(&pid.as_str())
+                    && fields.get(6).is_some_and(|file| file.ends_with(&inode))
+            })
+            .count()
+    }
+
     fn age(path: &Path, by: Duration) {
         let then = std::time::SystemTime::now() - by;
         for path in [path.to_owned(), path.join(ENVELOPE)] {
@@ -1580,6 +1706,13 @@ mod tests {
     /// test processes have, leave one population, built once; a source change
     /// makes a second; populations and legacy generations unused for
     /// `PRUNE_AFTER` are pruned (<https://github.com/rrnewton/hermit/issues/3946>).
+    /// Every build makes the whole population with the stand-in compiler
+    /// (`Fixture::compiler`), which installs each source as its executable.
+    /// The test holds the lock until both preparations wait for it, so they
+    /// always contend, however short a build is. The real compiler's failure
+    /// path is covered by
+    /// `real_c_compiler_failure_preserves_diagnostics_and_does_not_accept_stale_output`,
+    /// and a successful compile of all 50 real sources by every producer run.
     #[test]
     fn standalone_population_is_shared_across_processes_and_pruned() {
         let fixture = Fixture::new();
@@ -1599,7 +1732,9 @@ mod tests {
         fs::create_dir(&legacy_old).unwrap();
         fs::create_dir(&legacy_new).unwrap();
         age(&legacy_old, PRUNE_AFTER * 2);
-        let compiler = c_compiler().unwrap();
+        // The stand-in makes every C workload of the population at a small
+        // fraction of the real compiler's kernel and CPU cost.
+        let compiler = fixture.compiler();
         let inode = |path: &Path| fs::metadata(path).unwrap().ino();
         // Each workload's path and the inode it had when its preparation
         // returned: a rebuild replaces the files.
@@ -1614,9 +1749,28 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
+        // Hold the preparation lock while both preparations start, and
+        // release it only once /proc/locks shows both of them waiting for it.
+        let lock_path = build_root.join("lock");
         let both = std::thread::scope(|scope| {
+            let held = fs::File::create(&lock_path).unwrap();
+            held.lock().unwrap();
             let first = scope.spawn(prepare);
             let second = scope.spawn(prepare);
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while flock_waiters_on(&lock_path) < 2 {
+                assert!(
+                    !first.is_finished() && !second.is_finished(),
+                    "a preparation finished while the test held the lock"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the two preparations did not both wait for the lock within 60 s"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // Closing the descriptor releases the lock.
+            drop(held);
             [first.join().unwrap(), second.join().unwrap()]
         });
         let populations = directories(&build_root)
@@ -1701,6 +1855,95 @@ mod tests {
         assert_eq!(
             fs::read_to_string(fixture.0.join("c_getpid.status")).unwrap(),
             "1"
+        );
+    }
+
+    /// `standalone_cargo`'s command carries RUSTC naming the rustc beside an
+    /// absolute `cargo`: a stand-in `cargo`, run with RUSTUP_TOOLCHAIN
+    /// removed from its environment, prints the RUSTC it receives. That both
+    /// of `standalone`'s commands are built this way is
+    /// `standalone_runs_both_cargo_commands_pinned`.
+    #[test]
+    fn standalone_cargo_pins_the_rustc_beside_cargo() {
+        let fixture = Fixture::new();
+        let cargo = fixture.installed("toolchain/bin/cargo", "#!/bin/sh\nprintf '%s' \"$RUSTC\"\n");
+        let rustc = fixture.installed("toolchain/bin/rustc", "#!/bin/sh\nexit 0\n");
+        let output = standalone_cargo(cargo.to_str().unwrap(), &fixture.0)
+            .unwrap()
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "stand-in cargo: {output:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            rustc.to_str().unwrap()
+        );
+    }
+
+    /// A `cargo` with no rustc beside it cannot be pinned, and
+    /// `standalone_cargo` refuses it by name rather than letting PATH choose
+    /// a rustc.
+    #[test]
+    fn standalone_cargo_refuses_a_cargo_without_rustc_beside_it() {
+        let fixture = Fixture::new();
+        let cargo = fixture.installed("lonely/bin/cargo", "#!/bin/sh\nexit 0\n");
+        let error = standalone_cargo(cargo.to_str().unwrap(), &fixture.0).unwrap_err();
+        let expected = fixture.0.join("lonely/bin/rustc");
+        assert!(
+            error.contains(expected.to_str().unwrap()),
+            "the refusal names the missing rustc: {error}"
+        );
+    }
+
+    /// A `cargo` that is not an absolute path (Buck passes the bare
+    /// `cargo`) names no toolchain directory to take rustc from, so
+    /// `standalone_cargo` refuses it for that reason, whatever files the
+    /// working directory holds.
+    #[test]
+    fn standalone_cargo_refuses_a_cargo_that_is_not_an_absolute_path() {
+        for cargo in ["cargo", "toolchain/bin/cargo"] {
+            let error = standalone_cargo(cargo, Path::new("/")).unwrap_err();
+            assert!(
+                error.contains("not an absolute path"),
+                "{cargo}: the refusal names the reason: {error}"
+            );
+        }
+    }
+
+    /// Both of `standalone`'s Cargo commands (`cargo metadata`, then `cargo
+    /// build`) carry the pinned RUSTC. The stand-in `cargo` records
+    /// "<subcommand> <RUSTC>", answers `metadata` with an empty JSON object
+    /// and fails `build`, which ends the preparation before anything is
+    /// compiled.
+    #[test]
+    fn standalone_runs_both_cargo_commands_pinned() {
+        let fixture = Fixture::new();
+        let calls = fixture.0.join("calls");
+        let cargo = fixture.installed(
+            "toolchain/bin/cargo",
+            &format!(
+                "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$RUSTC\" >> '{}'\n\
+                 if [ \"$1\" = metadata ]; then printf '{{}}'; exit 0; fi\nexit 1\n",
+                calls.display()
+            ),
+        );
+        let rustc = fixture.installed("toolchain/bin/rustc", "#!/bin/sh\nexit 0\n");
+        let error = standalone_ungated(
+            &fixture.0,
+            &fixture.0.join("build-root"),
+            cargo.to_str().unwrap(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("record workload compilation failed"),
+            "the stand-in build fails: {error}"
+        );
+        let rustc = rustc.to_str().unwrap();
+        assert_eq!(
+            fs::read_to_string(&calls).unwrap(),
+            format!("metadata {rustc}\nbuild {rustc}\n")
         );
     }
 }

@@ -38,15 +38,30 @@ MANIFEST=target/validate/harvested-files.json
 # DotSlash cache's extracted binary. Refuse if none exists.
 if [[ -n ${HERMIT_VALIDATE_BUCK2:-} ]]; then
   BUCK2=$HERMIT_VALIDATE_BUCK2
+  BUCK2_CHOSEN_BY=HERMIT_VALIDATE_BUCK2
 elif command -v buck2 >/dev/null 2>&1 && buck2 --version >/dev/null 2>&1; then
-  BUCK2=buck2
+  BUCK2=$(command -v buck2)
+  BUCK2_CHOSEN_BY=PATH
 else
   BUCK2=$(find "$HOME/.cache/dotslash" -maxdepth 4 -name 'buck2-*-unknown-linux-*' -type f 2>/dev/null | sort | tail -n 1)
+  BUCK2_CHOSEN_BY=dotslash-cache
   if [[ -z $BUCK2 ]]; then
     echo "harvest-reverie-buck: no usable buck2 (set HERMIT_VALIDATE_BUCK2)" >&2
     exit 2
   fi
 fi
+
+# Measure this node's Buck build (ci/buck-e2e/buck-measure.sh): which buck2 ran and how it was
+# chosen, where its daemon ran, the bootstraps' CPU, every action's execution kind and the outputs'
+# sha256. Record only: a failed measurement costs the sidecar, never the node, and it starts or
+# stops no daemon. The measurement fits inside this node's own 600 s wall and 600 CPU-s: it does
+# not walk buck-out (a slow walk on a loaded host could spend the node's budget, so the sidecar
+# records buck-out as not measured by this node), the placement read is capped at 10 s and the
+# sidecar write at 60 s. With buck_measure_start's 30 s version read and the 1 s grace that
+# `timeout -k 1` gives each bounded command, that is at most about 103 s of the 600.
+# shellcheck source-path=SCRIPTDIR source=buck-e2e/buck-measure.sh
+source ci/buck-e2e/buck-measure.sh
+buck_measure_start build.reverie_buck "$BUCK2" "$BUCK2_CHOSEN_BY"
 
 # target| harvested name (the Cargo test-binary stem)
 TARGETS=(
@@ -68,7 +83,7 @@ stamp_file=shim/third-party/rust/vendor/.stamp
 vendored_key=$(./bootstrap/rust-deps-cache-key.rs . 2>/dev/null) && key_rc=0 || key_rc=$?
 if [[ $key_rc -ne 0 || ! -f shim/third-party/rust/BUCK || ! -f $stamp_file ||
       $(cat "$stamp_file" 2>/dev/null) != "$vendored_key" ]]; then
-  ./bootstrap/regenerate-rust-deps
+  buck_measure_bootstrap regenerate-rust-deps ./bootstrap/regenerate-rust-deps
   if [[ $key_rc -eq 0 ]]; then
     stamp_tmp=$(mktemp shim/third-party/rust/vendor/.stamp.XXXXXX)
     printf '%s\n' "$vendored_key" >"$stamp_tmp"
@@ -88,6 +103,8 @@ find target/validate/buck-harvest -maxdepth 1 -type f -delete
 # from retained evidence instead of cache-byte deltas; overwritten per run.
 BUILD_LOG=target/validate/buck-harvest-build.log
 : > "$BUILD_LOG"
+# The build's --show-output lines, appended to the log below; overwritten per run.
+SHOW_OUTPUT=target/validate/buck-harvest-show-output.txt
 
 BUCK_TARGETS=()
 for entry in "${TARGETS[@]}"; do
@@ -97,13 +114,18 @@ done
 # Build against the pinned root's sysroot input so the binaries carry the
 # nix RUNPATH their Cargo twins carry and execute where prepare lists them
 # (inside the pinned root). A digest drift refuses in the staging script.
-bash shim/modes/stage-pinned-sysroot
+buck_measure_bootstrap stage-pinned-sysroot bash shim/modes/stage-pinned-sysroot
 echo "harvest-reverie-buck: building ${#BUCK_TARGETS[@]} detcore targets with $BUCK2" >&2
-"$BUCK2" build -c hermit.rust_sysroot=pinned-rust-sysroot --show-output "${BUCK_TARGETS[@]}" > "$BUILD_LOG" 2>&1 || {
+build_rc=0
+buck_measure_build "$SHOW_OUTPUT" -c hermit.rust_sysroot=pinned-rust-sysroot "${BUCK_TARGETS[@]}" 2>"$BUILD_LOG" || build_rc=$?
+cat -- "$SHOW_OUTPUT" >>"$BUILD_LOG"
+buck_measure_daemon 10
+buck_measure_write 60
+if ((build_rc != 0)); then
   tail -n 30 "$BUILD_LOG" >&2
   echo "harvest-reverie-buck: buck build failed (log retained at $BUILD_LOG)" >&2
   exit 2
-}
+fi
 # Surface the build's own cache counters in this node's log; the full log
 # stays at $BUILD_LOG for anything the summary lines do not carry.
 grep -E 'Cache hits|Jobs completed|BUILD (SUCCEEDED|FAILED)|Network:' "$BUILD_LOG" >&2 || true

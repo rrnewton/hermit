@@ -161,6 +161,41 @@ fn validate_kernel_sigset_size(sigsetsize: usize) -> Result<(), Errno> {
     }
 }
 
+/// The pending word in the first `prefix.len()` bytes the kernel wrote for
+/// an `rt_sigpending` with a short `sigsetsize`: the little-endian low
+/// bytes, zero above the prefix. Bytes past the prefix are never read, so a
+/// short buffer at a page end cannot fault here where Linux succeeded.
+fn kernel_sigset_from_prefix(prefix: &[u8]) -> KernelSigset {
+    let mut bytes = [0u8; KERNEL_SIGSET_SIZE];
+    let take = prefix.len().min(KERNEL_SIGSET_SIZE);
+    bytes[..take].copy_from_slice(&prefix[..take]);
+    KernelSigset::from_le_bytes(bytes)
+}
+
+/// The bytes a corrected `rt_sigpending` word may write back: at most the
+/// `min(sigsetsize, 8)` bytes the kernel wrote, never past them.
+fn sigpending_corrected_bytes(kept: KernelSigset, sigsetsize: usize) -> Vec<u8> {
+    kept.to_le_bytes()[..sigsetsize.min(KERNEL_SIGSET_SIZE)].to_vec()
+}
+
+/// The set `rt_sigpending` reports: `after_discard`, the kernel-reported
+/// `reported` with each copy Linux discarded at send subtracted, plus every
+/// timer-queued signal it reported. Linux queues a POSIX timer's expiry
+/// (`posix_timer_queue_signal` -> `posixtimer_send_sigqueue`) and
+/// `do_sigpending` reports the queued set without asking whether a dequeue
+/// would deliver the entry,
+/// so a timer entry stays pending even once stale (re-armed far, disarmed
+/// or deleted: `timer_coalesce.c` `stale_*`), and even when its physical
+/// copy stands on one Linux discarded. Only signals the kernel reported
+/// can be restored; a timer entry invents nothing.
+fn sigpending_kept(
+    reported: KernelSigset,
+    after_discard: KernelSigset,
+    timer_queued: KernelSigset,
+) -> KernelSigset {
+    after_discard | (reported & timer_queued)
+}
+
 /// The mask Linux installs when a call names `mask` as the signal mask to sleep
 /// under (`rt_sigsuspend`, `ppoll`, `pselect6`): `set_current_blocked` drops
 /// `SIGKILL` and `SIGSTOP`, which can never be blocked.
@@ -995,6 +1030,13 @@ fn self_sigkill_targets_current_task(
         && (target_process.is_some() || target_thread.is_some())
         && target_process.is_none_or(|target| target == current_process)
         && target_thread.is_none_or(|target| target == current_thread)
+}
+
+/// The validated timeout of an `rt_sigtimedwait` call: Linux rejects a
+/// negative second or nanosecond count, or a nanosecond count at or
+/// above one second, with EINVAL (`do_sigtimedwait`'s timespec check).
+fn sigtimedwait_timeout_duration(ts: Timespec) -> Result<Duration, Errno> {
+    crate::syscalls::io::ppoll_timeout_duration(ts)
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -2161,28 +2203,38 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let dettid = guest.thread_state().dettid;
 
-        let ns_delta = if let Some(timeout) = call.timeout() {
-            let ts: Timespec = guest.memory().read_value(timeout)?;
-            Some(Duration::from_secs(ts.tv_sec as u64) + Duration::from_nanos(ts.tv_nsec as u64))
-        } else {
-            None
-        };
         let mut rsrc = Resources::new(dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("rt_sigtimedwait");
         // While it polls, a signal in the set is taken at the next poll
         // whatever the thread's mask, which a process-directed signal another
         // thread sends must account for
-        // (`Scheduler::own_process_signal_inputs`). An unreadable set fails in
-        // the kernel at the first poll.
+        // (`Scheduler::own_process_signal_inputs`). Linux copies the set
+        // before validating the timeout (measured natively: bad set plus
+        // invalid timeout gives EFAULT, not EINVAL), so a set fault is
+        // returned here, ahead of the timeout check below.
         let waited = match call.set() {
             Some(set) => match read_kernel_sigset(guest, set.into()).await {
                 Err(error @ Error::Errno(Errno::ERESTARTSYS)) => {
                     return restart_if_first_probe_not_run(Err(error));
                 }
+                Err(error @ Error::Errno(Errno::EFAULT)) => {
+                    return Err(error);
+                }
                 read => read.ok(),
             },
-            None => None,
+            // A NULL set faults the kernel's copy_from_user, like
+            // handle_rt_sigsuspend's NULL-mask case.
+            None => return Err(Errno::EFAULT.into()),
+        };
+        let ns_delta = if let Some(timeout) = call.timeout() {
+            let ts: Timespec = guest.memory().read_value(timeout)?;
+            // Linux returns EINVAL for an invalid timeout
+            // (kernel/signal.c do_sigtimedwait); unchecked casts panicked
+            // Detcore on the Duration addition for e.g. {-1, 1_000_000_000}.
+            Some(sigtimedwait_timeout_duration(ts)?)
+        } else {
+            None
         };
         // After the set's probe, the call's first injection: observing the
         // virtual clock asks the scheduler, which a restart would repeat.
@@ -3015,8 +3067,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Linux sends the signal to each process in the set
     /// (`__kill_pgrp_info`, `kill_something_info` in kernel/signal.c), and each
     /// process then picks its receiving thread as a process-directed signal
-    /// does. Detcore models neither the set's membership nor that choice, so
-    /// the call goes through the unsupported-operation policy: a fail-closed
+    /// does. Detcore models process-group membership but does not yet deliver
+    /// the signal to each process in the set
+    /// (https://github.com/facebookexperimental/hermit/issues/429), so the
+    /// call goes through the unsupported-operation policy: a fail-closed
     /// run stops with the policy-refusal status and
     /// `--allow-unsupported-syscalls` returns ENOSYS, as the call did before.
     /// A SIGKILL to another group is forwarded before this point
@@ -3037,8 +3091,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             pid => format!("process group {}", pid.unsigned_abs()),
         };
         let reason = if guest.config().sequentialize_threads {
-            "Detcore does not model process-group membership or each process's receiving \
-             thread (https://github.com/rrnewton/hermit/issues/4046)"
+            "Detcore models process-group membership but does not yet deliver this signal to \
+             each process in the set (https://github.com/facebookexperimental/hermit/issues/429)"
         } else {
             "with threads not sequentialized (--no-sequentialize-threads, --strace-only) it \
              would go to the host kernel as is, and the guest's process group is inherited from \
@@ -5378,7 +5432,57 @@ impl<T: RecordOrReplay> Detcore<T> {
         // queued (https://github.com/rrnewton/hermit/issues/4089).
         let pending = pending_real_time_among(guest, REAL_TIME_SIGNALS).await;
         act_on_pending_real_time(guest, pending, REAL_TIME_SIGNALS, 0).await;
-        Ok(self.record_or_replay(guest, call).await?)
+        let result = self.record_or_replay(guest, call).await?;
+        // Linux never queues a copy it discarded when the signal was sent
+        // (`sig_ignored`, kernel/signal.c), so `do_sigpending`'s union of
+        // the private and shared queues cannot contain one. Under ptrace
+        // the host kernel queues such a copy for the tracer anyway, so
+        // subtract the discarded-at-send record from the set the kernel
+        // just wrote, per queue as every other pending check does
+        // (`threads::without_discarded`,
+        // https://github.com/rrnewton/hermit/issues/4293). Only where the
+        // record is kept; elsewhere the kernel's answer stands.
+        // Linux copies only `sigsetsize` bytes (0..=8 succeeds), so the
+        // correction reads and writes back at most that prefix; a size-0
+        // call touches nothing and is skipped entirely.
+        let written = call.sigsetsize().min(KERNEL_SIGSET_SIZE);
+        if result == 0
+            && written > 0
+            && crate::scheduler::discarded_at_send::records(guest.config())
+            && let Some(set) = call.set()
+        {
+            let out = AddrMut::<u8>::from_raw(set.as_raw()).ok_or(Errno::EFAULT)?;
+            let mut prefix = vec![0u8; written];
+            guest.memory().read_exact(out, &mut prefix)?;
+            let reported = kernel_sigset_from_prefix(&prefix);
+            if reported & crate::scheduler::discarded_at_send::STANDARD_SIGNALS != 0 {
+                let state = crate::syscalls::read_guest_wait_signal_state(guest)?;
+                let after_discard =
+                    crate::syscalls::threads::without_discarded(guest, &state, reported, 0).await;
+                // A POSIX timer's queued entry is pending here even when
+                // the discarded record subtracts it for dequeue decisions:
+                // its entry may be stale, or stand on a discarded copy,
+                // and `do_sigpending` reports the queue either way
+                // (`sigpending_kept`). Other pending checks keep the
+                // subtraction unchanged.
+                let timer_queued = match crate::tool_global::discarded_signal(
+                    guest,
+                    DiscardedSignalControl::TimerQueued,
+                )
+                .await
+                {
+                    DiscardedSignalAnswer::Bits { thread, process } => thread | process,
+                    _ => unreachable!(),
+                };
+                let kept = sigpending_kept(reported, after_discard, timer_queued);
+                if kept != reported {
+                    guest
+                        .memory()
+                        .write_exact(out, &sigpending_corrected_bytes(kept, written))?;
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// A delivered signal may run a handler, whose return restores, through an
@@ -7151,6 +7255,43 @@ mod tests {
         assert!(matches!(restart(Ok(7)), Ok(7)));
     }
 
+    /// rt_sigtimedwait rejects an invalid timeout with EINVAL as Linux
+    /// does. The old unchecked conversion turned {-1, 1_000_000_000} into
+    /// a huge Duration and panicked on the Duration addition
+    /// (`from_secs + from_nanos` overflowed); the virtual-clock addition
+    /// saturates and never panics.
+    #[test]
+    fn sigtimedwait_timeout_rejects_invalid_timespecs() {
+        assert_eq!(
+            sigtimedwait_timeout_duration(Timespec {
+                tv_sec: -1,
+                tv_nsec: 1_000_000_000,
+            }),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            sigtimedwait_timeout_duration(Timespec {
+                tv_sec: 0,
+                tv_nsec: -1,
+            }),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            sigtimedwait_timeout_duration(Timespec {
+                tv_sec: 1,
+                tv_nsec: 500,
+            }),
+            Ok(Duration::new(1, 500))
+        );
+        assert_eq!(
+            sigtimedwait_timeout_duration(Timespec {
+                tv_sec: i64::MAX,
+                tv_nsec: 999_999_999,
+            }),
+            Ok(Duration::new(i64::MAX as u64, 999_999_999))
+        );
+    }
+
     /// A reserved send names the caller's own process by its ids when it names
     /// the calling thread, the process's id, or the process as the thread
     /// group; any other id needs a lookup (A5 step 3c slice 0a).
@@ -7537,6 +7678,36 @@ mod tests {
         assert_eq!(validate_kernel_sigset_size(7), Err(Errno::EINVAL));
         assert_eq!(validate_kernel_sigset_size(8), Ok(()));
         assert_eq!(validate_kernel_sigset_size(16), Err(Errno::EINVAL));
+    }
+
+    #[test]
+    fn sigpending_correction_is_bounded_to_the_kernel_written_prefix() {
+        // SIGURG (23) is byte 2, bit 6 of the little-endian word.
+        let urg = 1_u64 << (libc::SIGURG - 1);
+        assert_eq!(kernel_sigset_from_prefix(&urg.to_le_bytes()[..4]), urg);
+        assert_eq!(kernel_sigset_from_prefix(&urg.to_le_bytes()[..2]), 0);
+        assert_eq!(kernel_sigset_from_prefix(&[]), 0);
+        // Clearing the word writes only the prefix; size 0 writes nothing.
+        assert_eq!(sigpending_corrected_bytes(0, 4), vec![0u8; 4]);
+        assert_eq!(sigpending_corrected_bytes(0, 0), Vec::<u8>::new());
+        assert_eq!(sigpending_corrected_bytes(u64::MAX, 9), vec![0xffu8; 8]);
+    }
+
+    #[test]
+    fn sigpending_keeps_timer_queued_signals_but_drops_discarded_standard_ones() {
+        let usr1 = 1_u64 << (libc::SIGUSR1 - 1);
+        let usr2 = 1_u64 << (libc::SIGUSR2 - 1);
+        // Both pending and subtracted as discarded: only the timer-queued
+        // one (USR1, stale_far_handler) stays pending, as Linux reports a
+        // queued POSIX timer entry in do_sigpending even when a dequeue
+        // would skip it as stale.
+        assert_eq!(sigpending_kept(usr1 | usr2, 0, usr1), usr1);
+        // No timer entry: the discarded-at-send subtraction stands.
+        assert_eq!(sigpending_kept(usr1 | usr2, 0, 0), 0);
+        // A timer entry never invents a signal the kernel did not report.
+        assert_eq!(sigpending_kept(usr2, 0, usr1), 0);
+        // A kept copy stays whether or not it is timer-queued.
+        assert_eq!(sigpending_kept(usr1 | usr2, usr2, usr1), usr1 | usr2);
     }
 
     #[test]

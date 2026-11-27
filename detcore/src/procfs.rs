@@ -17,6 +17,7 @@ use chrono::DateTime;
 use chrono::Utc;
 use detcore_model::config::MountInfoRootRewrite;
 use detcore_model::procfs::Bitmap;
+use detcore_model::procfs::Fdinfo;
 use detcore_model::procfs::FdinfoKind;
 use detcore_model::procfs::MOUNT_PEER_PREFIXES;
 use detcore_model::procfs::MountInfoRow;
@@ -1493,6 +1494,14 @@ pub(crate) struct ProcfsFile {
     #[serde(default)]
     rendered_from_memory_map: bool,
     target_fd: Option<i32>,
+    /// For an `fdinfo`, whose descriptor table its path names
+    /// ([`FdinfoOwner`]); `None` for every other file.
+    #[serde(default)]
+    fdinfo_owner: Option<FdinfoOwner>,
+    /// For an `fdinfo`, the task whose table it shows, bound at its open
+    /// ([`ProcfsFile::bind_fdinfo_table`]); `None` where none was bound.
+    #[serde(default)]
+    fdinfo_table: Option<FdinfoTable>,
     bound_thread_identity: Option<(i32, i32, i32)>,
     /// For a task's `schedstat`, the task it describes, found when it was
     /// opened ([`ProcfsFile::bind_schedstat_thread`]); `None` where none was.
@@ -1989,6 +1998,45 @@ pub(crate) struct ProcfsSnapshotContext {
     /// (`procfs::fdinfo::render`). Built by the caller, from the descriptor's
     /// state at this read (`Detcore::render_own_fdinfo`).
     pub(crate) fdinfo_rendering: Option<Vec<u8>>,
+    /// For a descriptor's fdinfo the kernel printed with `lock:` lines, what
+    /// those lines show in place of the host's values ([`FdinfoLockLines`]).
+    /// Built by the caller, which asks Detcore's global state. `None` refuses
+    /// any lock line by name, which only a snapshot without the caller's
+    /// account of them, or a unit test, gives.
+    pub(crate) fdinfo_locks: Option<FdinfoLockLines>,
+}
+
+/// What the `lock:` lines of a descriptor's fdinfo the kernel printed show
+/// to the guest. The kernel lists the locks held through the descriptor's
+/// open file description, in an order the guest's own calls decide
+/// (`show_fd_locks` in fs/locks.c), and the sanitizer keeps each line and
+/// that order, with three host values replaced: the owner (`owners`), the
+/// device (`device`) and the inode (the fdinfo's own virtual inode, which
+/// every line names: `__show_fd_locks` lists only locks taken through this
+/// description, so on its file). Of those it lists only the ones the shown
+/// table or the description owns, skipping a lock whose `flc_owner` is
+/// neither the shown task's `files_struct` nor the file: every OFD lock,
+/// flock and lease, and only the POSIX locks the shown table took. So a
+/// fdinfo's POSIX lines are its table's, which is why only a fdinfo of the
+/// reader's own table is accounted for (`Detcore::kernel_fdinfo_locks`).
+///
+/// ⚠️ BUILT BY THE CALLER, NEVER HERE, as `ProcfsSnapshotContext::
+/// mapping_identities` is: the owners come from Detcore's lock ledger, its
+/// flock model and its process table (`LockLedger::fdinfo_owners`), and the
+/// device from the pool `stat` determinizes devices through
+/// (`Detcore::lock_line_device`), none of which a pure sanitizer can reach.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FdinfoLockLines {
+    /// The kernel's `lock:` lines the caller decided on, in order
+    /// (`locks::fdinfo_lock_rows` of the same snapshot): the sanitizer serves
+    /// owners only for exactly these lines.
+    pub(crate) rows: Vec<locks::LockRowFacts>,
+    /// The owner each line shows, in order, or why Detcore cannot serve the
+    /// lines, for which the read is refused by name.
+    pub(crate) owners: Result<Vec<i64>, String>,
+    /// The device major and minor every line's object shows: the file's
+    /// device as the guest's `stat` numbers it.
+    pub(crate) device: (u32, u32),
 }
 
 impl ProcfsFile {
@@ -2166,7 +2214,9 @@ impl ProcfsFile {
         };
         let task = Self::per_process_name_of(&kind)
             .and_then(|filename| ProcfsTask::parse(task_path, filename));
-        Some(Self::of_kind(kind, task, target_fd))
+        let mut file = Self::of_kind(kind, task, target_fd);
+        file.fdinfo_owner = target_fd.and_then(|_| parse_fdinfo_owner(path_text));
+        Some(file)
     }
 
     /// A device's NUMA attribute the kernel opened, which reads `file`'s
@@ -2186,6 +2236,8 @@ impl ProcfsFile {
             memory_map: None,
             rendered_from_memory_map: false,
             target_fd,
+            fdinfo_owner: None,
+            fdinfo_table: None,
             bound_thread_identity: None,
             schedstat_thread: None,
             timer_slack_identity: None,
@@ -3354,6 +3406,7 @@ impl ProcfsFile {
             task_stat,
             task_status,
             fdinfo_rendering,
+            fdinfo_locks,
         } = context;
         // Linux prints a task's `Cpus_allowed` with `nr_cpu_ids` bits.
         let cpus_allowed = cpus_allowed.map(|cpus| (cpus, machine.cpus));
@@ -3506,7 +3559,7 @@ impl ProcfsFile {
                 &mut sanitize_refusal,
             ),
             ProcfsKind::Fdinfo => checked_or_refusal(
-                sanitize_fdinfo_checked(&contents, fdinfo_identity),
+                sanitize_fdinfo_checked(&contents, fdinfo_identity, fdinfo_locks.as_ref()),
                 &mut sanitize_refusal,
             ),
             ProcfsKind::NumaMaps => sanitize_numa_maps(&contents),
@@ -3561,13 +3614,19 @@ impl ProcfsFile {
             ProcfsKind::BtrfsBytesReserved => sanitize_btrfs_bytes_reserved(&contents),
             ProcfsKind::BtrfsBytesPinned => sanitize_btrfs_bytes_pinned(&contents),
             ProcfsKind::Rtc => sanitize_rtc(&contents, virtual_realtime_seconds),
-            ProcfsKind::NetlinkSockets => sanitize_netlink_sockets(&contents),
+            ProcfsKind::NetlinkSockets => checked_or_refusal(
+                sanitize_netlink_sockets_checked(&contents),
+                &mut sanitize_refusal,
+            ),
             ProcfsKind::Locks => {
                 sanitize_locks(&locks::keep_lock_rows(&contents, lock_rows_kept.as_deref()))
             }
             ProcfsKind::NodeVmstat => sanitize_node_vmstat(&contents),
             ProcfsKind::CppcFeedback => sanitize_cppc_feedback(&contents),
-            ProcfsKind::UnixSockets => sanitize_unix_sockets(&contents),
+            ProcfsKind::UnixSockets => checked_or_refusal(
+                sanitize_unix_sockets_checked(&contents),
+                &mut sanitize_refusal,
+            ),
             ProcfsKind::InetSockets => sanitize_inet_sockets(&contents),
             ProcfsKind::BtrfsCommitStats => sanitize_btrfs_commit_stats(&contents),
             ProcfsKind::SysfsRtcDate | ProcfsKind::SysfsRtcTime | ProcfsKind::SysfsRtcEpoch => {
@@ -3808,6 +3867,69 @@ impl ProcfsFile {
     pub(crate) fn target_fd(&self) -> Option<i32> {
         self.target_fd.filter(|_| !self.rendered)
     }
+
+    /// For an `fdinfo`, whose descriptor table its path names
+    /// ([`FdinfoOwner`]).
+    pub(crate) fn fdinfo_owner(&self) -> Option<FdinfoOwner> {
+        self.fdinfo_owner
+    }
+
+    /// Bind an `fdinfo` to the task its path named at this open, for an
+    /// opener that is thread `tid` of process `pid` (`opener`, in Detcore's
+    /// numbers), as the kernel resolves `self` and `thread-self` at the open
+    /// ([`FdinfoTable`]). `None` where the opener's numbers are not the
+    /// path's (a nested PID namespace, a file not classified by its spelling,
+    /// or a spelling the walk did not follow): nothing is bound, and the
+    /// read gets no lock-line account (`fdinfo_names_callers_table` in
+    /// syscalls/files.rs says what it shows instead).
+    pub(crate) fn bind_fdinfo_table(&mut self, opener: Option<(i32, i32)>) {
+        self.fdinfo_table = self
+            .fdinfo_owner
+            .zip(opener)
+            .map(|(owner, (pid, tid))| owner.resolve(pid, tid));
+    }
+
+    /// For an `fdinfo`, the task whose table it shows, as its open bound it
+    /// ([`ProcfsFile::bind_fdinfo_table`]).
+    pub(crate) fn fdinfo_table(&self) -> Option<FdinfoTable> {
+        self.fdinfo_table
+    }
+
+    /// Keep an `fdinfo`'s binding only if `opened`, the link of the
+    /// descriptor the kernel's open returned, names the same task by number
+    /// and the same descriptor: `/proc/<pid>/fdinfo/<fd>` names the process,
+    /// and `/proc/<pid>/task/<tid>/fdinfo/<fd>` the thread. The kernel prints
+    /// that link from the file it opened (`d_path`), whatever the spelling
+    /// was, so it names the task whose table the file shows
+    /// (`seq_fdinfo_open`) and the descriptor it describes. Any other link,
+    /// or none, unbinds: the read's lock lines are then refused by name
+    /// (`sanitize_fdinfo_checked`).
+    pub(crate) fn confirm_fdinfo_table(&mut self, opened: Option<&Path>) {
+        let opened = opened.and_then(Path::to_str);
+        let named = opened
+            .and_then(parse_fdinfo_owner)
+            .and_then(|owner| match owner {
+                FdinfoOwner::Process(process) => Some(FdinfoTable {
+                    process,
+                    thread: None,
+                }),
+                FdinfoOwner::Thread {
+                    process: Some(process),
+                    thread,
+                } => Some(FdinfoTable {
+                    process,
+                    thread: Some(thread),
+                }),
+                // A link names its task by number, never by a selector.
+                FdinfoOwner::SelfProcess
+                | FdinfoOwner::ThreadSelf
+                | FdinfoOwner::Thread { process: None, .. } => None,
+            });
+        let same_descriptor = opened.and_then(parse_fdinfo_target) == self.target_fd;
+        if self.fdinfo_table.is_some() && (named != self.fdinfo_table || !same_descriptor) {
+            self.fdinfo_table = None;
+        }
+    }
 }
 
 /// The task a `/proc/<pid>[/task/<tid>]/fdinfo/<name>` spelling (with `self`
@@ -3876,6 +3998,81 @@ fn parse_timer_slack_target(path: &str) -> Option<Option<i32>> {
     }
     let target = task.parse::<i32>().ok().filter(|target| *target > 0)?;
     Some(Some(target))
+}
+
+/// Whose descriptor table a `/proc/.../fdinfo/<fd>` path names, as its
+/// spelling says once `..` is resolved: the opener's process (`self`), the
+/// opener's thread (`thread-self`), a process's by its number, or a thread's
+/// by its number below a process (`self` or a number, `None` for `self`).
+/// The kernel resolves the spelling when the file is opened and keeps that
+/// task's inode (`seq_fdinfo_open`, fs/proc/fd.c), so the file shows that
+/// task's table to whoever reads it later ([`FdinfoTable`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum FdinfoOwner {
+    SelfProcess,
+    ThreadSelf,
+    Process(i32),
+    Thread { process: Option<i32>, thread: i32 },
+}
+
+/// The task whose descriptor table an opened fdinfo shows, resolved at its
+/// open from the path's spelling ([`FdinfoOwner`]) and the opener's
+/// numbers: a process, or a thread of one. It stays with the open file
+/// description, through a fork and a descriptor's transfer, as the kernel's
+/// file keeps its inode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct FdinfoTable {
+    pub(crate) process: i32,
+    pub(crate) thread: Option<i32>,
+}
+
+impl FdinfoOwner {
+    /// The task this spelling names for an opener that is thread `tid` of
+    /// process `pid`.
+    fn resolve(self, pid: i32, tid: i32) -> FdinfoTable {
+        match self {
+            Self::SelfProcess => FdinfoTable {
+                process: pid,
+                thread: None,
+            },
+            Self::ThreadSelf => FdinfoTable {
+                process: pid,
+                thread: Some(tid),
+            },
+            Self::Process(process) => FdinfoTable {
+                process,
+                thread: None,
+            },
+            Self::Thread { process, thread } => FdinfoTable {
+                process: process.unwrap_or(pid),
+                thread: Some(thread),
+            },
+        }
+    }
+}
+
+fn parse_fdinfo_owner(path: &str) -> Option<FdinfoOwner> {
+    let relative = path.strip_prefix("/proc/")?;
+    match relative.split('/').collect::<Vec<_>>().as_slice() {
+        ["self", "fdinfo", _] => Some(FdinfoOwner::SelfProcess),
+        ["thread-self", "fdinfo", _] => Some(FdinfoOwner::ThreadSelf),
+        [process, "fdinfo", _] if is_numeric_id(process) => {
+            Some(FdinfoOwner::Process(process.parse().ok()?))
+        }
+        [process, "task", thread, "fdinfo", _]
+            if is_proc_process_name(process) && is_numeric_id(thread) =>
+        {
+            let process = match *process {
+                "self" => None,
+                number => Some(number.parse().ok()?),
+            };
+            Some(FdinfoOwner::Thread {
+                process,
+                thread: thread.parse().ok()?,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn parse_fdinfo_target(path: &str) -> Option<i32> {
@@ -4173,11 +4370,41 @@ fn cpu_backlink_directory(directory: &Path) -> bool {
     })
 }
 
+/// The CPUs the machine Detcore presents has in sysfs: how many, and whether
+/// each has a `cache` directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SysfsCpus {
+    /// How many CPUs (`Config::virtual_cpu_count`): `cpuN` for each N below.
+    pub(crate) count: u32,
+    /// Whether each CPU has its `cache` directory. On a GenuineIntel CPU
+    /// Linux builds that directory from CPUID leaf 4 alone
+    /// (`populate_cache_leaves`), and a CPU whose leaf 4 lists no cache has
+    /// none: `init_cache_level` is -ENOENT for zero leaves
+    /// (arch/x86/kernel/cpu/cacheinfo.c in v7.3). False where Detcore
+    /// answers the guest's CPUID instruction from a virtual table, which
+    /// lists none (`Detcore::sysfs_cpus`).
+    pub(crate) caches: bool,
+}
+
+#[cfg(test)]
+impl SysfsCpus {
+    /// `count` CPUs, each with the host's `cache` directory.
+    pub(crate) fn with_caches(count: u32) -> Self {
+        Self {
+            count,
+            caches: true,
+        }
+    }
+}
+
 /// Whether `name`, an entry of the directory at the canonical path
 /// `directory`, is absent from the machine Detcore presents: a CPU or
-/// cpufreq policy numbered `cpus` or more, which a machine with `cpus`
-/// CPUs does not have, and every NUMA node name, because that machine is
-/// a kernel built without NUMA (https://github.com/rrnewton/hermit/issues/5269).
+/// cpufreq policy numbered `cpus.count` or more, which a machine with that
+/// many CPUs does not have; a CPU's `cache` directory where its CPUID lists
+/// no cache ([`SysfsCpus::caches`],
+/// https://github.com/facebookexperimental/hermit/issues/438); and every
+/// NUMA node name, because that machine is a kernel built without NUMA
+/// (https://github.com/rrnewton/hermit/issues/5269).
 /// Without `drivers/base/node.o` Linux registers no node subsystem, so the
 /// `node` directory itself is missing from `/sys/devices/system` and from
 /// `/sys/bus` — not an empty directory — and neither a memory block nor a
@@ -4187,7 +4414,7 @@ fn cpu_backlink_directory(directory: &Path) -> bool {
 /// `nproc --all`) counts the `cpuN` entries of `/sys/devices/system/cpu`,
 /// and libnuma counts them and probes `/sys/devices/system/node`, which a
 /// kernel without NUMA does not have.
-pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> bool {
+pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: SysfsCpus) -> bool {
     match (directory.to_str(), name) {
         // The node directory itself, in each of its two parents.
         (Some("/sys/devices/system" | "/sys/bus"), b"node") => return true,
@@ -4205,6 +4432,10 @@ pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> b
     // node subsystem no CPU is registered on a node (`register_cpu`'s
     // `register_cpu_under_node` is a `CONFIG_NUMA` stub returning 0).
     if cpu_backlink_directory(directory) {
+        // The CPU's `cache` directory, which Linux builds from CPUID leaf 4.
+        if name == b"cache" {
+            return !cpus.caches;
+        }
         return name
             .strip_prefix(b"node")
             .is_some_and(|node| !node.is_empty() && node.iter().all(u8::is_ascii_digit));
@@ -4216,11 +4447,11 @@ pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> b
             // The processor driver's link to each CPU it binds. (A node's
             // links to its CPUs went with the node directory.)
             | "/sys/bus/cpu/drivers/processor",
-        ) => (b"cpu", cpus),
+        ) => (b"cpu", cpus.count),
         // Inside the node directories themselves, should a listing of one
         // ever be filtered: no node is present.
         Some("/sys/devices/system/node" | "/sys/bus/node/devices") => (b"node", 0),
-        Some("/sys/devices/system/cpu/cpufreq") => (b"policy", cpus),
+        Some("/sys/devices/system/cpu/cpufreq") => (b"policy", cpus.count),
         // A memory block's link to the node it belongs to: none, without NUMA.
         Some(directory)
             if directory
@@ -4250,9 +4481,9 @@ pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> b
 /// `/sys/devices/system/node/node0/cpulist`. `None` where no component is
 /// absent, for a relative path, and at a `..` (the kernel's to resolve,
 /// through any link before it). A lookup of the prefix, or of a name below
-/// it, finds nothing, as on the machine with `cpus` CPUs and no NUMA that
-/// the listings, `online` and `sched_getaffinity` describe.
-pub(crate) fn absent_cpu_entry_prefix(path: &Path, cpus: u32) -> Option<PathBuf> {
+/// it, finds nothing, as on the machine with `cpus` and no NUMA that the
+/// listings, `online` and `sched_getaffinity` describe.
+pub(crate) fn absent_cpu_entry_prefix(path: &Path, cpus: SysfsCpus) -> Option<PathBuf> {
     let mut components = path.components();
     if components.next() != Some(Component::RootDir) {
         return None;
@@ -4519,7 +4750,9 @@ fn is_hwmon_input_file(path: &str) -> bool {
 /// `--allow-unsupported-syscalls`): the file was already opened
 /// through the kernel, and the alternatives are republishing host
 /// bytes or fabricating a partial file.
-static SANITIZE_REFUSALS: [std::sync::atomic::AtomicU64; 6] = [
+static SANITIZE_REFUSALS: [std::sync::atomic::AtomicU64; 8] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -4544,7 +4777,9 @@ fn record_status_unknown_dropped(count: usize) {
 }
 
 /// The formats [`sanitize_refusal_counts`] reports, in counter order.
-const SANITIZE_FORMATS: [&str; 6] = ["stat", "status", "statm", "io", "sched", "fdinfo"];
+const SANITIZE_FORMATS: [&str; 8] = [
+    "stat", "status", "statm", "io", "sched", "fdinfo", "netlink", "unix",
+];
 
 fn sanitize_refusal_index(format: &str) -> usize {
     match format {
@@ -4554,6 +4789,8 @@ fn sanitize_refusal_index(format: &str) -> usize {
         "io" => 3,
         "sched" => 4,
         "fdinfo" => 5,
+        "netlink" => 6,
+        "unix" => 7,
         _ => {
             debug_assert!(false, "unknown sanitize format {format}");
             0
@@ -5681,89 +5918,156 @@ fn sanitize_sockstat(contents: &[u8]) -> Vec<u8> {
     normalized
 }
 
+/// The header every `/proc/net/unix` table is served under: the v7.1.3
+/// kernel's (`unix_seq_show`, net/unix/af_unix.c), whose header 7.4-rc3 keeps.
+const UNIX_SOCKETS_HEADER: &str = "Num       RefCount Protocol Flags    Type St Inode Path";
+
+#[cfg(test)]
+fn sanitize_unix_sockets(contents: &[u8]) -> Vec<u8> {
+    match sanitize_unix_sockets_checked(contents) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            tracing::warn!("{reason}");
+            Vec::new()
+        }
+    }
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-967): Review Unix socket identity normalization.
-fn sanitize_unix_sockets(contents: &[u8]) -> Vec<u8> {
+/// Zero the host identities in `/proc/net/unix`, or refuse the table by name.
+///
+/// Every row is accepted exactly as `unix_seq_show` prints it, in either
+/// kernel layout, or the whole table is refused (counted, named, no bytes
+/// served): host bytes of an unknown shape never reach the guest.
+///
+/// - `Num` is the socket's address printed `%pK:` (v7.1.3: 16 lower-hex
+///   digits), or the constant 0 printed `%08u:` (7.4-rc3: exactly `00000000:`).
+///   Either way it is served as 16 zero digits, so the guest's table is the
+///   same on both kernels.
+/// - `RefCount`, `Protocol` and `Flags` are `%08X`, `Type` is `%04X` and `St`
+///   is `%02X`: upper-case hex, served as printed.
+/// - `Inode` is `%5llu`, a host-global counter, served as 0.
+/// - A bound socket's path follows `Inode` after exactly one space and is
+///   every byte after it, raw (every byte but NUL is printed as it is),
+///   served as printed. It is never empty (an abstract name prints at least
+///   `@`), so an empty path, like any other separator, is refused. A newline
+///   in a path
+///   splits its row: the rest is refused unless it is itself a valid row,
+///   which no reader of the kernel's format can tell apart from one, and
+///   whose identities are then zeroed like any row's.
+///
+/// The header is accepted by its words and served as [`UNIX_SOCKETS_HEADER`];
+/// rows are single-spaced and sorted.
+fn sanitize_unix_sockets_checked(contents: &[u8]) -> Result<Vec<u8>, String> {
     const HEADER: [&str; 8] = [
         "Num", "RefCount", "Protocol", "Flags", "Type", "St", "Inode", "Path",
     ];
+    /// `Num` as 7.4-rc3 prints it: the constant 0, `%08u:`.
+    const V7_4_RC3_NUM: &str = "00000000:";
     const ZERO_NUM: &str = "0000000000000000:";
+    /// The upper-case hex fields after `Num`: index, name and width.
+    const HEX_FIELDS: [(usize, &str, usize); 5] = [
+        (1, "RefCount", 8),
+        (2, "Protocol", 8),
+        (3, "Flags", 8),
+        (4, "Type", 4),
+        (5, "St", 2),
+    ];
+    let refuse = |reason: String| counted_refusal_reason("unix", reason);
 
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
+    let Some(body) = contents.strip_suffix(b"\n") else {
+        return Err(refuse("no trailing newline".to_owned()));
     };
-    let Some(body) = text.strip_suffix('\n') else {
-        return contents.to_vec();
-    };
-    let mut lines = body.split('\n');
-    let Some(header) = lines.next() else {
-        return contents.to_vec();
-    };
-    if !header.split_whitespace().eq(HEADER) {
-        return contents.to_vec();
+    let mut lines = body.split(|byte| *byte == b'\n');
+    // `split` yields at least one item, so a header line is always present.
+    let header = lines.next().unwrap_or_default();
+    if !std::str::from_utf8(header).is_ok_and(|header| header.split_whitespace().eq(HEADER)) {
+        return Err(refuse("header".to_owned()));
     }
 
     let mut rows = Vec::new();
-    for line in lines {
-        let Some((mut fields, path)) = unix_socket_fields(line) else {
-            return contents.to_vec();
+    for (index, line) in lines.enumerate() {
+        let number = index + 2;
+        let Some((mut fields, rest)) = unix_socket_fields(line) else {
+            return Err(refuse(format!("line {number}: seven text fields")));
         };
-        let Some(num) = fields[0].strip_suffix(':') else {
-            return contents.to_vec();
-        };
-        if !is_fixed_lower_hex(num, 16)
-            || !is_fixed_lower_hex(fields[1], 8)
-            || !is_fixed_lower_hex(fields[2], 8)
-            || !is_fixed_lower_hex(fields[3], 8)
-            || !is_fixed_lower_hex(fields[4], 4)
-            || !is_fixed_lower_hex(fields[5], 2)
-            || !is_decimal(fields[6])
-        {
-            return contents.to_vec();
+        let num_known = fields[0] == V7_4_RC3_NUM
+            || fields[0]
+                .strip_suffix(':')
+                .is_some_and(|num| is_fixed_lower_hex(num, 16));
+        if !num_known {
+            return Err(refuse(format!("line {number}: Num")));
         }
+        for (field, name, width) in HEX_FIELDS {
+            if !is_fixed_upper_hex(fields[field], width) {
+                return Err(refuse(format!("line {number}: {name}")));
+            }
+        }
+        if !is_decimal(fields[6]) {
+            return Err(refuse(format!("line {number}: Inode")));
+        }
+        // An unbound socket's row ends at `Inode`; a bound socket's path
+        // follows it after exactly one space (`seq_putc(seq, ' ')`) and is
+        // never empty (an abstract name prints at least `@`).
+        let path = match rest {
+            [] => None,
+            [b' '] => return Err(refuse(format!("line {number}: empty path"))),
+            [b' ', path @ ..] => Some(path),
+            _ => return Err(refuse(format!("line {number}: path separator"))),
+        };
 
         fields[0] = ZERO_NUM;
         fields[6] = "0";
-        let mut row = fields.join(" ");
-        if !path.is_empty() {
-            row.push(' ');
-            row.push_str(path);
+        let mut row = fields.join(" ").into_bytes();
+        if let Some(path) = path {
+            row.push(b' ');
+            row.extend_from_slice(path);
         }
         rows.push(row);
     }
     rows.sort_unstable();
 
-    let mut normalized = String::with_capacity(text.len());
-    normalized.push_str(header);
-    normalized.push('\n');
+    let mut normalized = Vec::with_capacity(contents.len());
+    normalized.extend_from_slice(UNIX_SOCKETS_HEADER.as_bytes());
+    normalized.push(b'\n');
     for row in rows {
-        normalized.push_str(&row);
-        normalized.push('\n');
+        normalized.extend_from_slice(&row);
+        normalized.push(b'\n');
     }
-    normalized.into_bytes()
+    Ok(normalized)
 }
 
-fn unix_socket_fields(line: &str) -> Option<(Vec<&str>, &str)> {
+/// The seven fixed fields of a `/proc/net/unix` row, which must be text, and
+/// the rest of the row after them, untrimmed: empty for an unbound socket,
+/// else the separator and the path, raw bytes.
+fn unix_socket_fields(line: &[u8]) -> Option<(Vec<&str>, &[u8])> {
     const FIELD_COUNT: usize = 7;
 
     let mut fields = Vec::with_capacity(FIELD_COUNT);
     let mut remainder = line;
     while fields.len() < FIELD_COUNT {
-        remainder = remainder.trim_start_matches(|character: char| character.is_ascii_whitespace());
+        remainder = trim_ascii_whitespace_start(remainder);
         if remainder.is_empty() {
             return None;
         }
         let end = remainder
-            .find(|character: char| character.is_ascii_whitespace())
+            .iter()
+            .position(u8::is_ascii_whitespace)
             .unwrap_or(remainder.len());
-        fields.push(&remainder[..end]);
+        fields.push(std::str::from_utf8(&remainder[..end]).ok()?);
         remainder = &remainder[end..];
     }
 
-    Some((
-        fields,
-        remainder.trim_start_matches(|character: char| character.is_ascii_whitespace()),
-    ))
+    Some((fields, remainder))
+}
+
+fn trim_ascii_whitespace_start(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    &bytes[start..]
 }
 
 fn is_fixed_lower_hex(field: &str, width: usize) -> bool {
@@ -5773,61 +6077,112 @@ fn is_fixed_lower_hex(field: &str, width: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// `%X` digits: exactly `width` of `0-9` and `A-F`.
+fn is_fixed_upper_hex(field: &str, width: usize) -> bool {
+    field.len() == width
+        && field
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte))
+}
+
 fn is_decimal(field: &str) -> bool {
     !field.is_empty()
         && field.bytes().all(|byte| byte.is_ascii_digit())
         && field.parse::<u64>().is_ok()
 }
 
+/// The header every `/proc/net/netlink` table is served under: the v7.1.3
+/// kernel's (`netlink_native_seq_show`, net/netlink/af_netlink.c). 7.4-rc3
+/// prints a narrower `sk` column, which no longer carries an address.
+const NETLINK_SOCKETS_HEADER: &str =
+    "sk               Eth Pid        Groups   Rmem     Wmem     Dump  Locks    Drops    Inode";
+
+#[cfg(test)]
+fn sanitize_netlink_sockets(contents: &[u8]) -> Vec<u8> {
+    match sanitize_netlink_sockets_checked(contents) {
+        Ok(bytes) => bytes,
+        Err(reason) => {
+            tracing::warn!("{reason}");
+            Vec::new()
+        }
+    }
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-961): Review proc netlink identity normalization.
-fn sanitize_netlink_sockets(contents: &[u8]) -> Vec<u8> {
+/// Zero the host identities in `/proc/net/netlink`, or refuse the table by
+/// name.
+///
+/// Every row is accepted exactly as `netlink_native_seq_show` prints it, in
+/// either kernel layout, or the whole table is refused (counted, named, no
+/// bytes served): host bytes of an unknown shape never reach the guest.
+///
+/// - `sk` is the socket's address printed `%pK` (v7.1.3: 16 lower-hex
+///   digits), or the literal `0` (7.4-rc3). Either way it is served as 16 zero
+///   digits, so the guest's table is the same on both kernels.
+/// - `Groups` is `%08x`: exactly 8 lower-hex digits.
+/// - `Eth`, `Pid`, `Rmem`, `Wmem`, `Dump`, `Locks` and `Drops` are decimal.
+/// - `Inode` is `%-8llu`, a host-global counter, served as 0.
+///
+/// The header is accepted by its words and served as
+/// [`NETLINK_SOCKETS_HEADER`]; rows are single-spaced and sorted on their
+/// numbers.
+fn sanitize_netlink_sockets_checked(contents: &[u8]) -> Result<Vec<u8>, String> {
     const HEADER: [&str; 10] = [
         "sk", "Eth", "Pid", "Groups", "Rmem", "Wmem", "Dump", "Locks", "Drops", "Inode",
     ];
+    /// `sk` as 7.4-rc3 prints it: the literal `0`.
+    const V7_4_RC3_SK: &str = "0";
     const ZERO_POINTER: &str = "0000000000000000";
+    let refuse = |reason: String| counted_refusal_reason("netlink", reason);
 
     let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
+        return Err(refuse("not UTF-8".to_owned()));
     };
     let Some(body) = text.strip_suffix('\n') else {
-        return contents.to_vec();
+        return Err(refuse("no trailing newline".to_owned()));
     };
     let mut lines = body.split('\n');
-    let Some(header) = lines.next() else {
-        return contents.to_vec();
-    };
+    // `split` yields at least one item, so a header line is always present.
+    let header = lines.next().unwrap_or_default();
     if !header.split_whitespace().eq(HEADER) {
-        return contents.to_vec();
+        return Err(refuse("header".to_owned()));
     }
 
     let mut rows = Vec::new();
-    for line in lines {
+    for (index, line) in lines.enumerate() {
+        let number = index + 2;
         let mut fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != HEADER.len()
-            || !is_lower_hex(fields[0], 16)
-            || !is_lower_hex(fields[3], 8)
-        {
-            return contents.to_vec();
+        if fields.len() != HEADER.len() {
+            return Err(refuse(format!(
+                "line {number}: {} fields, not {}",
+                fields.len(),
+                HEADER.len()
+            )));
         }
-
-        let Some(key) = [
-            parse_decimal(fields[1]),
-            parse_decimal(fields[2]),
-            parse_lower_hex(fields[3]),
-            parse_decimal(fields[4]),
-            parse_decimal(fields[5]),
-            parse_decimal(fields[6]),
-            parse_decimal(fields[7]),
-            parse_decimal(fields[8]),
-        ]
-        .into_iter()
-        .collect::<Option<Vec<_>>>() else {
-            return contents.to_vec();
+        if !(is_lower_hex(fields[0], 16) || fields[0] == V7_4_RC3_SK) {
+            return Err(refuse(format!("line {number}: sk")));
+        }
+        let groups = match parse_lower_hex(fields[3]) {
+            Some(groups) if is_lower_hex(fields[3], 8) => groups,
+            _ => return Err(refuse(format!("line {number}: Groups"))),
         };
-        if parse_decimal(fields[9]).is_none() {
-            return contents.to_vec();
-        }
+        let decimal = |field: usize| {
+            parse_decimal(fields[field])
+                .ok_or_else(|| refuse(format!("line {number}: {}", HEADER[field])))
+        };
+        // The sort key: every field but the two identities, as numbers.
+        let key = [
+            decimal(1)?,
+            decimal(2)?,
+            groups,
+            decimal(4)?,
+            decimal(5)?,
+            decimal(6)?,
+            decimal(7)?,
+            decimal(8)?,
+        ];
+        decimal(9)?;
 
         fields[0] = ZERO_POINTER;
         fields[9] = "0";
@@ -5836,13 +6191,13 @@ fn sanitize_netlink_sockets(contents: &[u8]) -> Vec<u8> {
     rows.sort_unstable();
 
     let mut normalized = String::with_capacity(text.len());
-    normalized.push_str(header);
+    normalized.push_str(NETLINK_SOCKETS_HEADER);
     normalized.push('\n');
     for (_, row) in rows {
         normalized.push_str(&row);
         normalized.push('\n');
     }
-    normalized.into_bytes()
+    Ok(normalized.into_bytes())
 }
 
 /// Zero the host-assigned identities in `/proc/net/tcp{,6}` and
@@ -6204,7 +6559,7 @@ fn sanitize_self_sched_checked(contents: &[u8]) -> Result<Vec<u8>, String> {
 // TODO-HUMAN-REVIEW(PR-931): Review the /proc/self/fdinfo field policy.
 #[cfg(test)]
 fn sanitize_fdinfo(contents: &[u8], identity: Option<(u64, i32, u64, u64)>) -> Vec<u8> {
-    match sanitize_fdinfo_checked(contents, identity) {
+    match sanitize_fdinfo_checked(contents, identity, None) {
         Ok(bytes) => bytes,
         Err(reason) => {
             tracing::warn!("{reason}");
@@ -6213,14 +6568,17 @@ fn sanitize_fdinfo(contents: &[u8], identity: Option<(u64, i32, u64, u64)>) -> V
     }
 }
 
+/// `lock_lines`: the caller's account of the kernel's `lock:` lines, given
+/// only for a fdinfo of one of the reader's own descriptors.
 fn sanitize_fdinfo_checked(
     contents: &[u8],
     identity: Option<(u64, i32, u64, u64)>,
+    lock_lines: Option<&FdinfoLockLines>,
 ) -> Result<Vec<u8>, String> {
     let Some((virtual_inode, logical_flags, virtual_open_file, virtual_mount_id)) = identity else {
-        // No virtual identity to substitute: a named, counted
-        // refusal like every other unserved shape, never an empty
-        // file.
+        // No virtual identity to substitute: a named, counted refusal like
+        // every other unserved shape, never an empty file, before the bytes
+        // are parsed, as before the lock ledger.
         return Err(counted_refusal_reason(
             "fdinfo",
             "no fd identity for the fdinfo snapshot",
@@ -6228,17 +6586,17 @@ fn sanitize_fdinfo_checked(
     };
     // Grammar-backed parse; identity substitution below is the same
     // policy the line surgery applied. Kinds this policy does not
-    // serve (epoll, inotify, fuse), files carrying lock lines, and
-    // unparseable input are refused by name and counted.
+    // serve (epoll, inotify, fuse) and unparseable input are refused by
+    // name and counted; lock lines are served only as the caller
+    // accounted for them (`serve_lock_lines`).
     let mut fdinfo = match parse_fdinfo(contents) {
         Ok(fdinfo) => fdinfo,
         Err(error) => return Err(counted_refusal_reason("fdinfo", error)),
     };
-    if !fdinfo.locks.is_empty() {
-        return Err(counted_refusal_reason(
-            "fdinfo",
-            "lock lines are not served",
-        ));
+    // An account's refusal stands with no lock line too: the guest's own
+    // lease, gone from the fdinfo (`locks::LockLedger::fdinfo_owners`).
+    if !fdinfo.locks.is_empty() || lock_lines.is_some_and(|lines| lines.owners.is_err()) {
+        serve_lock_lines(contents, &mut fdinfo, virtual_inode, lock_lines)?;
     }
     fdinfo.mnt_id = virtual_mount_id;
     fdinfo.ino = virtual_inode;
@@ -6258,6 +6616,64 @@ fn sanitize_fdinfo_checked(
         _ => return Err(counted_refusal_reason("fdinfo", "fd kind is not served")),
     }
     Ok(render_fdinfo(&fdinfo))
+}
+
+/// The refusal of a fdinfo's `lock:` lines no account of the caller's
+/// covers ([`serve_lock_lines`]), or that have no identity to be served with
+/// (`sanitize_fdinfo_checked`).
+const UNSERVED_LOCK_LINES: &str = "lock lines are not served";
+
+/// Replace the host values of `fdinfo`'s `lock:` lines, parsed from the
+/// kernel's `contents`, with what the caller's account says the guest sees
+/// ([`FdinfoLockLines`]): each line's owner, the file's device, and
+/// `virtual_inode`, the fdinfo's own. Refused by name, and counted: no
+/// account, the account's own refusal, an account of other lines than these,
+/// and a line on another file than the descriptor's, which Linux never lists
+/// there (`__show_fd_locks` lists only locks taken through this description).
+fn serve_lock_lines(
+    contents: &[u8],
+    fdinfo: &mut Fdinfo,
+    virtual_inode: u64,
+    lock_lines: Option<&FdinfoLockLines>,
+) -> Result<(), String> {
+    let Some(lines) = lock_lines else {
+        return Err(counted_refusal_reason("fdinfo", UNSERVED_LOCK_LINES));
+    };
+    let owners = lines
+        .owners
+        .as_ref()
+        .map_err(|reason| counted_refusal_reason("fdinfo", format!("lock lines: {reason}")))?;
+    if locks::fdinfo_lock_rows(contents).as_ref() != Some(&lines.rows)
+        || owners.len() != fdinfo.locks.len()
+    {
+        return Err(counted_refusal_reason(
+            "fdinfo",
+            "lock lines other than those Detcore accounted for",
+        ));
+    }
+    let file = (
+        fdinfo.ino,
+        fdinfo.locks[0].dev_major,
+        fdinfo.locks[0].dev_minor,
+    );
+    if fdinfo
+        .locks
+        .iter()
+        .any(|lock| (lock.inode, lock.dev_major, lock.dev_minor) != file)
+    {
+        return Err(counted_refusal_reason(
+            "fdinfo",
+            "a lock line names another file than the descriptor's",
+        ));
+    }
+    let (dev_major, dev_minor) = lines.device;
+    for (lock, owner) in fdinfo.locks.iter_mut().zip(owners) {
+        lock.owner = *owner;
+        lock.dev_major = dev_major;
+        lock.dev_minor = dev_minor;
+        lock.inode = virtual_inode;
+    }
+    Ok(())
 }
 
 fn numa_page_accounting_value(field: &str) -> Option<&str> {
@@ -9630,7 +10046,7 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             (
                 "/sys/devices/system/cpu/cpu0",
                 &["node0", "node2", "node999"],
-                &["node", "nodex", "online", "topology"],
+                &["node", "nodex", "online", "topology", "cache"],
             ),
             (
                 "/sys/bus/cpu/devices/cpu0",
@@ -9656,13 +10072,21 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
         ] {
             for name in absent {
                 assert!(
-                    is_absent_cpu_entry(Path::new(directory), name.as_bytes(), 1),
+                    is_absent_cpu_entry(
+                        Path::new(directory),
+                        name.as_bytes(),
+                        SysfsCpus::with_caches(1)
+                    ),
                     "{directory}/{name}"
                 );
             }
             for name in kept {
                 assert!(
-                    !is_absent_cpu_entry(Path::new(directory), name.as_bytes(), 1),
+                    !is_absent_cpu_entry(
+                        Path::new(directory),
+                        name.as_bytes(),
+                        SysfsCpus::with_caches(1)
+                    ),
                     "{directory}/{name}"
                 );
             }
@@ -9682,7 +10106,11 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             ("/sys/devices/system/cpu/cpu3", "topology", false),
         ] {
             assert_eq!(
-                is_absent_cpu_entry(Path::new(directory), name.as_bytes(), 4),
+                is_absent_cpu_entry(
+                    Path::new(directory),
+                    name.as_bytes(),
+                    SysfsCpus::with_caches(4)
+                ),
                 absent,
                 "{directory}/{name}"
             );
@@ -9694,7 +10122,11 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             ("/tmp", "cpu1"),
         ] {
             assert!(
-                !is_absent_cpu_entry(Path::new(directory), name.as_bytes(), 1),
+                !is_absent_cpu_entry(
+                    Path::new(directory),
+                    name.as_bytes(),
+                    SysfsCpus::with_caches(1)
+                ),
                 "{directory}/{name}"
             );
         }
@@ -9771,7 +10203,7 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             ),
         ] {
             assert_eq!(
-                absent_cpu_entry_prefix(Path::new(path), 1).as_deref(),
+                absent_cpu_entry_prefix(Path::new(path), SysfsCpus::with_caches(1)).as_deref(),
                 Some(Path::new(prefix)),
                 "{path}"
             );
@@ -9788,8 +10220,95 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             "sys/devices/system/cpu/cpu1",
             "/tmp/cpu1/x",
         ] {
-            assert_eq!(absent_cpu_entry_prefix(Path::new(path), 1), None, "{path}");
+            assert_eq!(
+                absent_cpu_entry_prefix(Path::new(path), SysfsCpus::with_caches(1)),
+                None,
+                "{path}"
+            );
         }
+    }
+
+    /// On a machine whose CPUs' CPUID lists no leaf-4 cache, as every virtual
+    /// table's does, each CPU's `cache` directory is absent, by every spelling
+    /// of the CPU's directory, and so is everything below it: Linux builds
+    /// that directory from leaf 4 alone (`init_cache_level` is -ENOENT for
+    /// zero leaves, arch/x86/kernel/cpu/cacheinfo.c in v7.3;
+    /// https://github.com/facebookexperimental/hermit/issues/438). A machine
+    /// whose CPUs keep the host's caches keeps the directory.
+    #[test]
+    fn a_cpu_whose_cpuid_lists_no_cache_has_no_cache_directory() {
+        let none = SysfsCpus {
+            count: 2,
+            caches: false,
+        };
+        let kept = SysfsCpus::with_caches(2);
+        for directory in [
+            "/sys/devices/system/cpu/cpu0",
+            "/sys/devices/system/cpu/cpu1",
+            "/sys/bus/cpu/devices/cpu1",
+            "/sys/bus/cpu/drivers/processor/cpu0",
+        ] {
+            assert!(
+                is_absent_cpu_entry(Path::new(directory), b"cache", none),
+                "{directory}"
+            );
+            assert!(
+                !is_absent_cpu_entry(Path::new(directory), b"cache", kept),
+                "{directory}"
+            );
+            // The CPU's other entries stay.
+            for name in ["topology", "online", "cpufreq", "caches"] {
+                assert!(
+                    !is_absent_cpu_entry(Path::new(directory), name.as_bytes(), none),
+                    "{directory}/{name}"
+                );
+            }
+        }
+        // Only a CPU's own directory: no other `cache` entry is the CPU's.
+        for directory in [
+            "/sys/devices/system/cpu",
+            "/sys/devices/system/cpu/cpu0/topology",
+            "/sys/devices/system/cpu/cpu0/cache",
+            "/sys/kernel/mm",
+            "/tmp",
+        ] {
+            assert!(
+                !is_absent_cpu_entry(Path::new(directory), b"cache", none),
+                "{directory}"
+            );
+        }
+        for (path, prefix) in [
+            (
+                "/sys/devices/system/cpu/cpu0/cache",
+                "/sys/devices/system/cpu/cpu0/cache",
+            ),
+            (
+                "/sys/devices/system/cpu/cpu1/cache/index0/size",
+                "/sys/devices/system/cpu/cpu1/cache",
+            ),
+            (
+                "/sys/bus/cpu/devices/cpu0/cache/index3/shared_cpu_list",
+                "/sys/bus/cpu/devices/cpu0/cache",
+            ),
+            // A CPU the machine does not have is absent first.
+            (
+                "/sys/devices/system/cpu/cpu2/cache/index0/size",
+                "/sys/devices/system/cpu/cpu2",
+            ),
+        ] {
+            assert_eq!(
+                absent_cpu_entry_prefix(Path::new(path), none).as_deref(),
+                Some(Path::new(prefix)),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            absent_cpu_entry_prefix(
+                Path::new("/sys/devices/system/cpu/cpu1/cache/index0/size"),
+                kept
+            ),
+            None
+        );
     }
 
     /// A device's NUMA attribute is absent where its subsystem's devices have
@@ -10550,6 +11069,431 @@ THPeligible:    0\n"
         );
     }
 
+    /// The kernel's header of the fdinfo the lock-line tests read: inode
+    /// 1002 on mount 31, both host values.
+    const LOCKED_FDINFO_HEADER: &str = "pos:\t0\nflags:\t02100002\nmnt_id:\t31\nino:\t1002\n";
+
+    /// The descriptor's virtual identity: inode 9007, its flags, open file
+    /// 42 and mount 7, as `Detcore` builds `fdinfo_identity`.
+    const LOCKED_FDINFO_IDENTITY: Option<(u64, i32, u64, u64)> = Some((9007, 0o2100002, 42, 7));
+
+    /// [`LOCKED_FDINFO_HEADER`] as the guest sees it.
+    const SERVED_FDINFO_HEADER: &str = "pos:\t0\nflags:\t02100002\nmnt_id:\t7\nino:\t9007\n";
+
+    /// The guest process a kernel owner number in the lock-line tests names:
+    /// 3 is guest process 3 (the container's PID namespace numbers it as the
+    /// guest does); any other number, such as host process 4242, names none.
+    fn lock_test_guest_process(owner: i64) -> Option<crate::types::DetPid> {
+        (owner == 3).then(|| crate::types::DetPid::from_raw(3))
+    }
+
+    /// What the snapshot's caller builds for a fdinfo the kernel printed of a
+    /// descriptor of `open_file` (`Detcore::kernel_fdinfo_locks`): its lock
+    /// lines, the owners `ledger` gives them (guest process 3 is listed), and
+    /// 00:31 standing for the file's determinized device.
+    fn kernel_fdinfo_lock_lines(
+        ledger: &locks::LockLedger,
+        open_file: crate::types::OpenFileId,
+        contents: &[u8],
+    ) -> FdinfoLockLines {
+        let rows = locks::fdinfo_lock_rows(contents).expect("every lock line is a lock row");
+        // The fdinfo's own `ino:` line, as the caller reads it.
+        let file_inode = std::str::from_utf8(contents)
+            .expect("fdinfo text")
+            .lines()
+            .find_map(|line| line.strip_prefix("ino:"))
+            .map(str::trim);
+        let owners = ledger.fdinfo_owners(
+            open_file,
+            &rows,
+            &|process| process.as_raw() == 3,
+            &lock_test_guest_process,
+            file_inode,
+        );
+        FdinfoLockLines {
+            rows,
+            owners,
+            device: (0, 0x31),
+        }
+    }
+
+    /// The ledger's record that `open_file` holds the locks `lines` spell
+    /// (each `lock:` line's text after its number), as a fdinfo read after
+    /// a guest lock call through process 3's table records it.
+    fn ledger_holding(
+        ledger: &mut locks::LockLedger,
+        open_file: crate::types::OpenFileId,
+        lines: &[&str],
+    ) {
+        let text = lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| format!("lock:\t{}: {line}\n", index + 1))
+            .collect::<String>();
+        let held = locks::held_locks_in_fdinfo(text.as_bytes());
+        assert_eq!(
+            held.len(),
+            lines.len(),
+            "every lock is an OFD lock or a flock"
+        );
+        ledger.note_locks(crate::types::DetPid::from_raw(3), open_file, held, 1);
+    }
+
+    /// (a) A fdinfo the kernel printed with lock lines is served, not
+    /// refused: each line in the kernel's order (Linux's: a description's
+    /// flock locks, then its record locks in list order, then its leases),
+    /// spelled as Linux spells it, with the host's values replaced. Its
+    /// object is the file's determinized device and the fdinfo's own virtual
+    /// inode (every line names the description's file), and its owner is -1
+    /// for an OFD lock, the guest process a kernel number names for a POSIX
+    /// lock, a flock and an active lease, and 0 where the number names none,
+    /// as Linux shows a taker its PID namespace cannot see.
+    #[test]
+    fn fdinfo_lock_lines_are_served_with_guest_owners_and_virtual_identity() {
+        let process = crate::types::DetPid::from_raw(3);
+        let [first, second, inherited, leased] =
+            [0, 1, 2, 3].map(|sequence| crate::types::OpenFileId::new(process, sequence));
+        let mut ledger = locks::LockLedger::default();
+        let ofd = "OFDLCK ADVISORY  READ -1 00:2a:1002 100 EOF";
+        ledger_holding(&mut ledger, first, &[ofd]);
+        // This process's record lock on bytes 0 to 9 (namespace pid 3), then
+        // its OFD lock from byte 100, as Linux lists both on the
+        // description's fdinfo.
+        let contents = format!(
+            "{LOCKED_FDINFO_HEADER}lock:\t1: POSIX  ADVISORY  WRITE 3 00:2a:1002 0 9\n\
+             lock:\t2: {ofd}\n"
+        );
+        let lines = kernel_fdinfo_lock_lines(&ledger, first, contents.as_bytes());
+        assert_eq!(
+            sanitize_fdinfo_checked(contents.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines),),
+            Ok(format!(
+                "{SERVED_FDINFO_HEADER}lock:\t1: POSIX  ADVISORY  WRITE 3 00:31:9007 0 9\n\
+                 lock:\t2: OFDLCK ADVISORY  READ -1 00:31:9007 100 EOF\n"
+            )
+            .into_bytes())
+        );
+
+        // A shared flock through a second open, taken by guest process 3.
+        let flock = "FLOCK  ADVISORY  READ 3 00:2a:1002 0 EOF";
+        ledger_holding(&mut ledger, second, &[flock]);
+        let contents = format!("{LOCKED_FDINFO_HEADER}lock:\t1: {flock}\n");
+        let lines = kernel_fdinfo_lock_lines(&ledger, second, contents.as_bytes());
+        assert_eq!(
+            sanitize_fdinfo_checked(contents.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines),),
+            Ok(format!(
+                "{SERVED_FDINFO_HEADER}lock:\t1: FLOCK  ADVISORY  READ 3 00:31:9007 0 EOF\n"
+            )
+            .into_bytes())
+        );
+
+        // A flock a host process (4242) took on a description the guest
+        // inherited, which the ledger read after the guest's own lock call
+        // through it: owner 0, never the host's number.
+        let host_flock = "FLOCK  ADVISORY  WRITE 4242 00:2a:1002 0 EOF";
+        ledger_holding(&mut ledger, inherited, &[host_flock]);
+        let contents = format!("{LOCKED_FDINFO_HEADER}lock:\t1: {host_flock}\n");
+        let lines = kernel_fdinfo_lock_lines(&ledger, inherited, contents.as_bytes());
+        assert_eq!(
+            sanitize_fdinfo_checked(contents.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines),),
+            Ok(format!(
+                "{SERVED_FDINFO_HEADER}lock:\t1: FLOCK  ADVISORY  WRITE 0 00:31:9007 0 EOF\n"
+            )
+            .into_bytes())
+        );
+
+        // An active read lease guest process 3 set with its own F_SETLEASE,
+        // which the ledger keeps: its taker is the kernel's number,
+        // translated.
+        ledger.note_lease(process, leased, Some("READ".to_owned()), 1);
+        let contents =
+            format!("{LOCKED_FDINFO_HEADER}lock:\t1: LEASE  ACTIVE    READ 3 00:2a:1002 0 EOF\n");
+        let lines = kernel_fdinfo_lock_lines(&ledger, leased, contents.as_bytes());
+        let served =
+            sanitize_fdinfo_checked(contents.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines));
+        assert_eq!(
+            served,
+            Ok(format!(
+                "{SERVED_FDINFO_HEADER}lock:\t1: LEASE  ACTIVE    READ 3 00:31:9007 0 EOF\n"
+            )
+            .into_bytes())
+        );
+        // The host's raw device (00:2a) never reaches the guest.
+        let served = String::from_utf8(served.unwrap()).unwrap();
+        assert!(!served.contains("00:2a"), "{served}");
+    }
+
+    /// (d) A lock line naming another file than the descriptor's (here a
+    /// POSIX lock on inode 1003 in the fdinfo of inode 1002), which Linux
+    /// never lists there, is refused by name; and the guest's own lease gone
+    /// from a fdinfo with no lock line at all (the kernel removed it after a
+    /// break, on its own clock) is refused by name, not shown as no lease.
+    #[test]
+    fn fdinfo_lock_lines_on_another_file_or_a_vanished_lease_are_refused() {
+        let process = crate::types::DetPid::from_raw(3);
+        let description = crate::types::OpenFileId::new(process, 0);
+        let ledger = locks::LockLedger::default();
+        let contents = format!(
+            "{LOCKED_FDINFO_HEADER}lock:\t1: POSIX  ADVISORY  WRITE 3 00:2a:1002 0 9\n\
+             lock:\t2: POSIX  ADVISORY  WRITE 3 00:2a:1003 20 29\n"
+        );
+        let lines = kernel_fdinfo_lock_lines(&ledger, description, contents.as_bytes());
+        let refusal =
+            sanitize_fdinfo_checked(contents.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines))
+                .expect_err("a line on another file is refused");
+        assert!(
+            refusal.contains("a lock line names another file than the descriptor's"),
+            "{refusal}"
+        );
+
+        let mut leased = locks::LockLedger::default();
+        leased.note_lease(process, description, Some("READ".to_owned()), 1);
+        let no_lock_line = LOCKED_FDINFO_HEADER.to_owned();
+        let lines = kernel_fdinfo_lock_lines(&leased, description, no_lock_line.as_bytes());
+        let refusal = sanitize_fdinfo_checked(
+            no_lock_line.as_bytes(),
+            LOCKED_FDINFO_IDENTITY,
+            Some(&lines),
+        )
+        .expect_err("the guest's vanished lease is refused");
+        assert!(refusal.contains("is gone from its fdinfo"), "{refusal}");
+        // With no account at all, the same fdinfo is shown: no lock line
+        // needs one.
+        assert!(
+            sanitize_fdinfo_checked(no_lock_line.as_bytes(), LOCKED_FDINFO_IDENTITY, None,).is_ok()
+        );
+    }
+
+    /// (b) Where the ledger cannot vouch for a description's OFD and flock
+    /// locks, a fdinfo listing one is refused by name, never served: its
+    /// locks are unknown (the ledger's own reason is named), or Detcore never
+    /// read them.
+    #[test]
+    fn fdinfo_lock_lines_refuse_by_name_where_the_ledger_cannot_vouch() {
+        let process = crate::types::DetPid::from_raw(3);
+        let [unknown, unread] =
+            [0, 1].map(|sequence| crate::types::OpenFileId::new(process, sequence));
+        let mut ledger = locks::LockLedger::default();
+        ledger.note_unknown(
+            process,
+            unknown,
+            "after F_OFD_SETLK on fd 3, its fdinfo could not be read (EMFILE)".to_owned(),
+            1,
+        );
+        let contents = format!(
+            "{LOCKED_FDINFO_HEADER}lock:\t1: OFDLCK ADVISORY  READ -1 00:2a:1002 100 EOF\n"
+        );
+        for (open_file, reason) in [
+            (unknown, "its fdinfo could not be read (EMFILE)"),
+            (unread, "never read the locks of this open file description"),
+        ] {
+            let lines = kernel_fdinfo_lock_lines(&ledger, open_file, contents.as_bytes());
+            let refusal =
+                sanitize_fdinfo_checked(contents.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines))
+                    .expect_err("a lock the ledger cannot vouch for is refused");
+            assert!(
+                refusal.contains("procfs sanitize refused fdinfo") && refusal.contains(reason),
+                "{refusal}"
+            );
+        }
+    }
+
+    /// (c) A lock line the ledger does not hold never passes through: a lock
+    /// the kernel lists through the description that the ledger did not read
+    /// it holding (another holder of a description shared with the host), a
+    /// lock the ledger holds that the kernel no longer lists, and lines other
+    /// than those the caller accounted for are refused by name; and a lock
+    /// with no caller's account at all is refused as before.
+    #[test]
+    fn fdinfo_lock_lines_the_ledger_does_not_hold_never_pass_through() {
+        let process = crate::types::DetPid::from_raw(3);
+        let description = crate::types::OpenFileId::new(process, 0);
+        let guest_ofd = "OFDLCK ADVISORY  READ -1 00:2a:1002 100 EOF";
+        let host_ofd = "OFDLCK ADVISORY  WRITE -1 00:2a:1002 0 0";
+        let mut ledger = locks::LockLedger::default();
+        ledger_holding(&mut ledger, description, &[guest_ofd]);
+
+        let with_host =
+            format!("{LOCKED_FDINFO_HEADER}lock:\t1: {host_ofd}\nlock:\t2: {guest_ofd}\n");
+        let lines = kernel_fdinfo_lock_lines(&ledger, description, with_host.as_bytes());
+        let refusal =
+            sanitize_fdinfo_checked(with_host.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines))
+                .expect_err("a lock the ledger does not hold is refused");
+        assert!(
+            refusal.contains("a change Detcore did not see"),
+            "{refusal}"
+        );
+
+        let mut stale = locks::LockLedger::default();
+        ledger_holding(&mut stale, description, &[host_ofd, guest_ofd]);
+        let guest_only = format!("{LOCKED_FDINFO_HEADER}lock:\t1: {guest_ofd}\n");
+        let lines = kernel_fdinfo_lock_lines(&stale, description, guest_only.as_bytes());
+        let refusal =
+            sanitize_fdinfo_checked(guest_only.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines))
+                .expect_err("a lock the kernel no longer lists is refused");
+        assert!(
+            refusal.contains("a change Detcore did not see"),
+            "{refusal}"
+        );
+
+        // The caller's account of other lines than the snapshot's.
+        let lines = kernel_fdinfo_lock_lines(&ledger, description, guest_only.as_bytes());
+        let refusal =
+            sanitize_fdinfo_checked(with_host.as_bytes(), LOCKED_FDINFO_IDENTITY, Some(&lines))
+                .expect_err("lines the caller did not account for are refused");
+        assert!(
+            refusal.contains("lock lines other than those Detcore accounted for"),
+            "{refusal}"
+        );
+
+        let refusal = sanitize_fdinfo_checked(guest_only.as_bytes(), LOCKED_FDINFO_IDENTITY, None)
+            .expect_err("lock lines with no account are refused");
+        assert!(refusal.contains("lock lines are not served"), "{refusal}");
+
+        // With no identity, a fdinfo is refused for its identity before its
+        // bytes are read, lock lines or none, as before the lock ledger.
+        for contents in [guest_only.as_str(), LOCKED_FDINFO_HEADER] {
+            let refusal = sanitize_fdinfo_checked(contents.as_bytes(), None, None)
+                .expect_err("a fdinfo with no identity is refused");
+            assert!(
+                refusal.contains("no fd identity for the fdinfo snapshot"),
+                "{refusal}"
+            );
+        }
+    }
+
+    /// A fdinfo path names whose descriptor table: the opener's process
+    /// (`self`) or thread (`thread-self`), once `..` is resolved, or a
+    /// process's or a thread's by number; every other path names none. The
+    /// open binds it to a task, resolving `self` and `thread-self` with the
+    /// opener's numbers, and the binding stays with the file: a child that
+    /// reads its parent's `self` fdinfo after a fork reads the parent's.
+    #[test]
+    fn fdinfo_paths_name_their_descriptor_table() {
+        let owner = |path: &str| {
+            ProcfsFile::from_path(Path::new(path)).and_then(|file| file.fdinfo_owner())
+        };
+        assert_eq!(owner("/proc/self/fdinfo/7"), Some(FdinfoOwner::SelfProcess));
+        assert_eq!(
+            owner("/proc/thread-self/fdinfo/7"),
+            Some(FdinfoOwner::ThreadSelf)
+        );
+        assert_eq!(
+            owner("/proc/self/../self/fdinfo/7"),
+            Some(FdinfoOwner::SelfProcess)
+        );
+        let bound = |path: &str, opener: Option<(i32, i32)>| {
+            let mut file = ProcfsFile::from_path(Path::new(path)).unwrap();
+            file.bind_fdinfo_table(opener);
+            file.fdinfo_table()
+        };
+        assert_eq!(
+            bound("/proc/self/fdinfo/7", Some((3, 5))),
+            Some(FdinfoTable {
+                process: 3,
+                thread: None
+            })
+        );
+        assert_eq!(
+            bound("/proc/thread-self/fdinfo/7", Some((3, 5))),
+            Some(FdinfoTable {
+                process: 3,
+                thread: Some(5)
+            })
+        );
+        assert_eq!(
+            bound("/proc/self/task/6/fdinfo/7", Some((3, 5))),
+            Some(FdinfoTable {
+                process: 3,
+                thread: Some(6)
+            })
+        );
+        assert_eq!(bound("/proc/self/fdinfo/7", None), None);
+        assert_eq!(owner("/proc/42/fdinfo/7"), Some(FdinfoOwner::Process(42)));
+        assert_eq!(
+            owner("/proc/42/fdinfo/../fdinfo/7"),
+            Some(FdinfoOwner::Process(42))
+        );
+        assert_eq!(
+            owner("/proc/self/task/43/fdinfo/7"),
+            Some(FdinfoOwner::Thread {
+                process: None,
+                thread: 43
+            })
+        );
+        assert_eq!(
+            owner("/proc/42/task/43/fdinfo/7"),
+            Some(FdinfoOwner::Thread {
+                process: Some(42),
+                thread: 43
+            })
+        );
+        assert_eq!(owner("/proc/self/status"), None);
+    }
+
+    /// A binding taken from the spelling stands only where the link of the
+    /// descriptor the kernel opened names the same task by number and the
+    /// same descriptor (`ProcfsFile::confirm_fdinfo_table`). Another task's
+    /// link, as after a `dup2` over the directory descriptor while the
+    /// opener waited for its turn, a thread's table for a process's, another
+    /// descriptor, a selector, an unrelated path or no link at all unbinds.
+    #[test]
+    fn a_fdinfo_binding_stands_only_where_the_opened_link_names_its_task() {
+        let process = |process| FdinfoTable {
+            process,
+            thread: None,
+        };
+        let thread = FdinfoTable {
+            process: 5,
+            thread: Some(6),
+        };
+        for (spelling, link, kept) in [
+            (
+                "/proc/self/fdinfo/7",
+                Some("/proc/5/fdinfo/7"),
+                Some(process(5)),
+            ),
+            (
+                "/proc/5/fdinfo/7",
+                Some("/proc/5/fdinfo/7"),
+                Some(process(5)),
+            ),
+            (
+                "/proc/thread-self/fdinfo/7",
+                Some("/proc/5/task/6/fdinfo/7"),
+                Some(thread),
+            ),
+            (
+                "/proc/self/task/6/fdinfo/7",
+                Some("/proc/5/task/6/fdinfo/7"),
+                Some(thread),
+            ),
+            ("/proc/5/fdinfo/7", Some("/proc/4/fdinfo/7"), None),
+            ("/proc/5/fdinfo/7", Some("/proc/5/fdinfo/8"), None),
+            ("/proc/self/fdinfo/7", Some("/proc/5/task/5/fdinfo/7"), None),
+            ("/proc/thread-self/fdinfo/7", Some("/proc/5/fdinfo/7"), None),
+            (
+                "/proc/thread-self/fdinfo/7",
+                Some("/proc/5/task/6/fdinfo/8"),
+                None,
+            ),
+            ("/proc/5/fdinfo/7", Some("/proc/self/fdinfo/7"), None),
+            ("/proc/5/fdinfo/7", Some("/proc/5/fdinfo"), None),
+            ("/proc/5/fdinfo/7", Some("/tmp/fdinfo/7"), None),
+            ("/proc/5/fdinfo/7", None, None),
+        ] {
+            let mut file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            file.bind_fdinfo_table(Some((5, 6)));
+            assert!(file.fdinfo_table().is_some(), "{spelling} binds");
+            file.confirm_fdinfo_table(link.map(Path::new));
+            assert_eq!(file.fdinfo_table(), kept, "{spelling} opened as {link:?}");
+        }
+        // Nothing bound stays unbound.
+        let mut file = ProcfsFile::from_path(Path::new("/proc/5/fdinfo/7")).unwrap();
+        file.bind_fdinfo_table(None);
+        file.confirm_fdinfo_table(Some(Path::new("/proc/5/fdinfo/7")));
+        assert_eq!(file.fdinfo_table(), None);
+    }
+
     #[test]
     fn fdinfo_mount_ids_match_distinct_mountinfo_rows_and_repeat() {
         let mountinfo = b"37 29 8:1 / / rw - ext4 /dev/a rw\n\
@@ -10911,16 +11855,90 @@ nr_switches : -1\n";
 00000000fedcba98: 00000003 00000000 00010000 0002 01 12346 /run/socket two\n\
 000000001234abcd: 00000002 00000000 00000000 0001 03 12345\n";
 
+        // The header served is the canonical one, whatever the input's
+        // padding. Only the expected header changed, from the echoed input
+        // header to that constant: the assertion stays byte-exact, and the
+        // input and the expected rows are unchanged.
         assert_eq!(
             sanitize_unix_sockets(contents),
-            b"Num RefCount Protocol Flags Type St Inode Path\n\
+            b"Num       RefCount Protocol Flags    Type St Inode Path\n\
 0000000000000000: 00000002 00000000 00000000 0001 03 0\n\
 0000000000000000: 00000003 00000000 00010000 0002 01 0 /run/socket two\n"
         );
     }
 
+    /// The v7.1.3 row (`%pK:`, `unix_seq_show` in net/unix/af_unix.c) and the
+    /// 7.4-rc3 row (the constant 0 printed `%08u:`) serve the same bytes, so
+    /// the guest's table does not depend on the host kernel.
     #[test]
-    fn unix_sockets_fail_open_on_unknown_schemas() {
+    fn unix_sockets_render_the_v7_1_3_and_v7_4_rc3_layouts_identically() {
+        // Each row as `unix_seq_show` prints it: the identity, then
+        // "%08X %08X %08X %04X %02X %5llu" and, for a bound socket, the path.
+        let table = |identities: [String; 2]| {
+            let rows = [
+                (
+                    3_u32,
+                    0x10000_u32,
+                    2_u32,
+                    1_u32,
+                    12346_u64,
+                    " /run/socket two",
+                ),
+                (2, 0, 1, 3, 12345, ""),
+            ];
+            let mut table =
+                String::from("Num       RefCount Protocol Flags    Type St Inode Path\n");
+            for (identity, (refcount, flags, kind, state, inode, path)) in
+                identities.iter().zip(rows)
+            {
+                table.push_str(&format!(
+                    "{identity}: {refcount:08X} {:08X} {flags:08X} {kind:04X} {state:02X} {inode:>5}{path}\n",
+                    0
+                ));
+            }
+            table
+        };
+        let v7_1_3 = table([
+            format!("{:016x}", 0xfedcba98_u64),
+            format!("{:016x}", 0x1234abcd_u64),
+        ]);
+        let v7_4_rc3 = table([format!("{:08}", 0), format!("{:08}", 0)]);
+        let canonical = b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+0000000000000000: 00000002 00000000 00000000 0001 03 0\n\
+0000000000000000: 00000003 00000000 00010000 0002 01 0 /run/socket two\n";
+
+        assert_eq!(sanitize_unix_sockets(v7_1_3.as_bytes()), canonical);
+        assert_eq!(sanitize_unix_sockets(v7_4_rc3.as_bytes()), canonical);
+    }
+
+    /// Initialize the kernel-opened `path` with `contents`, and require a
+    /// named refusal of `format`, counted under that format, with no
+    /// servable byte. The counter is process-global and monotonic, so the
+    /// count is checked by delta.
+    fn assert_refused_without_bytes(path: &str, format: &str, contents: &[u8]) {
+        // `sanitize_refusal_counts` omits a format with no refusal yet.
+        let count = || sanitize_refusal_counts().get(format).copied().unwrap_or(0);
+        let before = count();
+        let mut file = ProcfsFile::from_path(Path::new(path)).unwrap();
+        file.initialize(contents.to_vec(), ProcfsSnapshotContext::default());
+        assert!(
+            count() > before,
+            "{path}: the refusal must be counted as {format}"
+        );
+        let prefix = format!("procfs sanitize refused {format}: ");
+        assert!(
+            file.sanitize_refusal()
+                .is_some_and(|reason| reason.starts_with(&prefix)),
+            "{path}: {:?}",
+            file.sanitize_refusal()
+        );
+        assert_eq!(file.take(usize::MAX), None, "{path}: no byte is servable");
+    }
+
+    /// A table of unknown shape is refused by name and counted, and no byte
+    /// of it is servable: the host's table never reaches the guest.
+    #[test]
+    fn unix_sockets_refuse_unknown_schemas_by_name() {
         for malformed in [
             b"".as_slice(),
             b"Num RefCount Protocol Flags Type St Inode Path",
@@ -10931,8 +11949,84 @@ nr_switches : -1\n";
             b"Num RefCount Protocol Flags Type St Inode Path\n000000001234abcd: 00000003 00000000 00000000 0001 03 18446744073709551616\n",
             b"Num RefCount Protocol Flags Type St Inode Path\n000000001234abcd: 00000003 00000000 00000000 0001\n",
         ] {
-            assert_eq!(sanitize_unix_sockets(malformed), malformed);
+            assert!(sanitize_unix_sockets(malformed).is_empty());
+            assert_refused_without_bytes("/proc/net/unix", "unix", malformed);
         }
+    }
+
+    /// `unix_seq_show` prints RefCount, Protocol, Flags, Type and St with
+    /// `%X`: upper-case hex is the kernel's own alphabet, served as printed.
+    #[test]
+    fn unix_sockets_accept_uppercase_hex_as_the_kernel_prints_it() {
+        assert_eq!(
+            sanitize_unix_sockets(
+                b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+000000001234abcd: 0000000A 00000000 00000000 0001 03 12345\n"
+            ),
+            b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+0000000000000000: 0000000A 00000000 00000000 0001 03 0\n"
+        );
+    }
+
+    /// A bound socket's path is raw bytes (`unix_seq_show` prints every byte
+    /// but NUL as it is): a name that is not UTF-8 is served as printed.
+    #[test]
+    fn unix_sockets_keep_a_non_utf8_path_as_raw_bytes() {
+        assert_eq!(
+            sanitize_unix_sockets(
+                b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+000000001234abcd: 00000002 00000000 00000000 0001 01 12345 /tmp/\xff\n"
+            ),
+            b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+0000000000000000: 00000002 00000000 00000000 0001 01 0 /tmp/\xff\n"
+        );
+    }
+
+    /// A newline in a path splits its row. When the rest is not a row, the
+    /// table is refused by name, and no byte of it is servable.
+    #[test]
+    fn unix_sockets_refuse_a_path_split_by_a_newline() {
+        let split = b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+000000001234abcd: 00000002 00000000 00000000 0001 01 12345 /tmp/a\nb\n";
+
+        assert!(sanitize_unix_sockets(split).is_empty());
+        assert_refused_without_bytes("/proc/net/unix", "unix", split);
+    }
+
+    /// Rows one step from an accepted shape are refused by name, so no
+    /// acceptance is wider than the kernel's format: a nonzero or short
+    /// 7.4-rc3 `Num`, a `Num` without its colon, a lower-case `%X` field, a path
+    /// separated from `Inode` by anything but one space, and an empty path
+    /// after that space (a bound socket prints at least `@`).
+    #[test]
+    fn unix_sockets_refuse_near_miss_rows_by_name() {
+        for row in [
+            "00000001: 00000002 00000000 00000000 0001 01 12345",
+            "0000000: 00000002 00000000 00000000 0001 01 12345",
+            "00000000 00000002 00000000 00000000 0001 01 12345",
+            "000000001234abcd: 0000000a 00000000 00000000 0001 01 12345",
+            "000000001234abcd: 00000002 00000000 00000000 0001 01 12345\t/tmp/x",
+            "000000001234abcd: 00000002 00000000 00000000 0001 01 12345 ",
+        ] {
+            let table = format!("Num       RefCount Protocol Flags    Type St Inode Path\n{row}\n");
+            assert!(sanitize_unix_sockets(table.as_bytes()).is_empty(), "{row}");
+            assert_refused_without_bytes("/proc/net/unix", "unix", table.as_bytes());
+        }
+    }
+
+    /// `unix_seq_show` separates a bound path from `Inode` by one space, and
+    /// the path is every byte after it: a name that begins with a space keeps
+    /// that space.
+    #[test]
+    fn unix_sockets_keep_a_path_that_begins_with_a_space() {
+        assert_eq!(
+            sanitize_unix_sockets(
+                b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+000000001234abcd: 00000002 00000000 00000000 0001 01 12345  lead\n"
+            ),
+            b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+0000000000000000: 00000002 00000000 00000000 0001 01 0  lead\n"
+        );
     }
 
     #[test]
@@ -10970,12 +12064,61 @@ total_commit_ms 0\n"
 00000000fedcba98 10 20 00000002 3 4 5 6 7 12346\n\
 000000001234abcd 4 10 00000001 0 0 0 2 0 12345\n";
 
+        // The header served is the canonical one, whatever the input's
+        // padding. Only the expected header changed, from the echoed input
+        // header to that constant: the assertion stays byte-exact, and the
+        // input and the expected rows are unchanged.
         assert_eq!(
             sanitize_netlink_sockets(contents),
-            b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n\
+            b"sk               Eth Pid        Groups   Rmem     Wmem     Dump  Locks    Drops    Inode\n\
 0000000000000000 4 10 00000001 0 0 0 2 0 0\n\
 0000000000000000 10 20 00000002 3 4 5 6 7 0\n"
         );
+    }
+
+    /// The v7.1.3 table (`%pK` under a header padded for it,
+    /// `netlink_native_seq_show` in net/netlink/af_netlink.c) and the 7.4-rc3
+    /// table (the literal `0` under a narrower header) serve the same bytes,
+    /// so the guest's table does not depend on the host kernel.
+    #[test]
+    fn netlink_sockets_render_the_v7_1_3_and_v7_4_rc3_layouts_identically() {
+        // Each row as `netlink_native_seq_show` prints it: the identity, then
+        // "%-3d %-10u %08x %-8d %-8d %-5d %-8d %-8u %-8llu".
+        let table = |header: &str, identities: [String; 2]| {
+            let rows = [
+                (
+                    10_u32, 20_u32, 2_u32, 3_u32, 4_u32, 5_u32, 6_u32, 7_u32, 12346_u64,
+                ),
+                (4, 10, 1, 0, 0, 0, 2, 0, 12345),
+            ];
+            let mut table = format!("{header}\n");
+            for (identity, (eth, pid, groups, rmem, wmem, dump, locks, drops, inode)) in
+                identities.iter().zip(rows)
+            {
+                table.push_str(&format!(
+                    "{identity} {eth:<3} {pid:<10} {groups:08x} {rmem:<8} {wmem:<8} {dump:<5} {locks:<8} {drops:<8} {inode:<8}\n"
+                ));
+            }
+            table
+        };
+        let v7_1_3 = table(
+            "sk               Eth Pid        Groups   Rmem     Wmem     Dump  Locks    Drops    Inode",
+            [
+                format!("{:016x}", 0xfedcba98_u64),
+                format!("{:016x}", 0x1234abcd_u64),
+            ],
+        );
+        // 7.4-rc3 prints "0  %-3d ...": the literal 0, then two spaces.
+        let v7_4_rc3 = table(
+            "sk Eth Pid        Groups   Rmem     Wmem     Dump  Locks    Drops    Inode",
+            [String::from("0 "), String::from("0 ")],
+        );
+        let canonical = b"sk               Eth Pid        Groups   Rmem     Wmem     Dump  Locks    Drops    Inode\n\
+0000000000000000 4 10 00000001 0 0 0 2 0 0\n\
+0000000000000000 10 20 00000002 3 4 5 6 7 0\n";
+
+        assert_eq!(sanitize_netlink_sockets(v7_1_3.as_bytes()), canonical);
+        assert_eq!(sanitize_netlink_sockets(v7_4_rc3.as_bytes()), canonical);
     }
 
     #[test]
@@ -11033,8 +12176,10 @@ total_commit_ms 0\n"
         }
     }
 
+    /// A table of unknown shape is refused by name and counted, and no byte
+    /// of it is servable: the host's table never reaches the guest.
     #[test]
-    fn netlink_sockets_fail_open_on_unknown_schemas() {
+    fn netlink_sockets_refuse_unknown_schemas_by_name() {
         for malformed in [
             b"".as_slice(),
             b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode",
@@ -11043,7 +12188,25 @@ total_commit_ms 0\n"
             b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n000000001234abcd 4 10 00000001 0 0 0 2 zero 12345\n",
             b"sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n000000001234abcd 4 10 00000001 0 0 0 2 0 12345 extra\n",
         ] {
-            assert_eq!(sanitize_netlink_sockets(malformed), malformed);
+            assert!(sanitize_netlink_sockets(malformed).is_empty());
+            assert_refused_without_bytes("/proc/net/netlink", "netlink", malformed);
+        }
+    }
+
+    /// Rows one step from an accepted `sk` are refused by name: the 7.4-rc3
+    /// literal is exactly `0`, and the v7.1.3 address exactly 16 digits.
+    #[test]
+    fn netlink_sockets_refuse_near_miss_rows_by_name() {
+        for row in [
+            "1 4 10 00000001 0 0 0 2 0 12345",
+            "00 4 10 00000001 0 0 0 2 0 12345",
+        ] {
+            let table = format!("sk Eth Pid Groups Rmem Wmem Dump Locks Drops Inode\n{row}\n");
+            assert!(
+                sanitize_netlink_sockets(table.as_bytes()).is_empty(),
+                "{row}"
+            );
+            assert_refused_without_bytes("/proc/net/netlink", "netlink", table.as_bytes());
         }
     }
 

@@ -42,6 +42,19 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--lib",
             "--bins",
         ]),
+        // hermit-run's lib and bin tests with exec-stop-launcher and
+        // liteinst, prepared in its own cohort
+        // (nextest_binaries::EXEC_STOP_LAUNCHER_COHORT): the only selection
+        // that compiles the code behind cfg(all(feature =
+        // "exec-stop-launcher", feature = "liteinst")).
+        "test.hermit_exec_stop_launcher" => Some(&[
+            "-p",
+            "hermit-run",
+            "--features",
+            "exec-stop-launcher,liteinst",
+            "--lib",
+            "--bins",
+        ]),
         "test.detcore_unit" => Some(&["-p", "hermit-detcore", "--lib", "--bins"]),
         "test.inherited_terminal_read" => Some(&[
             "-p",
@@ -70,7 +83,279 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
         | "super.weekly_pmu_parallel_memory_diagnostic_mem_race_top_detcore" => {
             Some(&["-p", "hermit-detcore-tests", "--test", "tests_parallelism"])
         }
-        "test.hermit_integration" | "test.pmu_integration_cases" => Some(&[
+        "test.hermit_integration" => Some(&[
+            "-p",
+            "hermit-run",
+            "--features",
+            "liteinst",
+            "--test",
+            "aio_nr_determinism",
+            "--test",
+            "arch_prctl",
+            "--test",
+            "arch_status_determinism",
+            "--test",
+            "block_inflight_determinism",
+            "--test",
+            "btrfs_commit_determinism",
+            "--test",
+            "btrfs_pinned_bytes_determinism",
+            "--test",
+            "btrfs_reservation_determinism",
+            "--test",
+            "btrfs_reserved_bytes_determinism",
+            "--test",
+            "buddyinfo_determinism",
+            "--test",
+            "chaos_sched_yield_progress",
+            "--test",
+            "chaos_stress_pmu_detection",
+            "--test",
+            "child_time_rpc",
+            "--test",
+            "chown_virtual_root_identity",
+            "--test",
+            "cli_owned_lifecycle",
+            "--test",
+            "clock_determinism",
+            "--test",
+            "clock_discipline_determinism",
+            "--test",
+            "clock_passthrough",
+            "--test",
+            "compression",
+            "--test",
+            "container_init_deadline",
+            "--test",
+            "copy_file_range_refusal",
+            "--test",
+            "cppc_feedback_determinism",
+            "--test",
+            "cpufreq_avg_determinism",
+            "--test",
+            "cpuidle_determinism",
+            "--test",
+            "deadline_slice_cap",
+            "--test",
+            "dentry_state_determinism",
+            "--test",
+            "dispatch_stats",
+            "--test",
+            "epoll_determinism",
+            "--test",
+            "epoll_pwait_zero_timeout_progress",
+            "--test",
+            "external_signal_interrupt",
+            "--test",
+            "fatal_core_capture",
+            "--test",
+            "file_nr_determinism",
+            "--test",
+            "first_seen_mtime",
+            "--test",
+            "flock_exclusion",
+            "--test",
+            "fp_reduction_determinism",
+            "--test",
+            "frontier_app_benchmarks",
+            "--test",
+            "full_summary_futex_order",
+            "--test",
+            "futex2_refusal",
+            "--test",
+            "getitimer_determinism",
+            "--test",
+            "hashseed_determinism",
+            "--test",
+            "host_fact_v3",
+            "--test",
+            "host_kernel_probes",
+            "--test",
+            "host_security_identity",
+            "--test",
+            "image_archive",
+            "--test",
+            "inode_nr_determinism",
+            "--test",
+            "integration_matrix",
+            "--test",
+            "io_uring_ring_determinism",
+            "--test",
+            "ipc_determinism",
+            "--test",
+            "irq_per_cpu_determinism",
+            "--test",
+            "kernel_keyring",
+            "--test",
+            "key_users_determinism",
+            "--test",
+            "kvm_harder",
+            "--test",
+            "kvm_lifecycle_timing_log_level",
+            "--test",
+            "language_runtime_determinism",
+            "--test",
+            "leveldb",
+            "--test",
+            "lit",
+            "--test",
+            "madvise",
+            "--test",
+            "meminfo_determinism",
+            "--test",
+            "mmap_determinism",
+            "--test",
+            "mmap_stress_determinism",
+            "--test",
+            "mount_introspection",
+            "--test",
+            "name_to_handle_refusal",
+            "--test",
+            "netlink_table_determinism",
+            "--test",
+            "netns_cookie_determinism",
+            "--test",
+            "node_vmstat_determinism",
+            "--test",
+            "numa_maps_determinism",
+            "--test",
+            "optional_memory_features",
+            "--test",
+            "perf_event_refusal",
+            "--test",
+            "pidfd_creation",
+            "--test",
+            "ppoll_simulation",
+            "--test",
+            "prctl_dumpable_determinism",
+            "--test",
+            "privileged_observation",
+            "--test",
+            "proc_fd_link_determinism",
+            "--test",
+            "proc_fdinfo_determinism",
+            "--test",
+            "proc_locks_determinism",
+            "--test",
+            "process_isolation_refusals",
+            "--test",
+            "procfs_determinism",
+            "--test",
+            "procfs_positioned_determinism",
+            "--test",
+            "prodcons_determinism",
+            "--test",
+            "protocols_determinism",
+            "--test",
+            "pselect6_simulation",
+            "--test",
+            "ptrace_refusal",
+            "--test",
+            "pty_nr_determinism",
+            "--test",
+            "python_stdlib",
+            "--test",
+            "random_determinism",
+            "--test",
+            "random_uuid_determinism",
+            "--test",
+            "redis_strict",
+            "--test",
+            "relaxed_flag_matrix",
+            "--test",
+            "remap_file_pages_refusal",
+            "--test",
+            "reopened_pipe_progress",
+            "--test",
+            "robust_futex_owner_death",
+            "--test",
+            "robust_list_queries",
+            "--test",
+            "sched_setattr_abi",
+            "--test",
+            "sched_setattr_noop",
+            "--test",
+            "scheduler_deadlock",
+            "--test",
+            "scheduler_policy_queries",
+            "--test",
+            "self_sched_determinism",
+            "--test",
+            "self_schedstat_determinism",
+            "--test",
+            "setup_retry",
+            "--test",
+            "sigmask_preemption",
+            "--test",
+            "signal_determinism",
+            "--test",
+            "smaps_determinism",
+            "--test",
+            "smaps_rollup_determinism",
+            "--test",
+            "so_incoming_cpu",
+            "--test",
+            "socket_cookie_determinism",
+            "--test",
+            "socket_ioctl_timestamp_determinism",
+            "--test",
+            "socket_timestamp_determinism",
+            "--test",
+            "sockstat_determinism",
+            "--test",
+            "softnet_stat_determinism",
+            "--test",
+            "sqlite_veryquick",
+            "--test",
+            "standalone",
+            "--test",
+            "stress_suite",
+            "--test",
+            "swaps_determinism",
+            "--test",
+            "syscall_file_io",
+            "--test",
+            "syscall_file_metadata",
+            "--test",
+            "syscall_quick_wins",
+            "--test",
+            "sysv_legacy_fallbacks",
+            "--test",
+            "tcp_info_determinism",
+            "--test",
+            "terminal_child_selectors",
+            "--test",
+            "thp_stats_determinism",
+            "--test",
+            "thread_scheduling_fairness",
+            "--test",
+            "thread_self_procfs_determinism",
+            "--test",
+            "thread_sync_determinism",
+            "--test",
+            "uevent_seqnum_determinism",
+            "--test",
+            "unix_socket_table_determinism",
+            "--test",
+            "utimensat_mtime",
+            "--test",
+            "verification_report_cli",
+            "--test",
+            "verification_report_consumers",
+            "--test",
+            "verify_claim_names_its_limit",
+            "--test",
+            "version_provenance",
+            "--test",
+            "vmstat_determinism",
+            "--test",
+            "waitid_signal_interrupt",
+            "--test",
+            "writev_determinism",
+            "--test",
+            "zero_copy_pipe_fallback",
+        ]),
+        "test.pmu_integration_cases" => Some(&[
             "-p",
             "hermit-run",
             "--features",
@@ -364,6 +649,14 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "liteinst_stacks",
         ]),
+        "privileged-test.autofs_cases" => Some(&[
+            "-p",
+            "hermit-run",
+            "--features",
+            "liteinst",
+            "--test",
+            "mount_introspection",
+        ]),
         "test.cli"
         | "test.isolated_dbt_workdir"
         | "test.cli_on_host"
@@ -563,13 +856,28 @@ pub(super) fn execution_command(step: &dagrun::model::Step) -> Result<String, St
         .iter()
         .position(|arg| arg == "--")
         .ok_or_else(|| format!("{} omits its pinned-root command boundary", step.tag()))?;
+    // Guard acceptance is tied to the tag: family-mapped test nodes use
+    // the test-node guard, every other pinned node the build guard.
+    // Generation already refuses other pairings; keep the reader this
+    // strict so validation is self-contained (seat F7).
+    let (current_guard, legacy_guard) =
+        if crate::validation_dag::family_image_reference(&step.tag()).is_some() {
+            (
+                crate::validation_dag::TEST_NODE_COMMAND_GUARD,
+                crate::validation_dag::LEGACY_TEST_NODE_COMMAND_GUARD,
+            )
+        } else {
+            (
+                crate::validation_dag::PINNED_ROOT_COMMAND_GUARD,
+                crate::validation_dag::LEGACY_PINNED_ROOT_COMMAND_GUARD,
+            )
+        };
     match &args[boundary + 1..] {
         [shell, option, guard, argv0, payload]
             if shell == "bash"
                 && option == "-c"
                 && argv0 == "bash"
-                && (guard == crate::validation_dag::PINNED_ROOT_COMMAND_GUARD
-                    || guard == crate::validation_dag::LEGACY_PINNED_ROOT_COMMAND_GUARD) =>
+                && (guard == current_guard || guard == legacy_guard) =>
         {
             Ok(payload.clone())
         }
@@ -723,10 +1031,14 @@ fn preparation_profile<'a>(
         return Err(format!("{tag} has duplicate prepared commands"));
     }
     let profile = rest.split_whitespace().next().unwrap_or("");
-    let cohort = crate::nextest_binaries::NATIVE_EXEC_COHORT;
-    if let Ok(expected) = crate::nextest_binaries::cohort_prepare_command(profile, cohort) {
-        if expected.strip_prefix(marker) == Some(rest) {
-            return Ok(Some((profile, cohort)));
+    for cohort in crate::nextest_binaries::REGISTERED_COHORTS {
+        if cohort.is_default() {
+            continue;
+        }
+        if let Ok(expected) = crate::nextest_binaries::cohort_prepare_command(profile, cohort) {
+            if expected.strip_prefix(marker) == Some(rest) {
+                return Ok(Some((profile, cohort)));
+            }
         }
     }
     // The full producer appends `--build-mode "${HERMIT_VALIDATE_BUILD_MODE:-cargo}"`
@@ -894,6 +1206,8 @@ pub(super) fn assert_preparation_dependencies(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
     use crate::nextest_binaries::REQUIRED_ENV;
     use crate::nextest_binaries::SELECTION_ENV;
@@ -1207,6 +1521,20 @@ mod tests {
             preparation_profile("producer", &cohort_command).unwrap(),
             Some(("full", crate::nextest_binaries::NATIVE_EXEC_COHORT))
         );
+        // Every registered non-default cohort has the same one form, keyed
+        // by its own slug.
+        let exec_stop_command = format!(
+            "prefix && {}",
+            crate::nextest_binaries::cohort_prepare_command(
+                "full",
+                crate::nextest_binaries::EXEC_STOP_LAUNCHER_COHORT
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            preparation_profile("producer", &exec_stop_command).unwrap(),
+            Some(("full", crate::nextest_binaries::EXEC_STOP_LAUNCHER_COHORT))
+        );
         for refused in [
             // Without its assert half.
             "prefix && ./ci/nextest-binaries.rs prepare full --build-mode \"${HERMIT_VALIDATE_BUILD_MODE:-cargo}\" --cohort native-exec"
@@ -1493,6 +1821,33 @@ mod tests {
         let ledger_key = crate::nextest_binaries::selection_key(&ledger_selection);
         assert_eq!(full.get(&ledger_key), Some(&ledger_selection));
         assert!(!portable.contains_key(&ledger_key));
+        // The PMU integration nodes carry only the full label, so their
+        // selection is full-only once it is separate from the hermit
+        // integration selection.
+        let pmu = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "test.pmu_integration_cases")
+            .unwrap();
+        assert_command_selection(pmu).unwrap();
+        let pmu_selection: Vec<String> = serde_json::from_str(&pmu.env[SELECTION_ENV]).unwrap();
+        let pmu_key = crate::nextest_binaries::selection_key(&pmu_selection);
+        assert_eq!(full.get(&pmu_key), Some(&pmu_selection));
+        assert!(!portable.contains_key(&pmu_key));
+        // The privileged-only autofs node is not run by the full lane, but
+        // full preparation is the producer its privileged barrier verifies,
+        // so its exact selection is prepared by full and by no portable node.
+        let autofs = graph
+            .steps
+            .iter()
+            .find(|step| step.tag() == "privileged-test.autofs_cases")
+            .unwrap();
+        assert_command_selection(autofs).unwrap();
+        let autofs_selection: Vec<String> =
+            serde_json::from_str(&autofs.env[SELECTION_ENV]).unwrap();
+        let autofs_key = crate::nextest_binaries::selection_key(&autofs_selection);
+        assert_eq!(full.get(&autofs_key), Some(&autofs_selection));
+        assert!(!portable.contains_key(&autofs_key));
         let mut narrowed = ledger.clone();
         narrowed.cmd = narrowed
             .cmd
@@ -1505,9 +1860,24 @@ mod tests {
             .replace("kvm-gap-ledger.rs run -- ", "kvm-gap-ledger.rs run ");
         let error = assert_command_selection(&separatorless).unwrap_err();
         assert!(error.contains("no `--`"), "{error}");
-        // The hardware CLI selection, the inherited-terminal selection and the
-        // KVM gap-ledger selection are full-only.
-        assert_eq!(full.len(), portable.len() + 3);
+        // The hardware CLI selection, the inherited-terminal selection, the
+        // KVM gap-ledger selection, the PMU integration selection and the
+        // privileged-only autofs selection are full-only, and nothing else is.
+        let full_only: BTreeSet<String> = full
+            .keys()
+            .filter(|key| !portable.contains_key(*key))
+            .cloned()
+            .collect();
+        assert_eq!(
+            full_only,
+            BTreeSet::from([
+                hardware_key.clone(),
+                terminal_key.clone(),
+                ledger_key.clone(),
+                pmu_key.clone(),
+                autofs_key.clone()
+            ])
+        );
         for (key, selection) in &portable {
             assert_eq!(full.get(key), Some(selection));
         }

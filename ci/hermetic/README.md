@@ -18,10 +18,25 @@ and cgroup policy stay on the host. Each wrapped build or test node runs in a
 privileged podman container pinned by digest, with `/dev/kvm` passed through
 when present, no runtime network, and source at `/src`. The wrapper defaults
 that source bind to read-only; validation nodes explicitly make it writable.
-Output and target volumes are separate and writable. `--cgroups=disabled` keeps
+Output and target volumes are separate and writable. The running kernel's
+generated uapi `asm` headers
+(`/lib/modules/$(uname -r)/build/arch/x86/include/generated/uapi/asm`) are
+bound read-only at that same path, because Detcore's syscall-table test checks
+its tables against the kernel the tests run on and the image carries no kernel
+headers; on a host without them nothing is bound and that test fails by name.
+The wrapper names that directory in `HERMIT_RUNNING_KERNEL_UAPI_ASM` in every
+container, bound or not, and where it is set the test reads only that header,
+never one the image might carry.
+`--cgroups=disabled` keeps
 the container and its monitor inside the caller's resource group, so the outer
 node accounts for and terminates their descendants. The wrapper does not add
-an independent container resource policy.
+an independent container resource policy. `--init` makes Podman's own init
+(catatonit, from the host) the container's PID 1 and the command its child, so
+orphans the command's descendants leave, such as Hermit's detached KVM teardown
+helper, are reaped instead of piling up as zombies under the command.
+catatonit leaves SIGTSTP, SIGTTIN and SIGTTOU blocked in that child, so the
+command runs under `/bin/env --default-signal`, which starts it with every
+signal at its default action and none blocked, as it was before `--init`.
 
 ```
 ci/hermetic/build-image.sh                     # build from the lock, load, record the digest
@@ -63,7 +78,12 @@ receipt's `flake_reattestation` records that its current flake.nix input was
 re-attested by abort-stub evaluation at the same derivation, not rebuilt;
 composed receipts carry their own evidence limitations (local two-store
 method) and must not be selected by any consumer until repin-grade builds
-replace them. The recorded
+replace them, with one approved exception (lead-014, 2026-11-21): family
+system-utils may select only suite digest
+sha256:d0b77afab51be486af62c9977d9e9d6ce0dde82dca2f4a75d5cedcd666c3434c
+under its production-route qualification receipt in
+`images/qualification/`; the exception expires at the next suite repin
+and is no precedent for any other family or digest. The recorded
 build-source commit, tree, and archive are historical evidence: review binds
 those identities and the external bytes and logs to the receipt. Rebases can
 rewrite commit ancestry, so live equivalence is deliberately limited to those
@@ -101,6 +121,9 @@ records, and the superseded 4e1605ec archive bytes. `build-image.sh` remains
 useful for a local one-off build, but one such build is not sufficient
 evidence for another reviewed repin. A future repin must replace the digest
 and provenance together with two new agreeing isolated builds.
+Composed images are provisioned separately with
+`build-composed-images.sh` (or verified already present with `--check`);
+hosts without a mapped image refuse at validate admission.
 
 `setup.pinned_root_fetch` fetches Cargo dependencies; it does not prepare the OCI
 image. Prepare that image explicitly with `build-image.sh` when needed. Each
@@ -203,7 +226,11 @@ ignored-test arguments after `--` without appending a misplaced worker flag.
 Other wrapped commands retain the scheduler's appended arguments as literal
 arguments to their original command.
 
-The wrapper imports only Cargo's registry and Git caches from `--cargo-home`.
+The wrapper imports only Cargo's registry and Git caches from `--cargo-home`,
+bind-mounted writable, because an explicit home is a build-phase home that
+Cargo extracts into. Without `--cargo-home`, the caller's `$HOME/.cargo`
+caches are instead seeded under a private overlay, so the caller's live
+caches are never written; `--cargo-home none` imports no caches at all.
 The image supplies executables and configuration; host Cargo configuration and
 rustup proxies do not cross that boundary. `VALIDATE_RUN_STATE` and structured
 result paths are mounted explicitly so the original producers and consumers

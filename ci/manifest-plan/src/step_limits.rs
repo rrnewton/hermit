@@ -77,8 +77,12 @@ pub(crate) const WALL_CEILING_EXCEPTIONS: &[(&str, &str)] = &[
         "571 passing runs to 2026-11-02 peaked at a 587-second wall; 1.5 times that needs 881 s",
     ),
     (
+        "build.hermit_exec_stop_launcher_compile_in_pinned_root",
+        "derived from build.hermit_native_exec_compile_in_pinned_root, which it copies and extends with the detcore-liteinst runtime build: that node passed at up to 592 s and was WALL-killed at 606 s (P1 bead dh-59uah3); 1.5 times the kill wall needs 909 s",
+    ),
+    (
         "check.script_unit_tests",
-        "2 WALL kills at up to 901 s under concurrent validations to 2026-11-02 (553 passing runs, largest wall 896 s); 1.5 times the kill wall needs 1352 s",
+        "2 WALL kills at up to 901 s under concurrent validations to 2026-11-02 (553 passing runs, largest wall 896 s), which set 1500 s (1.5 times the kill wall); raised 2026-11-25 to 2400 s with the five-job width cut (review estimate of the worst five-job wall about 1,580 s; re-derive from the measured in-full five-job walls once they exist)",
     ),
     (
         "build.buck_release_artifact",

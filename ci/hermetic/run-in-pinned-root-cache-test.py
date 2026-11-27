@@ -5,13 +5,18 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Exercise the actual wrapper's cache mounts without starting a container."""
+"""Exercise the actual wrapper's cache mounts, mostly without a container.
+
+One live case (SeededOverlayLive) starts a real container where podman and
+the pinned image are available, and skips by name where they are not.
+"""
 
 import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -62,6 +67,16 @@ def repository_neutral_env():
     }
 
 
+def signal_masks(status):
+    """The SigBlk and SigIgn masks of a /proc/<pid>/status text, as integers."""
+    masks = {}
+    for line in status.splitlines():
+        key, _, value = line.partition(":")
+        if key in ("SigBlk", "SigIgn"):
+            masks[key] = int(value.strip(), 16)
+    return masks
+
+
 class CargoCacheMounts(unittest.TestCase):
     def setUp(self):
         self.scratch = tempfile.TemporaryDirectory(prefix="hermit-pinned-root-cache-")
@@ -87,7 +102,7 @@ class CargoCacheMounts(unittest.TestCase):
         fake = self.root / "tools/podman"
         fake.write_text(
             f"#!{sys.executable}\n"
-            "import json, os, pathlib, sys\n"
+            "import json, os, pathlib, signal, sys\n"
             "with open(os.environ['PINNED_ROOT_CAPTURE'], 'a') as out:\n"
             "    out.write(json.dumps(sys.argv[1:]) + '\\n')\n"
             "if sys.argv[1] == 'run' and os.environ.get('PINNED_ROOT_WRITE_AGENT_UTILS_STATE') == '1':\n"
@@ -97,6 +112,10 @@ class CargoCacheMounts(unittest.TestCase):
             "        pathlib.Path(by_destination[destination], 'container-write').write_text(destination + '\\n')\n"
             "if sys.argv[1] == 'run' and os.environ.get('PINNED_ROOT_EXEC_PAYLOAD') == '1':\n"
             "    os.sched_setaffinity(0, json.loads(os.environ['PINNED_ROOT_RUNTIME_AFFINITY']))\n"
+            "    leftover = json.loads(os.environ.get('PINNED_ROOT_RUNTIME_SIGNALS', '{}'))\n"
+            "    signal.pthread_sigmask(signal.SIG_BLOCK, leftover.get('block', []))\n"
+            "    for number in leftover.get('ignore', []):\n"
+            "        signal.signal(number, signal.SIG_IGN)\n"
             "    image = next(i for i, arg in enumerate(sys.argv) if arg.startswith('fixture@sha256:'))\n"
             "    os.execv(sys.argv[image + 1], sys.argv[image + 1:])\n"
             "if sys.argv[1:3] == ['image', 'inspect']: print('c' * 64); sys.exit(0)\n"
@@ -118,8 +137,11 @@ class CargoCacheMounts(unittest.TestCase):
         caller_affinity=None,
         project=None,
         bundle_lower=None,
+        hermit_bundle=None,
         extra_env=None,
         extra_forwarded=None,
+        prefix=None,
+        home=None,
     ):
         # The wrapper gets this process's environment, as it does in
         # production, so an inherited Git location variable reaches it.
@@ -142,20 +164,31 @@ class CargoCacheMounts(unittest.TestCase):
             forwarded += ["--env", "VALIDATE_RUN_STATE"]
         if bundle_lower is not None:
             forwarded += ["--bundle-lower", str(bundle_lower)]
+        if hermit_bundle is not None:
+            forwarded += ["--hermit-bundle", str(hermit_bundle)]
         if extra_env:
             env.update(extra_env)
         if extra_forwarded:
             forwarded += extra_forwarded
+        # `home` pins the HOME the wrapper sees: a path, or "" for unset.
+        # Seeding reads the caller's HOME, so no seeded-mode case may
+        # inherit this process's real one.
+        if home is not None:
+            if home == "":
+                env.pop("HOME", None)
+            else:
+                env["HOME"] = str(home)
+        cargo_args = [] if cargo_home is None else ["--cargo-home", cargo_home]
         result = subprocess.run(
             [
+                *(prefix or []),
                 "bash",
                 str(WRAPPER),
                 "--src",
                 str(source),
                 "--out",
                 output,
-                "--cargo-home",
-                cargo_home,
+                *cargo_args,
                 "--digest",
                 "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
                 *forwarded,
@@ -312,7 +345,7 @@ class CargoCacheMounts(unittest.TestCase):
             self.assertEqual(
                 calls[1], ["image", "inspect", "--format", "{{.Id}}", calls[0][-1]]
             )
-            self.assertEqual(calls[2][-6], calls[0][-1])
+            self.assertEqual(calls[2][-8], calls[0][-1])
             mounts = [
                 calls[2][i + 1]
                 for i, value in enumerate(calls[2])
@@ -411,6 +444,12 @@ class CargoCacheMounts(unittest.TestCase):
                 f"type=bind,source={self.root}/cargo/git,destination=/build/.cargo/git",
             ],
         )
+        # The explicit home stays a writable bind: it is a build-phase home
+        # cargo extracts into, never the caller's live ~/.cargo.
+        self.assertTrue(
+            all("ro=true" not in mount and "readonly" not in mount for mount in imports),
+            imports,
+        )
         self.assertIn(
             f"type=bind,source={self.root}/source,destination=/src,ro=true", mounts
         )
@@ -438,9 +477,11 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertIn("--network=none", argv)
         self.assertIn("--http-proxy=false", argv)
         self.assertEqual(
-            argv[-6:],
+            argv[-8:],
             [
                 "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "/bin/env",
+                "--default-signal",
                 "/bin/taskset",
                 "--cpu-list",
                 ",".join(map(str, sorted(os.sched_getaffinity(0)))),
@@ -462,6 +503,71 @@ class CargoCacheMounts(unittest.TestCase):
             "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"
         )
         self.assertLess(argv.index("GIT_OPTIONAL_LOCKS=0"), image)
+
+    def test_payload_is_not_the_container_init(self):
+        # The payload is exec'd as PID 1 of the container's PID namespace
+        # unless Podman runs an init above it, and every orphan in the
+        # namespace is then re-parented to the payload, which waits only for
+        # its own children: one zombie per KVM run under test-harness. --init
+        # must be a `podman run` option, before the image; after it, it would
+        # be a payload argument.
+        result, calls = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = calls[1]
+        self.assertEqual(argv[0], "run")
+        self.assertEqual(argv.count("--init"), 1)
+        image = argv.index(
+            "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        )
+        self.assertLess(argv.index("--init"), image)
+
+    def test_payload_starts_with_default_signal_actions_and_none_blocked(self):
+        # Under --init the payload is catatonit's child, and catatonit leaves
+        # SIGTSTP, SIGTTIN and SIGTTOU blocked there. The blocked mask survives
+        # execve, so every process the payload started inherited it, and the
+        # cli tests that compare a zombie's /proc/<pid>/stat signal fields with
+        # Linux's answer failed. The fake runtime leaves those three blocked,
+        # and also leaves three actions ignored (being Python, it ignores
+        # SIGPIPE and SIGXFSZ itself as well), before it execs the payload.
+        # The payload must see no signal blocked and none of 1-31 or 34-64
+        # ignored; for 32 and 33 it keeps exactly this test's own setting.
+        # glibc reserves signals 32 and 33 for its threads library, and sigaction refuses to change them.
+        reserved = (1 << 31) | (1 << 32)
+        own = signal_masks(Path("/proc/self/status").read_text())
+        result, calls = self.invoke(
+            command=["cat", "/proc/self/status"],
+            extra_env={
+                "PINNED_ROOT_EXEC_PAYLOAD": "1",
+                "PINNED_ROOT_RUNTIME_AFFINITY": json.dumps(
+                    sorted(os.sched_getaffinity(0))
+                ),
+                "PINNED_ROOT_RUNTIME_SIGNALS": json.dumps(
+                    {
+                        "block": [signal.SIGTSTP, signal.SIGTTIN, signal.SIGTTOU],
+                        "ignore": [signal.SIGPIPE, signal.SIGXFSZ, signal.SIGTERM],
+                    }
+                ),
+            },
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        masks = signal_masks(result.stdout)
+        self.assertEqual(sorted(masks), ["SigBlk", "SigIgn"], result.stdout)
+        ignored = masks["SigIgn"]
+        self.assertEqual(
+            {
+                "SigBlk": f"{masks['SigBlk']:016x}",
+                "SigIgn 1-31": f"{ignored & 0x7FFFFFFF:016x}",
+                "SigIgn 32-33": f"{ignored & reserved:016x}",
+                "SigIgn 34-64": f"{ignored >> 33:016x}",
+            },
+            {
+                "SigBlk": f"{0:016x}",
+                "SigIgn 1-31": f"{0:016x}",
+                "SigIgn 32-33": f"{own['SigIgn'] & reserved:016x}",
+                "SigIgn 34-64": f"{0:016x}",
+            },
+        )
 
     def test_payload_uses_cargo_checksum_freshness(self):
         # Every pinned-root container shares /src/target, and Cargo marks a
@@ -669,9 +775,11 @@ class CargoCacheMounts(unittest.TestCase):
         self.assertIn("--network=none", argv)
         self.assertIn("--http-proxy=false", argv)
         self.assertEqual(
-            argv[-6:],
+            argv[-8:],
             [
                 "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                "/bin/env",
+                "--default-signal",
                 "/bin/taskset",
                 "--cpu-list",
                 ",".join(map(str, sorted(os.sched_getaffinity(0)))),
@@ -705,6 +813,132 @@ class CargoCacheMounts(unittest.TestCase):
                 ]
             ],
         )
+
+    def make_home_with_caches(self):
+        home = self.root / "home"
+        for directory in (".cargo/registry", ".cargo/git", ".cargo/bin"):
+            (home / directory).mkdir(parents=True, exist_ok=True)
+        (home / ".cargo/config.toml").write_text(
+            "host configuration must not be imported\n"
+        )
+        (home / ".cargo/bin/cargo-clippy").write_text(
+            "host executable must not be imported\n"
+        )
+        return home
+
+    def cargo_volumes(self, argv):
+        return [
+            argv[index + 1]
+            for index, arg in enumerate(argv)
+            if arg == "--volume" and ":/build/.cargo/" in argv[index + 1]
+        ]
+
+    def test_default_seeds_home_caches_under_a_private_overlay(self):
+        home = self.make_home_with_caches()
+        result, calls = self.invoke(cargo_home=None, home=home)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        argv = calls[1]
+        self.assertEqual(
+            self.cargo_volumes(argv),
+            [
+                f"{home}/.cargo/registry:/build/.cargo/registry:O",
+                f"{home}/.cargo/git:/build/.cargo/git:O",
+            ],
+        )
+        mounts = [argv[index + 1] for index, arg in enumerate(argv) if arg == "--mount"]
+        self.assertFalse(any(f"source={home}" in mount for mount in mounts))
+        self.assertFalse(any(".cargo/bin" in arg for arg in argv))
+        self.assertIn(
+            f"seeding cargo dependency caches from {home}/.cargo under a private overlay",
+            result.stderr,
+        )
+        out = self.root / "output"
+        pinned_home = out / "home"
+        for cache in ("registry", "git"):
+            self.assertTrue((pinned_home / ".cargo" / cache).is_dir(), cache)
+
+    def test_default_without_home_caches_seeds_nothing(self):
+        home = self.root / "empty-home"
+        home.mkdir()
+        result, calls = self.invoke(
+            cargo_home=None, home=home, command=["cargo", "build"]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        argv = calls[1]
+        self.assertEqual(self.cargo_volumes(argv), [])
+        mounts = [argv[index + 1] for index, arg in enumerate(argv) if arg == "--mount"]
+        self.assertFalse(any(f"source={home}" in mount for mount in mounts))
+        self.assertNotIn("seeding cargo dependency caches", result.stderr)
+        self.assertIn("offline cargo builds need populated caches", result.stderr)
+        self.assertNotIn("caches are mounted read-only", result.stderr)
+
+    def test_cargo_home_none_seeds_nothing_even_with_home_caches(self):
+        home = self.make_home_with_caches()
+        result, calls = self.invoke(cargo_home="none", home=home)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        argv = calls[1]
+        self.assertEqual(self.cargo_volumes(argv), [])
+        mounts = [argv[index + 1] for index, arg in enumerate(argv) if arg == "--mount"]
+        self.assertFalse(any(f"source={home}" in mount for mount in mounts))
+        self.assertNotIn("seeding cargo dependency caches", result.stderr)
+
+    def test_home_unset_seeds_nothing_and_names_it(self):
+        result, calls = self.invoke(
+            cargo_home=None, home="", command=["cargo", "build"]
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.cargo_volumes(calls[1]), [])
+        self.assertIn("HOME is unset, so no cargo caches are seeded", result.stderr)
+
+    def test_empty_cargo_home_value_is_refused_by_name(self):
+        result, calls = self.invoke(cargo_home="")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--cargo-home was given an empty value", result.stderr)
+        self.assertEqual(calls, [])
+
+    def test_no_home_caches_with_a_non_cargo_payload_is_silent(self):
+        home = self.root / "empty-home"
+        home.mkdir()
+        result, calls = self.invoke(cargo_home=None, home=home)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.cargo_volumes(calls[1]), [])
+        self.assertNotIn("offline cargo builds", result.stderr)
+        self.assertNotIn("seeding cargo dependency caches", result.stderr)
+
+    def test_seeded_home_path_with_a_colon_is_refused_by_name(self):
+        home = self.root / "ho:me"
+        (home / ".cargo/registry").mkdir(parents=True)
+        result, calls = self.invoke(cargo_home=None, home=home)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn(
+            "an overlay volume cannot name a source path containing ':'",
+            result.stderr,
+        )
+        self.assertEqual(
+            calls,
+            [
+                [
+                    "image",
+                    "exists",
+                    "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                ]
+            ],
+        )
+
+    def test_buck_cells_and_fixture_stage_pin_no_cargo_caches(self):
+        buck_e2e = WRAPPER.parent.parent / "buck-e2e"
+        cell = (buck_e2e / "cell.sh").read_text()
+        self.assertIn(
+            '"$wrapper" --src "$R" --out "$W/pinned" --src-rw --cargo-home none',
+            cell,
+        )
+        stage = (buck_e2e / "stage").read_text()
+        self.assertIn("--src-rw --cargo-home none --", stage)
 
     def test_run_state_uses_the_same_host_directory_for_each_pinned_command(self):
         run_state = self.root / "run state"
@@ -752,6 +986,124 @@ class CargoCacheMounts(unittest.TestCase):
             "HERMIT_CENSUS_BASE_LISTED_IDS=/census-base/cli.listed-ids", argv)
         self.assertIn("HERMIT_CENSUS_DROPPED_FILE=/census-base/dropped.txt", argv)
 
+
+    def hermit_bundle_fixture(self, kind="binary-only", tamper=False, install=False, binary=None):
+        import hashlib as _hl
+        hermit = binary if binary is not None else b"#!/bin/sh\n[ \"$1\" = --version ] && echo 'hermit fixture 0.0'\n"
+        binary_hash = _hl.sha256(hermit).hexdigest()
+        identity = _hl.sha256(f"{kind}\n{binary_hash}\nnone\nnone\n".encode()).hexdigest()
+        bundle = self.root / identity
+        bundle.mkdir(parents=True)
+        (bundle / "kind").write_text(kind)
+        hermit_path = bundle / "hermit"
+        hermit_path.write_bytes(hermit + (b"# tampered\n" if tamper else b""))
+        hermit_path.chmod(0o755)
+        (bundle / "hermit.sha256").write_text(binary_hash)
+        if install:
+            (bundle / "install").mkdir()
+        return bundle
+
+    def test_hermit_bundle_is_mounted_verified_and_named(self):
+        bundle = self.hermit_bundle_fixture()
+        result, calls = self.invoke(hermit_bundle=bundle)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = calls[-1]
+        self.assertIn(
+            f"type=bind,source={bundle},destination=/hermit-bundle,ro=true", argv
+        )
+        self.assertIn("HERMIT_BIN=/hermit-bundle/hermit", argv)
+        self.assertFalse(any(arg.startswith("HERMIT_INSTALL_DIR=") for arg in argv))
+        self.assertIn("hermit bundle verified:", result.stderr)
+
+    def fake_elf_tools(self, missing=None):
+        # Fake readelf/ldd, first on PATH through the test tools dir, so a
+        # planted ELF reaches the wrapper's ABI preflight deterministically.
+        readelf = self.root / "tools/readelf"
+        readelf.write_text(
+            f"#!{sys.executable}\n"
+            "import sys\n"
+            "if '-d' in sys.argv:\n"
+            "    print('0x0000000000000001 (NEEDED)             Shared library: [libfixture.so.1]')\n"
+            "else:\n"
+            "    print('  Name: GLIBC_2.34  Flags: none  Version: 2')\n"
+        )
+        readelf.chmod(0o755)
+        ldd = self.root / "tools/ldd"
+        body = (
+            "print('libmissing-fixture.so.1 => not found')\n"
+            if missing
+            else "print('libfixture.so.1 => /lib/libfixture.so.1 (0x00007f0000000000)')\n"
+        )
+        ldd.write_text(f"#!{sys.executable}\n{body}")
+        ldd.chmod(0o755)
+
+    def test_a_tampered_hermit_bundle_is_refused_before_launch(self):
+        bundle = self.hermit_bundle_fixture(tamper=True)
+        result, calls = self.invoke(hermit_bundle=bundle)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("failed artifact verification", result.stderr)
+        self.assertIn("published Hermit hash mismatch", result.stderr)
+        self.assertFalse(any(call and call[0] == "run" for call in calls))
+
+    def test_a_complete_bundle_without_install_is_refused_before_launch(self):
+        bundle = self.hermit_bundle_fixture(kind="complete")
+        result, calls = self.invoke(hermit_bundle=bundle)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("failed artifact verification", result.stderr)
+        self.assertIn("resource bundle has no rsrcs directory", result.stderr)
+        self.assertFalse(any(call and call[0] == "run" for call in calls))
+
+    def test_bundle_elf_with_an_unresolved_library_is_refused_by_name(self):
+        self.fake_elf_tools(missing="libmissing-fixture.so.1")
+        bundle = self.hermit_bundle_fixture(binary=b"\x7fELF planted fixture\n")
+        result, calls = self.invoke(hermit_bundle=bundle)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("DT_NEEDED: libfixture.so.1", result.stderr)
+        self.assertIn("libmissing-fixture.so.1 => not found", result.stderr)
+        self.assertFalse(any(call and call[0] == "run" for call in calls))
+
+    def test_bundle_binary_whose_version_fails_is_refused_before_launch(self):
+        self.fake_elf_tools()
+        bundle = self.hermit_bundle_fixture(binary=b"\x7fELF planted fixture\n")
+        result, calls = self.invoke(hermit_bundle=bundle)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--version exited nonzero", result.stderr)
+        self.assertFalse(any(call and call[0] == "run" for call in calls))
+
+    def test_empty_hermit_bundle_value_is_refused_by_name(self):
+        result, calls = self.invoke(hermit_bundle="")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--hermit-bundle was given an empty value", result.stderr)
+        self.assertFalse(any(call and call[0] == "run" for call in calls))
+
+    def test_check_image_refuses_hermit_bundle(self):
+        env = repository_neutral_env()
+        env["PATH"] = str(self.root / "tools") + os.pathsep + env["PATH"]
+        env["PINNED_ROOT_CAPTURE"] = str(self.capture)
+        result = subprocess.run(
+            [
+                "bash", str(WRAPPER),
+                "--check-image",
+                "--digest", "fixture@sha256:" + "0" * 64,
+                "--hermit-bundle", str(self.hermit_bundle_fixture()),
+            ],
+            cwd=self.root, env=env,
+            capture_output=True, text=True, timeout=WRAPPER_TIMEOUT_S,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("--check-image accepts only optional --digest", result.stderr)
+
+    def test_forwarded_hermit_install_dir_is_refused_with_a_bundle(self):
+        bundle = self.hermit_bundle_fixture()
+        result, calls = self.invoke(
+            hermit_bundle=bundle,
+            extra_env={"HERMIT_INSTALL_DIR": "/host/install"},
+            extra_forwarded=["--env", "HERMIT_INSTALL_DIR"],
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("HERMIT_INSTALL_DIR is bundle-owned", result.stderr)
+        self.assertFalse(any(call and call[0] == "run" for call in calls))
+
     def test_bundle_lower_is_a_read_only_bind_that_adds_no_link(self):
         # ci/buck-e2e/cell.sh shares one staged bundle across concurrent cells as
         # an overlay lower. A bind leaves its files' link counts alone; a guest
@@ -787,6 +1139,194 @@ class CargoCacheMounts(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn(message, result.stderr)
                 self.assertFalse(any(call[0] == "run" for call in calls), calls)
+
+    def kernel_header_mounts(self, release=None, prefix=None, fake_uname=True):
+        """Run the wrapper, under a fake `uname -r` printing RELEASE when one
+        is given, and return its result and every --mount under /lib/modules.
+        Whatever is bound, the container is told where the running kernel's
+        headers belong (HERMIT_RUNNING_KERNEL_UAPI_ASM), exactly once, so the
+        syscall-table test reads only there. With PREFIX and fake_uname off,
+        the release instead comes from the prefix itself (setarch)."""
+        if release is not None and fake_uname:
+            uname = self.root / "tools/uname"
+            uname.write_text(f"#!/bin/sh\nprintf '%s\\n' '{release}'\n")
+            uname.chmod(0o755)
+        result, calls = self.invoke(prefix=prefix)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = calls[-1]
+        self.assertEqual(argv[0], "run")
+        guest = f"/lib/modules/{release or os.uname().release}/build/arch/x86/include/generated/uapi/asm"
+        named = [
+            argv[i + 1]
+            for i, arg in enumerate(argv[:-1])
+            if arg == "-e" and argv[i + 1].startswith("HERMIT_RUNNING_KERNEL_UAPI_ASM=")
+        ]
+        self.assertEqual(named, [f"HERMIT_RUNNING_KERNEL_UAPI_ASM={guest}"])
+        mounts = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--mount"]
+        headers = [m for m in mounts if "/lib/modules/" in m]
+        # A bound run says so in one stderr line (the node's log, outside
+        # any test output capture); an unbound run never claims a bind.
+        said = [
+            line for line in result.stderr.splitlines() if "bound host syscall header:" in line
+        ]
+        if headers:
+            source = dict(field.split("=", 1) for field in headers[0].split(","))["source"]
+            self.assertEqual(
+                said,
+                [
+                    "run-in-pinned-root: bound host syscall header: "
+                    f"{guest}/unistd_64.h (ro, from {source})"
+                ],
+            )
+        else:
+            self.assertEqual(said, [])
+        return result, headers
+
+    def test_the_running_kernel_header_directory_name_is_wrapper_owned(self):
+        result, calls = self.invoke(
+            extra_env={"HERMIT_RUNNING_KERNEL_UAPI_ASM": "/elsewhere"},
+            extra_forwarded=["--env", "HERMIT_RUNNING_KERNEL_UAPI_ASM"],
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("HERMIT_RUNNING_KERNEL_UAPI_ASM is wrapper-owned", result.stderr)
+        self.assertFalse(any(call[0] == "run" for call in calls), calls)
+
+    def test_running_kernel_uapi_headers_are_bound_read_only_where_the_host_has_them(self):
+        # Detcore's syscall-table test reads the running kernel's
+        # unistd_64.h from this directory first. The container shares the
+        # host's kernel, so the same release names the same path inside.
+        release = os.uname().release
+        guest = f"/lib/modules/{release}/build/arch/x86/include/generated/uapi/asm"
+        result, headers = self.kernel_header_mounts()
+        if os.path.isdir(guest):
+            self.assertEqual(
+                headers,
+                [f"type=bind,source={os.path.realpath(guest)},destination={guest},ro=true"],
+            )
+        else:
+            self.assertEqual(headers, [])
+            self.assertIn(f"uapi headers are absent at {guest}", result.stderr)
+
+    def test_a_host_without_uapi_headers_binds_none_and_says_so(self):
+        release = "0.0.0-hermit-fixture-without-headers"
+        result, headers = self.kernel_header_mounts(release)
+        self.assertEqual(headers, [])
+        self.assertIn(
+            "uapi headers are absent at "
+            f"/lib/modules/{release}/build/arch/x86/include/generated/uapi/asm;",
+            result.stderr,
+        )
+
+    def test_uapi_headers_podman_cannot_name_exactly_are_not_bound(self):
+        result, headers = self.kernel_header_mounts("0.0.0-hermit,fixture")
+        self.assertEqual(headers, [])
+        self.assertIn("cannot name /lib/modules/0.0.0-hermit,fixture/", result.stderr)
+
+    def _other_release_prefix(self, fixture):
+        """(release, prefix) running the wrapper so its `uname -r` reports a
+        release that is not this host's, in a private mount namespace whose
+        /lib/modules is a tmpfs holding only FIXTURE's trees: kernels/<R'>
+        for R' and decoy/ for the running release. setarch --uname-2.6
+        changes the uname(2) release too, so this holds even if the wrapper
+        ever stops shelling out to uname(1). Skips (never counts) where the
+        capability is refused."""
+        for argv, capability in (
+            (["unshare", "-rm", "/bin/true"], "unprivileged user+mount namespaces (unshare -rm)"),
+            (["setarch", "x86_64", "--uname-2.6", "/bin/true"], "setarch x86_64 --uname-2.6 personality"),
+        ):
+            probe = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+            if probe.returncode != 0:
+                self.skipTest(f"{capability} refused here: {probe.stderr.strip()}")
+        other = subprocess.run(
+            ["setarch", "x86_64", "--uname-2.6", "uname", "-r"],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout.strip()
+        running = os.uname().release
+        self.assertNotEqual(other, running)
+        setup = (
+            'mount -t tmpfs tmpfs /lib/modules || exit 125; '
+            'mkdir -p "/lib/modules/$1" "/lib/modules/$3" || exit 125; '
+            'ln -s "$2/kernels/$1" "/lib/modules/$1/build" || exit 125; '
+            'ln -s "$2/decoy" "/lib/modules/$3/build" || exit 125; '
+            'shift 3; exec "$@"'
+        )
+        return other, [
+            "setarch", "x86_64", "--uname-2.6",
+            "unshare", "-rm", "/bin/sh", "-c", setup, "sh",
+            other, str(fixture), running,
+        ]
+
+    def _header_fixture(self, base, release, with_header=True):
+        # The wrapper realpath()s the source, so compare against the
+        # resolved fixture path (a symlinked temp dir would differ).
+        base = Path(os.path.realpath(base))
+        asm = base / "kernels" / release / "arch/x86/include/generated/uapi/asm"
+        asm.mkdir(parents=True)
+        if with_header:
+            (asm / "unistd_64.h").write_text("#define __NR_read 0\n")
+        decoy = base / "decoy/arch/x86/include/generated/uapi/asm"
+        decoy.mkdir(parents=True)
+        (decoy / "unistd_64.h").write_text("#define __NR_decoy 9999\n")
+        return base
+
+    def test_another_kernels_headers_are_bound_at_its_own_release(self):
+        # The bound branch with a release that is not the running one: the
+        # only /lib/modules trees in the namespace are R' (real) and the
+        # running release's decoy, so a wrapper that used the running
+        # release anywhere would bind the decoy and fail by name here.
+        running = os.uname().release
+        probe_root = self.root / "probe-fixture"
+        other, _ = self._other_release_prefix(probe_root)
+        fixture = self._header_fixture(self.root / "fixture", other)
+        other, prefix = self._other_release_prefix(fixture)
+        result, headers = self.kernel_header_mounts(
+            other, prefix=prefix, fake_uname=False
+        )
+        guest = f"/lib/modules/{other}/build/arch/x86/include/generated/uapi/asm"
+        self.assertEqual(
+            headers,
+            [
+                "type=bind,"
+                f"source={fixture}/kernels/{other}/arch/x86/include/generated/uapi/asm,"
+                f"destination={guest},ro=true"
+            ],
+        )
+        argv = self.capture.read_text()
+        self.assertNotIn(running, argv)
+        self.assertNotIn("decoy", argv)
+        self.assertNotIn(running, result.stderr)
+        self.assertNotIn("decoy", result.stderr)
+
+    def test_another_kernel_without_headers_binds_none_and_says_so(self):
+        fixture = self._header_fixture(self.root / "fixture", "unused", with_header=False)
+        # with_header=False still makes kernels/unused; R' stays absent.
+        other, prefix = self._other_release_prefix(fixture)
+        # No kernels/<R'> tree exists under the fixture, only the decoy.
+        result, headers = self.kernel_header_mounts(
+            other, prefix=prefix, fake_uname=False
+        )
+        self.assertEqual(headers, [])
+        self.assertIn(
+            "run-in-pinned-root: the running kernel's uapi headers are absent at "
+            f"/lib/modules/{other}/build/arch/x86/include/generated/uapi/asm;",
+            result.stderr,
+        )
+
+    def test_a_comma_in_the_host_header_path_is_not_bound(self):
+        # The existing comma case puts the comma in the release; this one
+        # puts it in the resolved HOST path (the mount source).
+        other, _ = self._other_release_prefix(self.root / "probe-fixture")
+        fixture = self._header_fixture(self.root / "src,x", other)
+        other, prefix = self._other_release_prefix(fixture)
+        result, headers = self.kernel_header_mounts(
+            other, prefix=prefix, fake_uname=False
+        )
+        self.assertEqual(headers, [])
+        self.assertIn(
+            f"cannot name /lib/modules/{other}/build/arch/x86/include/generated/uapi/asm "
+            f"(host path {fixture}/kernels/{other}/arch/x86/include/generated/uapi/asm)",
+            result.stderr,
+        )
 
     def test_relative_run_state_refuses_before_container_launch(self):
         result, calls = self.invoke(run_state="relative-state")
@@ -1383,9 +1923,11 @@ class CargoCacheMounts(unittest.TestCase):
                     "/src/nested module",
                 )
                 self.assertEqual(
-                    argv[-6:],
+                    argv[-8:],
                     [
                         "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+                        "/bin/env",
+                        "--default-signal",
                         "/bin/taskset",
                         "--cpu-list",
                         ",".join(map(str, sorted(os.sched_getaffinity(0)))),
@@ -1968,6 +2510,217 @@ class PinnedGuestPathContract(unittest.TestCase):
         # test.record_replay's curl_recording_replays_offline_with_identical_logs
         # finds curl on PATH (https://github.com/rrnewton/hermit/issues/3786).
         self.assertIn("/usr/bin/curl", paths, "record_replay curl guest")
+
+
+class SeededOverlayLive(unittest.TestCase):
+    """The seeded default must never write the caller's cargo home.
+
+    Builds a scratch HOME whose .cargo holds a registry crate that is
+    cached but not extracted and a git dependency that is in the db but
+    not checked out, runs the real wrapper on its default (seeded) path,
+    and requires the scratch .cargo to be byte-identical afterwards:
+    extractions and checkouts may only land in the container-private
+    overlay upper layer. Skips by name where podman, the pinned image,
+    or the fixture tools are unavailable.
+    """
+
+    def cargo_manifest(self, cargo_home):
+        lines = []
+        for path in sorted(p for p in cargo_home.rglob("*") if p.is_file()):
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            lines.append(f"{path.relative_to(cargo_home)} {path.stat().st_size} {digest}")
+        return hashlib.sha256("\n".join(lines).encode()).hexdigest(), lines
+
+    def run_fixture(self, args, cwd, env=None):
+        return subprocess.run(
+            args, cwd=cwd, env=env, capture_output=True, text=True, timeout=300
+        )
+
+    def test_seeded_default_build_leaves_host_cargo_home_byte_unchanged(self):
+        if Path("/run/.containerenv").exists():
+            self.skipTest("inside a container; nested podman is not used")
+        if shutil.which("podman") is None:
+            self.skipTest("podman not on PATH")
+        image = WRAPPER.with_name("image.digest").read_text().strip()
+        exists = subprocess.run(
+            ["podman", "image", "exists", image],
+            capture_output=True, text=True, timeout=120,
+        )
+        if exists.returncode != 0:
+            self.skipTest(f"pinned image {image} not in the local podman store")
+        # Past this point the case must run: missing tools are failures,
+        # not skips a host could quietly sit on.
+        for tool in ("cargo", "git"):
+            if shutil.which(tool) is None:
+                self.fail(
+                    f"{tool} not on PATH although podman and the pinned image "
+                    "exist; the seeded-overlay case must run here"
+                )
+        scratch = tempfile.TemporaryDirectory(prefix="seeded-overlay-live-")
+        self.addCleanup(scratch.cleanup)
+        root = Path(scratch.name)
+        gitlib = root / "gitlib"
+        (gitlib / "src").mkdir(parents=True)
+        (gitlib / "Cargo.toml").write_text(
+            '[package]\nname = "gitprobe-lib"\nversion = "0.1.0"\nedition = "2021"\n\n[workspace]\n'
+        )
+        (gitlib / "src/lib.rs").write_text("pub fn answer() -> i32 {\n    42\n}\n")
+        neutral = repository_neutral_env()
+        for args in (
+            ["git", "init", "-b", "main", "-q"],
+            ["git", "add", "Cargo.toml", "src/lib.rs"],
+            ["git", "-c", "user.name=seeded-overlay-live",
+             "-c", "user.email=seeded-overlay-live@invalid",
+             "commit", "-qm", "gitprobe-lib"],
+        ):
+            done = self.run_fixture(args, gitlib, env=neutral)
+            self.assertEqual(done.returncode, 0, done.stderr)
+        src = root / "consumer"
+        for directory in (
+            "src", "agent-utils/rs/target",
+            "agent-utils/rs/.agent-utils-locks",
+            "agent-utils/rs/.agent-utils-snapshots",
+        ):
+            (src / directory).mkdir(parents=True, exist_ok=True)
+        (src / "Cargo.toml").write_text(
+            '[package]\nname = "seeded-overlay-live"\nversion = "0.1.0"\n'
+            'edition = "2021"\n\n[dependencies]\nseededreg = "=0.1.0"\n'
+            f'gitprobe-lib = {{ git = "file://{gitlib}" }}\n\n[workspace]\n'
+        )
+        (src / "src/main.rs").write_text(
+            "fn main() {\n"
+            '    println!("seeded-live reg={} answer={}", '
+            "seededreg::val(), gitprobe_lib::answer());\n}\n"
+        )
+        home = root / "home"
+        cargo_home = home / ".cargo"
+        lock_env = {**os.environ, "CARGO_HOME": str(cargo_home)}
+        # Prime the git db through a git-only crate: cargo --offline will
+        # not clone a git dependency, so the db must exist before the real
+        # lock step. The priming clone is a local file:// fetch, and the
+        # checkout it makes is deleted again with the fixture clean-up.
+        prime = root / "prime"
+        (prime / "src").mkdir(parents=True)
+        (prime / "Cargo.toml").write_text(
+            '[package]\nname = "prime"\nversion = "0.1.0"\nedition = "2021"\n\n'
+            f'[dependencies]\ngitprobe-lib = {{ git = "file://{gitlib}" }}\n\n[workspace]\n'
+        )
+        (prime / "src/main.rs").write_text(
+            'fn main() { println!("{}", gitprobe_lib::answer()); }\n'
+        )
+        primed = self.run_fixture(
+            ["cargo", "generate-lockfile"], prime, env=lock_env
+        )
+        if primed.returncode != 0:
+            self.fail(
+                "cannot prime the scratch git db "
+                f"({primed.stderr.strip()[-200:]})"
+            )
+        # Self-contained registry fixture: package a tiny local crate and
+        # write its .crate archive plus a synthesized sparse-index cache
+        # entry (with the crate's sha256 as its checksum) into the scratch
+        # registry. Nothing is read from the caller's real cargo home, so
+        # the case runs identically on any host with podman and the image.
+        regcrate = root / "regcrate"
+        (regcrate / "src").mkdir(parents=True)
+        (regcrate / "Cargo.toml").write_text(
+            '[package]\nname = "seededreg"\nversion = "0.1.0"\nedition = "2021"\n\n[lib]\npath = "src/lib.rs"\n'
+        )
+        (regcrate / "src/lib.rs").write_text("pub fn val() -> i32 {\n    7\n}\n")
+        packaged = self.run_fixture(
+            ["cargo", "package", "--offline"], regcrate,
+            env={**os.environ, "CARGO_HOME": str(root / "pkg-home/.cargo")},
+        )
+        if packaged.returncode != 0:
+            self.fail(
+                "cannot package the fixture registry crate "
+                f"({packaged.stderr.strip()[-200:]})"
+            )
+        crate_path = regcrate / "target/package/seededreg-0.1.0.crate"
+        if not crate_path.exists():
+            self.fail(f"packaged fixture crate missing at {crate_path}")
+        # The index directory name carries a cargo-computed hash; cargo's
+        # own debug output names it, version-independent, on the offline
+        # attempt that is expected to fail before the entry exists.
+        probe = subprocess.run(
+            ["cargo", "generate-lockfile", "--offline"], cwd=src,
+            env={**lock_env, "CARGO_LOG": "debug"},
+            capture_output=True, text=True, timeout=300,
+        )
+        found = re.search(r"index\.crates\.io-[0-9a-z]+", probe.stdout + probe.stderr)
+        if found is None:
+            self.fail("cannot discover the sparse index directory name from cargo debug output")
+        index_id = found.group(0)
+        cache_dst = cargo_home / "registry/cache" / index_id
+        cache_dst.mkdir(parents=True)
+        shutil.copyfile(crate_path, cache_dst / crate_path.name)
+        index_root = cargo_home / "registry/index" / index_id
+        (index_root / ".cache/se/ed").mkdir(parents=True)
+        (index_root / "config.json").write_text(
+            '{\n  "dl": "https://static.crates.io/crates",\n  "api": "https://crates.io"\n}\n'
+        )
+        meta = {
+            "name": "seededreg", "vers": "0.1.0", "deps": [],
+            "cksum": hashlib.sha256(crate_path.read_bytes()).hexdigest(),
+            "features": {}, "yanked": False,
+        }
+        (index_root / ".cache/se/ed/seededreg").write_bytes(
+            b"\x03" + (2).to_bytes(4, "little")
+            + b'etag: "seeded-overlay-live"\x00' + b"0.1.0\x00"
+            + json.dumps(meta, separators=(",", ":")).encode() + b"\x00"
+        )
+        locked = self.run_fixture(
+            ["cargo", "generate-lockfile", "--offline"], src, env=lock_env
+        )
+        if locked.returncode != 0:
+            self.fail(
+                "cannot lock against the synthesized scratch registry "
+                f"({locked.stderr.strip()[-200:]})"
+            )
+        for extracted in cargo_home.glob("registry/src/*/seededreg-0.1.0"):
+            shutil.rmtree(extracted)
+        for checkout in cargo_home.glob("git/checkouts/*"):
+            shutil.rmtree(checkout)
+        self.assertTrue(list(cargo_home.glob("git/db/*")), "git db populated")
+        self.assertEqual(list(cargo_home.glob("registry/src/*/seededreg-0.1.0")), [])
+        self.assertEqual(list(cargo_home.glob("git/checkouts/*")), [])
+        before_hash, before = self.cargo_manifest(cargo_home)
+        env = {**os.environ, "HOME": str(home)}
+        # Swapping HOME would also move rootless podman's default store and
+        # config (both derive from HOME when XDG is unset), making the
+        # pinned image "absent" on a default-layout host. Pin both XDG
+        # roots to the caller's real ones so podman looks exactly where it
+        # did before the swap.
+        real_home = Path.home()
+        # An empty XDG value is unset for podman's path derivation too.
+        env["XDG_DATA_HOME"] = (
+            os.environ.get("XDG_DATA_HOME") or str(real_home / ".local/share")
+        )
+        env["XDG_CONFIG_HOME"] = (
+            os.environ.get("XDG_CONFIG_HOME") or str(real_home / ".config")
+        )
+        result = subprocess.run(
+            [
+                "bash", str(WRAPPER),
+                "--src", str(src), "--out", str(root / "out"), "--src-rw",
+                "--", "bash", "-c",
+                "cd /src && cargo build --locked --offline && "
+                "./target/debug/seeded-overlay-live",
+            ],
+            env=env, capture_output=True, text=True, timeout=900,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("seeded-live reg=7 answer=42", result.stdout)
+        self.assertIn("seeding cargo dependency caches", result.stderr)
+        after_hash, after = self.cargo_manifest(cargo_home)
+        changed = [line for line in before if line not in after][:5]
+        added = [line for line in after if line not in before][:5]
+        self.assertEqual(
+            before_hash, after_hash,
+            f"seeded run changed the host cargo home: changed={changed} added={added}",
+        )
+        self.assertEqual(list(cargo_home.glob("registry/src/*/seededreg-0.1.0")), [])
+        self.assertEqual(list(cargo_home.glob("git/checkouts/*")), [])
 
 
 if __name__ == "__main__":

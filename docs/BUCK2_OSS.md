@@ -61,7 +61,7 @@ build, which reads only `BUCK` and `TARGETS`, ignores them. Internally the root
 
 The shim gives every `rust_library` and `rust_binary` without
 `unittests = False` the implicit `<name>-unittest` test target that Meta's
-build generates (29 targets), built from the same sources plus `test_srcs`.
+build generates (27 targets), built from the same sources plus `test_srcs`.
 Those targets evaluate under `buck2 targets //...`; their open-source build and
 pass status are not yet established.
 
@@ -87,10 +87,9 @@ Reverie's stand-ins `gated_test`, `excluded_paths_test` and
 also define no target. With Reverie at c3f8de29 or later, Reverie's BUCK files
 evaluate in this tree.
 
-`flaky-tests:use_configurable_flaky_service` is marked `broken-in-oss` (the
-shim has no curl), as are the root package's `backend-abstraction-repository`,
-`cargo-lock-repository` and `oss-release-values-stand-in`, which feed internal
-contract checks. This tree runs the backend-abstraction check as
+The root package's `backend-abstraction-repository`,
+`cargo-lock-repository` and `oss-release-values-stand-in` are marked
+`broken-in-oss`; they feed internal contract checks. This tree runs the backend-abstraction check as
 `scripts/check-detcore-backend-abstraction.sh` and checks the stand-in
 `release.bzl` values with `scripts/check-reverie-pin.rs`.
 
@@ -585,6 +584,77 @@ signal, or a breach) the node kills the scope with `cgroup.kill` after
 `buck2 kill`. A host whose buck2 daemon has no
 systemd scope cannot run `--buck-s0` or `--buck-s1`: the node exits 2 before any
 cell runs.
+
+The Buck-only run's buck2 reads only three kinds of configuration: this
+commit's tracked buckconfig files, the buckconfig bundled into buck2 (the
+prelude), and `ci/buck-e2e/stock-runner.buckconfig`.
+
+Why: on a Meta host the internal `buck` wrapper rewrites
+`~/.buckconfig.d/experiments_from_buck_start` from rollout state. buck2 would
+otherwise load that file, `/etc/buckconfig.d/*`, `/etc/buckconfig` and
+`~/.buckconfig.local`.
+
+How the node enforces it (code in `ci/buck-e2e/buckconfig-sources.sh`, tested by
+`ci/buck-e2e/test-buckconfig-sources.sh`, which `make lint-checks` runs):
+
+- **Two knobs, in every form of the node, `--stage-only` included**, for every
+  buck2 it runs, its daemon included:
+  - `BUCK2_TEST_SKIP_DEFAULT_EXTERNAL_CONFIG=1` skips those four sources;
+  - `BUCK2_TEST_EXTRA_EXTERNAL_CONFIG` adds `stock-runner.buckconfig`, which no
+    other mode reads.
+
+  buck2 labels both testing knobs; buck2's own open-source CI uses the first for
+  the same reason. Any other `BUCK2_TEST_*` variable makes the node exit 2.
+- **In every form, right after the knobs and before any buck2 runs**, it exits 2
+  on:
+  - a buck2 settings file (`.bucksettings.toml` or `.bucksettings.local.toml`)
+    in HOME or at the checkout's root;
+  - an untracked or linked `.buckconfig.local` or `.buckconfig.d` at the
+    checkout's root. The shared action cache's link below is one: remove it
+    from a checkout used for a Buck-only run.
+
+  An untracked config at another cell's root (`shim/.buckconfig.local`, say) is
+  caught only by the per-value check below.
+- **In the forms that run cells** (no argument, `--cells-only`):
+  - before the daemon starts, it writes each machine-local file's SHA-256 to
+    `buck-invocations/buckconfig-external.tsv`;
+  - after the bounded daemon starts, it writes the daemon's buckconfig for
+    every cell, with where each value is defined, to
+    `buck-invocations/buckconfig-effective.txt`;
+  - it exits 2 before the stage or the cells unless that dump has values, every
+    location line in it parses, every value comes from a file of HEAD (inside
+    a submodule, the submodule's HEAD) with HEAD's bytes and no symlink on its
+    path, from the bundled prelude, or from `stock-runner.buckconfig`, and both
+    of that file's keys are defined there. HEAD's bytes are compared raw,
+    ignoring any clean filter or `refs/replace` entry. A file in a nested
+    repository is a file of HEAD only when HEAD records that repository as a
+    submodule and the submodule is checked out at exactly the recorded commit.
+
+  `--stage-only` starts no bounded daemon, so its buckconfig gets the knobs and
+  the refusal above, but no dump and no per-value check.
+
+`stock-runner.buckconfig` sets two keys:
+
+- `[buck2_resource_control] status = if_available`: the daemon's systemd scope.
+  Without a status key, buck2 follows a version gate that only a machine-local
+  buckconfig sets, and with no gate it turns resource control off.
+- `[buck2] sqlite_dep_file_state = false`: a restarted daemon must not serve
+  actions from outputs an earlier run left behind.
+
+The other Buck modes do not read that file.
+
+What the run does not cover:
+
+- the rest of the node's inherited environment, including other `BUCK2_*`
+  variables;
+- any later buck2 settings layer, which `buck2 audit config` does not show.
+  Check for one at each buck2 pin bump.
+
+Buck-only results from a commit without this configuration control are not
+directly comparable with results from a commit that has it, whatever the date
+of the run. Those runs took action suspension (`kill_and_retry`), clean-stale,
+the restarter and persistent workers from the host's rollout file. Runs with
+the control leave each at buck2's default.
 
 ## Host prerequisites for Buck validation
 

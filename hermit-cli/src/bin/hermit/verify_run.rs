@@ -66,6 +66,7 @@ use super::verify::SignalTerminationReports;
 use super::verify::container_failed_report;
 use super::verify::emit_compared_guest_output;
 use super::verify::record_exact_branch_counter;
+use super::verify::record_startup_unmonitored;
 use super::verify::run_failed_report;
 use super::verify::verification_runtime_from_summaries;
 use super::verify::write_pending_verification_json;
@@ -380,6 +381,27 @@ pub(super) fn compare_for_adapter<A: super::backend_hook::BackendAdapter>(
     )
 }
 
+/// The pair's startup claim from its two records: `Some(true)` when at
+/// least one record states an unmonitored startup and neither states a
+/// monitored one; `Some(false)` only when BOTH state monitored, so a
+/// record with no claim (`None`, an older producer) can never turn into
+/// a false monitored claim for the pair; `None` when neither record
+/// claims unmonitored and at least one makes no claim. Two records that
+/// positively disagree are refused (`Err` carries both values).
+fn pair_startup_unmonitored(
+    first: Option<bool>,
+    second: Option<bool>,
+) -> Result<Option<bool>, (bool, bool)> {
+    match (first, second) {
+        (Some(true), Some(false)) | (Some(false), Some(true)) => {
+            Err((first.unwrap(), second.unwrap()))
+        }
+        (Some(true), _) | (_, Some(true)) => Ok(Some(true)),
+        (Some(false), Some(false)) => Ok(Some(false)),
+        _ => Ok(None),
+    }
+}
+
 fn compare_with_application(
     directories: [&Path; 2],
     verify_json: Option<&Path>,
@@ -447,6 +469,23 @@ fn compare_with_application(
         return compare_recording_and_replay(&run1, directories[1], verify_json, &retain);
     }
     let summary1 = run1.summary();
+    // Where the comparison ends on run 1 alone (run 1 failed, or
+    // `--verify-allow` rejects its status, so `run --verify` would not have
+    // started run 2), the report states run 1's startup claim, as `run
+    // --verify`'s states the claim it records at dispatch, before any
+    // refusal. Once run 2 is read, the pair's claim is stamped instead
+    // (below): the stamp is set once per process, so run 1's monitored claim
+    // stamped any earlier could not be withdrawn when run 2's record makes no
+    // claim.
+    let stamp_run1_startup_claim = || -> Result<(), Error> {
+        if let Some(unmonitored) = record1.startup_unmonitored {
+            record_startup_unmonitored(unmonitored);
+            if let Some(path) = verify_json {
+                write_pending_verification_json(path)?;
+            }
+        }
+        Ok(())
+    };
 
     let VerifyRunOutcome::Completed {
         status: status1,
@@ -456,6 +495,7 @@ fn compare_with_application(
         virtual_timeout_ns: virtual_timeout1,
     } = record1.outcome
     else {
+        stamp_run1_startup_claim()?;
         retain(&[&run1])?;
         return Err(failed_run(
             verify_json,
@@ -476,6 +516,10 @@ fn compare_with_application(
     // model, a virtual timeout) passes `--verify-allow` as `run --verify`'s
     // does (`rejected_first_run`): neither is a guest result, so the default
     // `success` refuses it.
+    if !verify_allow.satisfies(out1.status) {
+        // The status `reject_first_run` refuses, before it writes the report.
+        stamp_run1_startup_claim()?;
+    }
     if let Some(error) =
         reject_first_run(verify_json, verify_allow, &out1, skid1, summary1.as_ref())
     {
@@ -517,6 +561,27 @@ fn compare_with_application(
             record2.comparison,
             record2.passthru_opt,
         );
+    }
+    // The pair's startup route, restamped like `exact_branch_counter`
+    // above: the comparing process ran neither guest, so the records are
+    // its only evidence. Two records that disagree were not run alike in
+    // the way the report states, so they are not compared.
+    let startup_unmonitored =
+        pair_startup_unmonitored(record1.startup_unmonitored, record2.startup_unmonitored)
+            .map_err(|(first, second)| {
+                anyhow::anyhow!(
+                    "the two --verify-run directories disagree on whether guest startup was \
+             unmonitored ({} records startup_unmonitored={first}, {} records \
+             startup_unmonitored={second}), so they are not compared",
+                    directories[0].display(),
+                    directories[1].display()
+                )
+            })?;
+    if let Some(unmonitored) = startup_unmonitored {
+        record_startup_unmonitored(unmonitored);
+        if let Some(path) = verify_json {
+            write_pending_verification_json(path)?;
+        }
     }
     let summary2 = run2.summary();
 
@@ -810,7 +875,10 @@ mod tests {
         const CAPABILITIES: reverie::BackendCapabilities = reverie::BackendCapabilities::PTRACE;
         const LOG_TRANSPORT: super::super::backend_hook::VerificationLogTransport =
             super::super::backend_hook::VerificationLogTransport::NativeEvidence;
+        const UNTRACED_CODE: super::super::backend_hook::UntracedCode =
+            super::super::backend_hook::UntracedCode::None;
         type Options = ();
+        type RuntimeInputs = ();
         type Session = ();
         type Pending = ();
         type Facts = super::super::backend_hook::NativeFacts;
@@ -825,7 +893,21 @@ mod tests {
                 | super::super::backend_hook::Mode::SavedVerification => Ok(()),
             }
         }
-        fn prepare(&self, _: (), _: super::super::backend_hook::Prepare<'_>) -> Result<(), Error> {
+        fn admit_static_options(
+            &self,
+            _: &super::super::backend_hook::StaticOptions<'_>,
+        ) -> Result<(), Error> {
+            Ok(())
+        }
+        fn ensure_runtime_inputs(&self) -> Result<(), Error> {
+            Ok(())
+        }
+        fn prepare(
+            &self,
+            _: (),
+            _: Self::RuntimeInputs,
+            _: super::super::backend_hook::Prepare<'_>,
+        ) -> Result<(), Error> {
             panic!("offline comparison must not prepare a physical run")
         }
         fn execute(
@@ -907,6 +989,7 @@ mod tests {
             passthru_opt: false,
             epoch: "2026-01-01T00:00:00Z".to_owned(),
             exact_branch_counter: None,
+            startup_unmonitored: None,
             dbt: native.then_some(DbtRunRecord {
                 initialization_records: 1,
             }),
@@ -1160,6 +1243,7 @@ mod tests {
             passthru_opt: false,
             epoch: "2026-01-01T00:00:00Z".into(),
             exact_branch_counter: None,
+            startup_unmonitored: None,
             dbt: None,
             role: RunRole::Run,
             outcome: VerifyRunOutcome::Completed {
@@ -1202,6 +1286,7 @@ mod tests {
                 passthru_opt: false,
                 epoch: "2026-01-01T00:00:00Z".into(),
                 exact_branch_counter: None,
+                startup_unmonitored: None,
                 dbt: None,
                 role: RunRole::Run,
                 outcome: VerifyRunOutcome::Error {
@@ -1210,5 +1295,167 @@ mod tests {
             })
             .unwrap();
         assert!(VerifyRunDirectory::read(&directory).is_ok());
+    }
+
+    #[test]
+    fn pair_startup_claim_never_invents_a_monitored_startup() {
+        // Both monitored: the only way the pair claims monitored.
+        assert_eq!(
+            pair_startup_unmonitored(Some(false), Some(false)),
+            Ok(Some(false))
+        );
+        // A no-claim record beside a monitored one stays no claim - the
+        // pair must not stamp the silent run as monitored.
+        assert_eq!(pair_startup_unmonitored(Some(false), None), Ok(None));
+        assert_eq!(pair_startup_unmonitored(None, Some(false)), Ok(None));
+        assert_eq!(pair_startup_unmonitored(None, None), Ok(None));
+        // An unmonitored claim survives a silent partner.
+        assert_eq!(pair_startup_unmonitored(Some(true), None), Ok(Some(true)));
+        assert_eq!(
+            pair_startup_unmonitored(Some(true), Some(true)),
+            Ok(Some(true))
+        );
+        // A positive disagreement is refused, carrying both values.
+        assert_eq!(
+            pair_startup_unmonitored(Some(true), Some(false)),
+            Err((true, false))
+        );
+        assert_eq!(
+            pair_startup_unmonitored(Some(false), Some(true)),
+            Err((false, true))
+        );
+    }
+
+    /// A saved run 1 with the startup claim `claim` that ends the comparison
+    /// on its own, as `run --verify` ends without starting run 2: its report
+    /// (`no_result_reason` of kind `kind`) states the claim, as `run
+    /// --verify`'s states the claim it records at dispatch, before any
+    /// refusal. Run 2's directory does not exist, so the comparison must end
+    /// before reading it. The claim is set once per process, so each case
+    /// runs in a process of its own.
+    fn assert_run_one_alone_reports_its_startup_claim(
+        backend: &str,
+        claim: bool,
+        outcome: VerifyRunOutcome,
+        verify_allow: VerifyAllow,
+        kind: &str,
+    ) {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let first = parent.path().join("first");
+        let report = parent.path().join("report.json");
+        let mut record = saved_comparison_record(backend, false);
+        record.startup_unmonitored = Some(claim);
+        record.outcome = outcome;
+        write_saved_comparison_control(&first, &record);
+        let result = compare(
+            [&first, &parent.path().join("never-run")],
+            Some(&report),
+            verify_allow,
+            None,
+        );
+        assert!(result.is_err(), "run 1 alone ends the comparison");
+        let value = saved_comparison_report(&report);
+        assert_eq!(value["no_result_reason"]["kind"], kind, "{value}");
+        assert_eq!(value["startup_unmonitored"], claim, "{value}");
+    }
+
+    /// A completed run that exited `code`, ending with `outcome`.
+    fn completed_run(outcome: Option<TerminalOutcome>, code: i32) -> VerifyRunOutcome {
+        let (guest_deadlock, virtual_timeout_ns) = TerminalOutcome::to_fields(outcome);
+        VerifyRunOutcome::Completed {
+            status: RecordedStatus::Exited { code },
+            skid_overshoots: 0,
+            forwarded_syscalls: None,
+            guest_deadlock,
+            virtual_timeout_ns,
+        }
+    }
+
+    #[test]
+    fn a_rejected_run_one_reports_its_startup_claim() {
+        // The in-guest preload route's claim: startup unmonitored.
+        assert_run_one_alone_reports_its_startup_claim(
+            "liteinst",
+            true,
+            completed_run(None, 3),
+            VerifyAllow::Success,
+            "first_run_rejected",
+        );
+    }
+
+    #[test]
+    fn a_deadlocked_run_one_reports_its_startup_claim() {
+        let deadlock = TerminalOutcome::GuestDeadlock;
+        assert_run_one_alone_reports_its_startup_claim(
+            "ptrace",
+            false,
+            completed_run(Some(deadlock), deadlock.exit_status()),
+            VerifyAllow::Success,
+            "first_run_rejected",
+        );
+    }
+
+    #[test]
+    fn a_virtual_timeout_run_one_reports_its_startup_claim() {
+        let timeout = TerminalOutcome::VirtualTimeout {
+            bound_ns: 1_000_000,
+        };
+        assert_run_one_alone_reports_its_startup_claim(
+            "ptrace",
+            false,
+            completed_run(Some(timeout), timeout.exit_status()),
+            VerifyAllow::Success,
+            "first_run_rejected",
+        );
+    }
+
+    #[test]
+    fn a_run_one_with_a_determinism_loss_reports_its_startup_claim() {
+        // Refused even under `--verify-allow=both`, which admits a deadlock.
+        assert_run_one_alone_reports_its_startup_claim(
+            "ptrace",
+            false,
+            VerifyRunOutcome::RunFailed {
+                failure: RunFailure::DeterminismLoss,
+                detail: format!(
+                    "{}the namespace init died",
+                    super::super::run::SAVED_LOSS_DETAIL_PREFIX
+                ),
+            },
+            VerifyAllow::Both,
+            "run_failed",
+        );
+    }
+
+    /// Once run 2 is read, the report states the pair's claim
+    /// (`pair_startup_unmonitored`), not run 1's: beside a record that makes
+    /// no claim, run 1's monitored claim is not the pair's. In a process of
+    /// its own, as the claim is set once per process.
+    #[test]
+    fn a_compared_pair_reports_the_pair_startup_claim_not_run_one_alone() {
+        if crate::app::test_isolation::rerun_alone() {
+            return;
+        }
+        let parent = tempfile::tempdir().unwrap();
+        let directories = [parent.path().join("first"), parent.path().join("second")];
+        let report = parent.path().join("report.json");
+        let mut first = saved_comparison_record("ptrace", false);
+        first.startup_unmonitored = Some(false);
+        write_saved_comparison_control(&directories[0], &first);
+        write_saved_comparison_control(&directories[1], &saved_comparison_record("ptrace", false));
+        let status = compare(
+            [&directories[0], &directories[1]],
+            Some(&report),
+            VerifyAllow::Success,
+            None,
+        )
+        .unwrap();
+        assert!(status.success());
+        let value = saved_comparison_report(&report);
+        assert_eq!(value["verdict"], "matched", "{value}");
+        assert!(value.get("startup_unmonitored").is_none(), "{value}");
     }
 }

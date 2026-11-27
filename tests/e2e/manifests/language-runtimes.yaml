@@ -1303,10 +1303,13 @@ test:
       verify:
         timeout_seconds:
           dbt: 57
+          kvm: 264
         cpu_timeout_seconds:
           dbt: 33
+          kvm: 33
         slow_reason:
           dbt: "The full validation of 77635530182d stopped this DBT cell at the default 22 CPU s. A local single sample on the host named in docs/TESTING_ENVIRONMENTS.md under Named measurement hosts, at the flip head (2026-10-27) measured 20.173 CPU s and 31.470 wall s; the configured CPU bound is ceil(1.5 x 22.0) = 33, the rule of DBT_2026_10_25_TIMEOUT_CALIBRATIONS. Wall stays at the 57 s default."
+          kvm: "Look-back over 83 validate-profile post-lands (2026-11-22..26): 38 final PASSes, max 21.622 CPU s, earliest-10 PASS median 19.204 and latest-10 median 17.235 (flat, ratio 0.897); identical hermit bytes span 10.636..20.584 CPU s under load and 7 runs were killed at the default 22. CPU bound is ceil(1.5 x 21.622) = 33 by the 1.5x measured-max rule (lead 2026-11-26) and the wall bound is 8 x 33 = 264."
         ci: true
         backends_enabled:
           - ptrace
@@ -1430,7 +1433,18 @@ test:
       artifacts: []
     modes:
       verify:
-        ci: true
+        # kvm is disabled by name under dh-mq9jsx. Re-enable condition: when
+        # the KVM pidfd vfork clone fix tracked in dh-mq9jsx lands, set kvm
+        # back to true, delete its ci_disabled_reason, and run
+        # ci/sync-cell-config.sh.
+        ci:
+          ptrace: true
+          kvm: false
+        ci_disabled_reason:
+          kvm:
+            result: crash-error
+            evidence: https://github.com/rrnewton/dev-hermit-beads/blob/main/issues/dh-mq9jsx.md
+            reason: 'dh-mq9jsx: KVM refuses by name the clone(CLONE_VM|CLONE_VFORK|CLONE_PIDFD) that Go os/exec spawns with, in both attempts at Hermit 7d70120c; the fix is in flight'
         backends_enabled:
           - ptrace
           - kvm
